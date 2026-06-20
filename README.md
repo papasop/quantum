@@ -1,237 +1,483 @@
-\documentclass[12pt]{article}
+# Metric-Compatible Path-Capacity Principle for Quantum Control Time
 
-\usepackage[a4paper,margin=1in]{geometry}
-\usepackage{amsmath,amssymb,amsfonts,bm}
-\usepackage{graphicx}
-\graphicspath{{./}{quantum_path_capacity_figures/}}
-\usepackage{booktabs}
-\usepackage{hyperref}
-\usepackage{microtype}
-\usepackage{enumitem}
-\usepackage{physics}
+This repository contains validation code and hardware-facing pilot tests for the manuscript:
 
-\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+**A Metric-Compatible Path-Capacity Principle for Quantum Control Time**
 
-\title{\textbf{A Metric-Compatible Path-Capacity Principle for Quantum Control Time}}
-\author{Y. Y. N. Li}
-\date{}
+The central idea is that elapsed quantum control time can be reconstructed from a metric-compatible path/capacity pair,
 
-\begin{document}
+[
+dt_{\rm info}
+=============
 
-\maketitle
+\frac{d\Phi_g}{H_{\rm cap}^{(g,\mathcal G)}} ,
+]
 
-\begin{abstract}
-We give an operational reconstruction of elapsed quantum control time from a metric-compatible path/capacity pair. Standard quantum dynamics treats time as an external parameter, while quantum speed limits bound the rate of state change by physical resources. Here we reconstruct elapsed time from the realized state-space path divided by the local capacity of the dynamics to generate it, \(dt_{\rm info}=d\Phi_g/H_{\rm cap}^{(g,G)}\). The nontrivial content is not the algebraic inversion of a speed relation but a \emph{capacity-selection rule}: once a state-space metric \(g_\rho\) and the true physical generator \(G_t\) are fixed, the capacity is determined by the same metric that defines the path element, \(H_{\rm cap}^{(g,G)}=\sqrt{g_\rho(G_t[\rho],G_t[\rho])}\). The path increment and the capacity must therefore be metric-compatible; for pure unitary dynamics this gives \(H_{\rm cap}=\Delta E/\hbar\) with the Fubini--Study metric, and for open dynamics the Bures speed of the full Liouvillian. The construction is falsifiable: endpoint-only estimates fail for non-geodesic or closed-loop paths, capacities from the wrong generator fail for driven dynamics, and closed-system energy speeds fail for genuinely open evolution. We demonstrate this across a non-commuting time-dependent drive, open dephasing, and an entangling gate, in each case showing the metric-compatible pair reconstructs the time while explicit wrong assignments do not. A closed entangling loop has endpoint distance \(0\) yet realized path \(\pi\), giving a hardware-relevant, geometric notion of executed control cost.
-\end{abstract}
+where the capacity is not a free parameter. Once a state-space metric (g_\rho) and a physical generator (\mathcal G_t) are specified, the local capacity is fixed by the same metric that defines the path element:
 
-\section{Introduction}
+[
+H_{\rm cap}^{(g,\mathcal G)}(\rho,t)
+====================================
 
-Time enters nonrelativistic quantum mechanics as an external parameter in the Schr\"odinger equation, \(i\hbar\,d_t\ket{\psi(t)}=\hat H(t)\ket{\psi(t)}\). The formalism presupposes a clock against which state change is measured. Quantum information geometry, however, shows that the state itself traces a curve in projective Hilbert space whose length is a distinguishability measure --- the Fubini--Study metric for pure states, the Bures metric for mixed states \cite{Uhlmann1976,Bures1969,BraunsteinCaves1994}. Quantum speed limits relate the rate of this motion to physical resources such as the energy uncertainty \(\Delta E\) \cite{MandelstamTamm1945,AnandanAharonov1990,DeffnerCampbell2017}.
+\sqrt{
+g_\rho!\left(\mathcal G_t[\rho],\mathcal G_t[\rho]\right)
+}.
+]
 
-We use this geometry in the reverse direction. Rather than bounding how fast a state can change in a given time, we ask whether the elapsed time can be reconstructed from the distinguishable state-space path actually traversed and the instantaneous capacity of the dynamics to generate it. We write the local relation as
-\begin{equation}
-    \boxed{\,dt_{\rm info}=\frac{d\Phi_g}{H_{\rm cap}^{(g,G)}}\,}
-    \label{eq:main}
-\end{equation}
-where \(d\Phi_g\) is an infinitesimal path variation in a state-space metric \(g\) and \(H_{\rm cap}^{(g,G)}\) the local evolution capacity. This construction does not modify quantum dynamics and does not introduce a new clock variable. It reconstructs elapsed control time from an independently generated trajectory, provided that the path element and the capacity are computed in the same state-space geometry. In the pure-state unitary case Eq.~\eqref{eq:main} reduces to the geometric speed identity \(d\Phi_{\rm FS}=(\Delta E/\hbar)\,dt\) \cite{AnandanAharonov1990}, a sharpened form of the time--energy uncertainty relation tied to the geometric phase \cite{Berry1984}.
+The repository is organized around two layers:
 
-The genuine content of this paper is the capacity-selection rule that fixes \(H_{\rm cap}\), described next, together with its empirical consequences. The framework is nontrivial because it is falsifiable: endpoint-only estimates fail for non-geodesic or closed-loop paths, capacities computed from the wrong generator fail for driven dynamics, and closed-system energy speeds fail for genuinely open-system evolution. We demonstrate Eq.~\eqref{eq:main} in three settings that determine whether a principle is useful for quantum computation --- a non-commuting time-dependent drive, open dephasing, and a two-qubit entangling gate --- and in each case contrast the metric-compatible capacity against explicit wrong assignments that do not reconstruct the time.
+1. **Core path-capacity validation**
+   Numerical tests of the metric-compatible reconstruction rule in closed and open quantum dynamics.
 
-\section{Path-capacity reconstruction}
+2. **Hardware-facing path-exposure tests**
+   Simulator and preliminary QPU pilot tests of endpoint-equivalent native-ZZ identity loops on IonQ/Forte-style backends.
 
-For a normalized pure state, the Fubini--Study line element between neighboring states is \(d\Phi_{\rm FS}=\arccos\abs{\braket{\psi(t)}{\psi(t+dt)}}\), and for unitary dynamics its rate is the energy uncertainty,
-\begin{equation}
-    \frac{d\Phi_{\rm FS}}{dt}=\frac{\Delta E(t)}{\hbar},\qquad
-    \Delta E=\sqrt{\expectationvalue{\hat H^2}-\expectationvalue{\hat H}^2}.
-    \label{eq:aa}
-\end{equation}
-Integrating along the realized trajectory \(\Gamma\) gives \(T_{\rm rec}=\int_\Gamma d\Phi_{\rm FS}/(\Delta E(t)/\hbar)\). The endpoint distance \(D_{\rm end}=\arccos\abs{\braket{\psi(0)}{\psi(T)}}\) satisfies \(D_{\rm end}\le\Phi_{\rm path}=\int_0^T d\Phi_{\rm FS}\), with equality only for geodesic motion without backtracking; hence the endpoint does not in general reconstruct the time.
+---
 
-\subsection*{Metric-compatible capacity selection}
+## 1. Core validation
 
-The nontrivial content of Eq.~\eqref{eq:main} is not the algebraic inversion of a speed relation. The capacity is not a free fitting parameter. Once a state-space metric \(g_\rho\) and a physical generator \(\mathcal G_t\) are specified, the local capacity is fixed by the same metric that defines the path element:
-\begin{equation}
-    H_{\rm cap}^{(g,\mathcal G)}(\rho,t)
-    =
-    \sqrt{
-    g_\rho\!\left(\mathcal G_t[\rho],\mathcal G_t[\rho]\right)
-    } .
-    \label{eq:selection_rule}
-\end{equation}
-The path increment \(d\Phi_g\) and the capacity \(H_{\rm cap}^{(g,\mathcal G)}\) must therefore be metric-compatible. For pure unitary dynamics with the Fubini--Study metric this reduces to \(H_{\rm cap}=\Delta E/\hbar\). For open dynamics with the Bures metric it becomes the Bures speed induced by the full Liouvillian. A capacity computed from the wrong generator, or from a metric different from the one defining \(d\Phi_g\), is not expected to reconstruct elapsed time. This gives Eq.~\eqref{eq:main} empirical content: it can fail under wrong capacity assignments.
+The main validation script checks the path-capacity principle in three settings:
 
-Concretely, for pure unitary motion the generator is \(\mathcal G_t[\psi]=-\tfrac{i}{\hbar}\hat H(t)\psi\). Its Fubini--Study metric speed
-\(\sqrt{g_{\rm FS}(\mathcal G_t[\psi],\mathcal G_t[\psi])}\)
-is the horizontal (gauge-projected) speed of \(\psi\), equal to \(\Delta E/\hbar\); we verify this identity numerically to machine precision (\(\sim\!10^{-15}\)). For open dynamics \(\dot\rho=\mathcal L_t[\rho]\) the metric is Bures, with Bures angle \(D_{\rm B}(\rho,\sigma)=\arccos\sqrt{F(\rho,\sigma)}\) and \(F\) the Uhlmann fidelity \cite{Uhlmann1976}; the selection rule reads
-\begin{equation}
-    H_{\mathcal L}(t)=\lim_{\epsilon\to0}\frac{D_{\rm B}\!\big(\rho(t),\,\rho(t)+\epsilon\,\mathcal L_t[\rho(t)]\big)}{\epsilon}
-    =\sqrt{g_{\rm B,\rho}(\mathcal L_t[\rho],\mathcal L_t[\rho])},
-    \label{eq:HL}
-\end{equation}
-so that \(dt_{\rm info}=d\Phi_{\rm B}/H_{\mathcal L}\). The same metric defines both \(d\Phi_{\rm B}\) and \(H_{\mathcal L}\). Using the pure-state energy uncertainty as the capacity of a mixed-state trajectory, or dropping the dissipative part of \(\mathcal L\), violates Eq.~\eqref{eq:selection_rule} and misreconstructs the time, as shown below.
+### Q3: Non-commuting pure-state drive
 
-\section{Results}
+A single qubit is driven by a non-commuting two-axis Hamiltonian,
 
-All simulations use \(\hbar=1\); grid sizes are given in Methods. The principle is summarized in Fig.~\ref{fig:schematic} and Table~\ref{tab:summary}; the correct/wrong contrast that gives the rule empirical content is collected in Table~\ref{tab:selection}.
+[
+H(t)
+====
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=0.92\textwidth]{fig1_principle_schematic.pdf}
-\caption{The path-capacity principle and its selection rule. Elapsed time is the realized state-space path \(d\Phi_g\) over the local evolution capacity \(H_{\rm cap}^{(g,G)}\), integrated along the trajectory. The capacity is not free: Eq.~\eqref{eq:selection_rule} fixes it as the metric speed of the true generator in the \emph{same} metric \(g\) that defines \(d\Phi_g\).}
-\label{fig:schematic}
-\end{figure}
+\frac{\hbar}{2}
+\left[
+\Omega_x(t)\sigma_x+\Omega_z(t)\sigma_z
+\right].
+]
 
-\subsection{Non-commuting time-dependent drive}
+The correct Fubini--Study capacity,
 
-The genuinely nontrivial single-qubit case has a non-commuting two-axis drive, \(\hat H(t)=\tfrac{\hbar}{2}[\Omega_x(t)\sigma_x+\Omega_z(t)\sigma_z]\), \(\Omega_x=\Omega_0[1+a_x\sin\nu_x t]\), \(\Omega_z=\Omega_0 a_z\cos\nu_z t\) (\(\Omega_0=1.7\), \(a_x=0.45\), \(a_z=0.85\), \(\nu_x=2.2\), \(\nu_z=1.35\), \(T=2.2\)). The capacity varies and the Hamiltonians do not commute at different times. The metric-compatible reconstruction \(T_{\rm rec}=\int d\Phi_{\rm FS}/(\Delta E(t)/\hbar)\) gives relative error \(\sim\!3\times10^{-8}\), set only by the integration (Fig.~\ref{fig:demo1}a). The path-capacity pair is geometrically nontrivial here: the realized path exceeds the endpoint distance by the factor \(1.345\) (Fig.~\ref{fig:demo1}b).
+[
+H_{\rm cap}=\Delta E(t)/\hbar,
+]
 
-Two wrong assignments isolate the content of the selection rule. A capacity built from the \emph{wrong generator} --- dropping the \(\sigma_z\) component, so the energy uncertainty is evaluated with \(\hat H_{\rm wrong}=\tfrac{\hbar}{2}\Omega_x\sigma_x\) while the true path is unchanged --- fails to reconstruct the time, with RMSE \(1.3\times10^{-1}\). A naive endpoint estimate \(D_{\rm end}/\bar H\) fails with RMSE \(3.0\times10^{-1}\) (Fig.~\ref{fig:demo1}c). The pure-state instance of the selection rule, \(\sqrt{g_{\rm FS}(\mathcal G[\psi],\mathcal G[\psi])}=\Delta E/\hbar\), holds to machine precision (\(\sim\!10^{-15}\)) along the trajectory. Thus the principle holds once the capacity is built from the right generator in the right metric, and visibly fails otherwise --- the situation faced by any realistic control pulse.
+reconstructs the elapsed time, while a wrong-generator capacity and endpoint-only estimate fail.
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=\textwidth]{fig2_noncommuting_drive.pdf}
-\caption{Non-commuting time-dependent drive. (a) The metric-compatible reconstruction tracks the true time, while a capacity from the wrong (no-\(z\)) generator and an endpoint estimate both fail. (b) The realized Fubini--Study path exceeds the endpoint distance (ratio \(1.345\)) and coincides with \(\int H_{\rm cap}\,dt\). (c) Reconstruction error (log scale): correct \(\sim\!10^{-8}\) versus wrong assignments at \(\sim\!10^{-1}\); the pure-state selection rule \(\abs{v_{\rm proj}-\Delta E/\hbar}\) holds to machine precision.}
-\label{fig:demo1}
-\end{figure}
+Representative result:
 
-\subsection{Open dephasing}
+```text
+correct relative error          = 3.214e-08
+endpoint/mean RMSE              = 2.974e-01
+wrong no-z model RMSE           = 1.285e-01
+path/endpoint ratio             = 1.344966
+speed identity max error        = 1.693e-15
+```
 
-We next dephase the qubit, \(\dot\rho=-\tfrac{i}{\hbar}[\hat H(t),\rho]+\gamma(\sigma_z\rho\sigma_z-\rho)\), with the same non-commuting drive and \(\gamma=0.35\), \(T=2.2\); the purity drops from \(1\) to \(0.633\). In open dynamics the relevant capacity is not the coherent energy uncertainty of a Hamiltonian part alone. It is the metric speed induced by the full Liouvillian, \(H_{\mathcal L}=\norm{\mathcal L[\rho]}_{\rm Bures}\) of Eq.~\eqref{eq:HL}. Using the Bures path and \(H_{\mathcal L}\), the reconstruction gives relative error \(5.7\times10^{-4}\) (RMSE \(2.8\times10^{-4}\)).
+This verifies that the reconstruction is not just a formal identity: using the wrong generator fails.
 
-Four wrong comparators, each violating the selection rule in a different way, fail (Fig.~\ref{fig:demo2}a): the pure-state energy speed \(\Delta E/\hbar\) applied to the mixed state (wrong generator content) fails with RMSE \(3.5\times10^{-1}\); setting \(\gamma=0\) in the capacity while the trajectory still dephases (wrong generator) fails with RMSE \(6.0\times10^{-2}\); the Hilbert--Schmidt speed \(\norm{\mathcal L[\rho]}_{\rm HS}\) (wrong metric) fails with RMSE \(3.2\times10^{-1}\); and the endpoint estimate fails with RMSE \(3.1\times10^{-1}\). Only the metric-compatible Bures/Liouvillian pair reconstructs the time. The principle is not defeated by decoherence; it absorbs dissipation into one capacity, but only the capacity selected by Eq.~\eqref{eq:selection_rule}.
+---
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=\textwidth]{fig3_open_system.pdf}
-\caption{Open dephasing. (a) The full Liouvillian Bures speed reconstructs elapsed time, while three wrong capacities --- pure-state \(\Delta E/\hbar\), \(\gamma{=}0\), and Hilbert--Schmidt speed --- and the endpoint estimate all fail. (b) The Bures path tracks \(\int H_{\mathcal L}\,dt\) and exceeds the endpoint distance. (c) Purity drops to \(0.633\).}
-\label{fig:demo2}
-\end{figure}
+### Q4: Open dephasing
 
-\subsection{Entangling gate and closed-loop endpoint failure}
+The open-system test evolves a mixed state under a Lindblad equation,
 
-An entangling interaction \(\hat H_{\rm int}=\tfrac{\hbar J}{2}\,\sigma_z\otimes\sigma_z\) acts on \(\ket{+}\otimes\ket{+}\), reaching maximal entanglement at \(t_{\rm Bell}=\pi/(2J)\). For \(J=1.3\) the concurrence and reduced entropy reach unity at \(t=1.20830487=\pi/(2J)\), and the path-capacity reconstruction recovers this Bell-gate time with relative error \(10^{-10}\) (Fig.~\ref{fig:demo3}a): the Fubini--Study path cost is generated by the same interaction capacity that produces entanglement.
+[
+\dot\rho
+========
 
-The two-qubit example shows that endpoint distance is not a faithful proxy for realized quantum control cost. A closed or extended entangling path may have small or even zero endpoint distance while still carrying nonzero executed path length. This is the regime in which the path-capacity reconstruction differs operationally from endpoint-based estimates. Continuing the evolution to \(T=1.25\pi/J\), the state-vector overlap recurs: the endpoint distance saturates at \(1.17809725\) while the realized path reaches \(1.96349541\), giving the path-to-endpoint ratio \(5/3\) (Fig.~\ref{fig:demo3}b). The limiting case is a closed loop: running the same interaction to \(T=2\pi/J\) returns the state to its initial ray, so \(D_{\rm endpoint}=0\) exactly, while the realized path is \(\Phi_{\rm path}=\pi\) (numerically \(3.14159265\), error \(2\times10^{-10}\) versus the analytic value). The path-capacity ratio still reconstructs elapsed time to \(6\times10^{-11}\) on the loop, whereas the endpoint estimate fails with RMSE \(1.97\) (Fig.~\ref{fig:demo3}c). Closed loops thus carry zero endpoint distance but nonzero path cost --- the bridge to quantum-computing path ledgers discussed below.
+-\frac{i}{\hbar}[H(t),\rho]
++
+\gamma(\sigma_z\rho\sigma_z-\rho).
+]
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=\textwidth]{fig4_entangling_gate.pdf}
-\caption{Entangling gate. (a) Concurrence and reduced entropy peak at the Bell time, recovered by the reconstruction. (b) Over the extended window the path grows while the endpoint saturates and recurs, reaching path/endpoint \(=5/3\). (c) Closed loop at \(T=2\pi/J\): the endpoint distance returns to \(0\) while the realized path reaches \(\pi\); endpoint-only cost vanishes although a full entangling path was executed.}
-\label{fig:demo3}
-\end{figure}
+The correct capacity is the Bures speed of the full Liouvillian,
 
-\begin{table}[t]
-\centering
-\caption{The three demonstrations. All use \(dt_{\rm info}=d\Phi_g/H_{\rm cap}^{(g,G)}\) with the metric-compatible pure- or mixed-state geometry of Eq.~\eqref{eq:selection_rule}.}
-\label{tab:summary}
-\small
-\begin{tabular}{@{}c l l p{6.0cm}@{}}
-\toprule
- & System & Capacity \(H_{\rm cap}\) & Result \\
-\midrule
-1 & Non-commuting drive & \(\Delta E(t)/\hbar\) & Rel.\ error \(\sim\!3\times10^{-8}\); wrong-generator RMSE \(1.3\times10^{-1}\) \\
-2 & Open dephasing & \(H_{\mathcal L}\) (Bures) & Rel.\ error \(5.7\times10^{-4}\); wrong capacities fail \((6.0\times10^{-2}\)--\(3.5\times10^{-1})\) \\
-3 & Two-qubit entangling & \(\Delta E/\hbar\) & Bell time recovered; extended ratio \(5/3\); closed loop \(D_{\rm end}{=}0,\ \Phi{=}\pi\) \\
-\bottomrule
-\end{tabular}
-\end{table}
+[
+H_{\mathcal L}(t)
+=================
 
-\begin{table}[t]
-\centering
-\caption{The reconstruction is not a fitting identity. It succeeds only when the path element and the capacity are computed from the same metric and the actual physical generator; each failed comparator violates Eq.~\eqref{eq:selection_rule} and is a measured error, not a stipulation.}
-\label{tab:selection}
-\footnotesize
-\begin{tabular}{@{}p{2.6cm} p{2.2cm} p{2.7cm} p{5.4cm}@{}}
-\toprule
-Test & Correct path element & Correct capacity & Failed comparator (error) \\
-\midrule
-Non-commuting drive & FS path & true \(\Delta H(t)/\hbar\) & wrong no-\(z\) generator (RMSE \(1.3\times10^{-1}\)) \\
-Open dephasing & Bures path & Liouvillian Bures speed & \(\Delta E/\hbar\) (\(3.5\times10^{-1}\)), \(\gamma{=}0\) (\(6.0\times10^{-2}\)), HS (\(3.2\times10^{-1}\)), endpoint (\(3.1\times10^{-1}\)) \\
-Entangling gate & FS path & interaction-generator speed & endpoint distance (ratio \(5/3\)) \\
-Closed entangling loop & FS path & interaction-generator speed & endpoint-only (\(D_{\rm end}{=}0\), RMSE \(1.97\)) \\
-\bottomrule
-\end{tabular}
-\end{table}
+\sqrt{
+g_{{\rm B},\rho}
+\left(
+\mathcal L_t[\rho],
+\mathcal L_t[\rho]
+\right)
+}.
+]
 
-\section{Discussion}
+Wrong assignments fail: using (\Delta E/\hbar), setting (\gamma=0), using Hilbert--Schmidt speed, or using endpoint distance does not reconstruct the elapsed time.
 
-Three conclusions follow. First, the nontrivial step is the capacity-selection rule: \(H_{\rm cap}\) is fixed by the same metric and the true physical generator that define the path element, Eq.~\eqref{eq:selection_rule}, not chosen to fit. For pure unitary motion this is the Fubini--Study speed identity read backwards; the explicit failure of a wrong-generator capacity (RMSE \(1.3\times10^{-1}\) for the non-commuting drive) shows the rule carries physical content rather than being definitional.
+Representative result:
 
-Second, the relevant geometric object is the path, not the endpoint, and the metric must match the dynamics. Under dissipation the pure-state calibration \(\Delta E/\hbar\) no longer equals the mixed-state Bures speed and fails with RMSE \(3.5\times10^{-1}\), while the full Liouvillian Bures speed recovers the time; the Hilbert--Schmidt speed, a different metric, also fails. The endpoint distance is not a generally valid substitute for path length: in the extended entangling evolution it underestimates the elapsed time, and in the closed loop it vanishes entirely while a full entangling path of length \(\pi\) is executed.
+```text
+correct Liouvillian rel error   = 5.692e-04
+wrong DeltaE RMSE               = 3.460e-01
+wrong gamma=0 RMSE              = 5.968e-02
+wrong Hilbert-Schmidt RMSE      = 3.193e-01
+endpoint/mean RMSE              = 3.138e-01
+purity final                    = 0.633112
+path/endpoint ratio             = 1.353378
+```
 
-Third, the construction is an operational reconstruction built on established quantum geometry --- not a new speed limit, not a modification of quantum mechanics, and not a fitted model. Its value is unification under one falsifiable rule: elapsed control time equals realized metric path over the metric-compatible capacity of the true generator, holding across time-dependent control, decoherence, and entangling dynamics. Gate time can then be read as \(T_{\rm gate}=\int_{\Gamma_{\rm gate}} d\Phi_{\rm gate}/H_{\rm hardware}(t)\), a hardware-relevant cost complementary to gate count and circuit depth \cite{Nielsen2006,DelCampo2013}.
+This verifies the open-system part of the selection rule: the capacity must be the metric speed of the true Liouvillian in the same metric used to define the path.
 
-\paragraph{Hardware outlook.}
-A direct hardware consequence is that mathematically equivalent circuits may carry different executed path costs. In a noisy processor this suggests a path-exposure relation of the form
-\[
-P_{\rm err}\sim 1-\exp(-\lambda_{\rm path}\,\Phi_{\rm exec}),
-\]
-so that path erasure or path compression can reduce excess residual error. This is a prediction, not a measured result: it can be tested by comparing preserved identity loops with compiler-erased or manually erased circuits, and by measuring output-distribution metrics such as excess odd parity, total-variation distance, and success-probability drop. The closed-loop result above ---  zero endpoint distance with nonzero executed path --- is the geometric statement such a hardware test would probe.
+---
 
-\section{Methods}
+### Q5: Two-qubit entangling gate
 
-\paragraph{Pure-state trajectories.}
-States were propagated by midpoint unitary evolution. The local Fubini--Study increment is \(d\Phi_i=\arccos\abs{\braket{\psi_i}{\psi_{i+1}}}\) and the capacity \(H_i=\Delta E_i/\hbar\), evaluated at the midpoint; reconstructed time is \(t_{\rm rec}(t_n)=\sum_{i<n} d\Phi_i/H_i\). The non-commuting drive used \(6001\) steps over \(t\in[0,2.2]\); its midpoint propagation was cross-checked against an independent fourth-order Runge--Kutta integration of the Schr\"odinger equation, agreeing to Fubini--Study distance \(<10^{-5}\). The selection-rule identity \(\sqrt{g_{\rm FS}(\mathcal G[\psi],\mathcal G[\psi])}=\Delta E/\hbar\) was checked by computing the gauge-projected speed of \(-\tfrac{i}{\hbar}\hat H\psi\) and comparing to \(\Delta E/\hbar\) (max error \(\sim\!10^{-15}\), machine precision). The entangling-gate demonstration used the exact unitary generated by \(\hat H_{\rm int}=\hbar J\,\sigma_z\otimes\sigma_z/2\) with \(3001\) steps over \(t\in[0,1.25\pi/J]\); the closed loop used \(4001\) steps over \(t\in[0,2\pi/J]\), where \(\langle\sigma_z\sigma_z\rangle=0\) is conserved so \(\Delta E/\hbar=J/2\) is constant and \(\Phi_{\rm path}=\pi\) analytically. The commuting single-axis drive \(\hat H=\hbar\Omega(t)\sigma_x/2\) is geodesic (path \(=\) endpoint) and is reported only as a sanity check.
+A two-qubit interaction,
 
-\paragraph{Open-system trajectories.}
-The Lindblad equation \(\dot\rho=-\tfrac{i}{\hbar}[H(t),\rho]+\gamma(\sigma_z\rho\sigma_z-\rho)\) was integrated by fourth-order Runge--Kutta with \(5001\) time steps over \(t\in[0,2.2]\). The propagated state was stabilized by Hermitization and trace renormalization only; \emph{no positivity projection was applied to the trajectory}, so the orbit is not artificially corrected, and the minimum eigenvalue of \(\rho\) remained nonnegative to numerical precision along the run (\(\min_t\lambda_{\min}\ge0\) to machine precision). The qubit Bures angle used \(F(\rho,\sigma)=\Tr(\rho\sigma)+2\sqrt{\det\rho\,\det\sigma}\), equal to the Uhlmann fidelity for qubits and cross-checked against the general Uhlmann formula to \(<10^{-10}\). The Liouvillian capacity \eqref{eq:HL} was estimated by finite difference with \(\epsilon\) equal to the time step (the code default); the reported \(5.7\times10^{-4}\) residual is dominated by the finite-difference estimate of the local Bures speed and remains stable under the \(\epsilon\)-scan over the range reported in the validation script, with excessively small \(\epsilon\) limited by floating-point cancellation. A small denominator floor (\(10^{-14}\)) guards the time integral against division by zero; it never binds, since all capacities are \(O(1)\), and the reported wrong-model errors are unchanged when it is reduced to \(10^{-20}\). Wrong comparators used: the mixed-state energy uncertainty \(\Delta E/\hbar\); the capacity with \(\gamma\) set to \(0\); the Hilbert--Schmidt speed \(\norm{\mathcal L[\rho]}_{\rm Fro}\); and the endpoint Bures distance over mean capacity.
+[
+H_{\rm int}
+===========
 
-\paragraph{Entanglement diagnostics.}
-For a two-qubit pure state the concurrence is \(C=2\abs{a_{00}a_{11}-a_{01}a_{10}}\) and the entanglement entropy is \(S(\rho_A)=-\Tr(\rho_A\log_2\rho_A)\) with \(\rho_A\) the reduced density matrix.
+\frac{\hbar J}{2}\sigma_z\otimes\sigma_z,
+]
 
-\section*{Data and code availability}
+generates entanglement from (|+\rangle\otimes|+\rangle). The path-capacity reconstruction recovers the Bell time and distinguishes real executed path from endpoint distance.
 
-The numerical data follow from the equations and parameters in the text. A standalone validation script reproducing every reported value --- including the wrong-capacity negative controls, the independent-integrator and fidelity cross-checks, the step-size and \(\epsilon\)-stability scans, and the figure-generation routines --- will be made available in a public repository upon publication.
+Representative result:
 
-\section*{Competing interests}
+```text
+correct relative error          = 1.096e-10
+endpoint/mean RMSE              = 3.123e-01
+max concurrence                 = 1.00000000
+max entropy                     = 1.00000000
+Bell time error                 = 0.000e+00
+path/endpoint ratio             = 1.666667
+```
 
-The author declares no competing interests.
+A closed entangling loop gives the strongest endpoint failure:
 
-\begin{thebibliography}{99}
+[
+D_{\rm endpoint}=0,
+\qquad
+\Phi_{\rm path}=\pi.
+]
 
-\bibitem{MandelstamTamm1945}
-L. Mandelstam and I. Tamm, \textit{J. Phys. USSR} \textbf{9}, 249 (1945).
+Numerically:
 
-\bibitem{AnandanAharonov1990}
-J. Anandan and Y. Aharonov, \textit{Phys. Rev. Lett.} \textbf{65}, 1697 (1990).
+```text
+endpoint distance final          = 0.000e+00
+path length final                = 3.14159265
+path error vs analytic pi        = 2.002e-10
+reconstruction rel error on loop = 6.379e-11
+endpoint-only RMSE on loop       = 1.974e+00
+```
 
-\bibitem{Berry1984}
-M. V. Berry, \textit{Proc. R. Soc. Lond. A} \textbf{392}, 45 (1984).
+---
 
-\bibitem{Uhlmann1976}
-A. Uhlmann, \textit{Rep. Math. Phys.} \textbf{9}, 273 (1976).
+## 2. Hardware-facing extension
 
-\bibitem{Bures1969}
-D. Bures, \textit{Trans. Am. Math. Soc.} \textbf{135}, 199 (1969).
+The manuscript predicts that mathematically equivalent circuits may carry different executed hardware costs. In noisy hardware, this can appear as a residual error exposure,
 
-\bibitem{BraunsteinCaves1994}
-S. L. Braunstein and C. M. Caves, \textit{Phys. Rev. Lett.} \textbf{72}, 3439 (1994).
+[
+P_{\rm err}
+\sim
+1-\exp(-\lambda_{\rm path}\Phi_{\rm exec}).
+]
 
-\bibitem{DelCampo2013}
-A. del Campo, I. L. Egusquiza, M. B. Plenio, and S. F. Huelga, \textit{Phys. Rev. Lett.} \textbf{110}, 050403 (2013).
+The hardware-facing tests in this repository focus on native-ZZ identity loops. Ideally, all of the following circuits have the same endpoint (|00\rangle), but they execute different numbers of native ZZ operations:
 
-\bibitem{DeffnerCampbell2017}
-S. Deffner and S. Campbell, \textit{J. Phys. A} \textbf{50}, 453001 (2017).
+[
+ZZ(0)^1,\qquad
+ZZ(0)^4,\qquad
+ZZ(0)^8.
+]
 
-\bibitem{Nielsen2006}
-M. A. Nielsen, \textit{Quantum Inf. Comput.} \textbf{6}, 213 (2006).
+The measured observable is odd-parity residual,
 
-\end{thebibliography}
+[
+P_{\rm odd}=P(01)+P(10).
+]
 
-\clearpage
-\section*{Supplementary information}
-\setcounter{figure}{0}
-\renewcommand{\thefigure}{S\arabic{figure}}
-\renewcommand{\theHfigure}{supp.\arabic{figure}}
+This is a hardware-facing test of the statement:
 
-\paragraph{Commuting-drive sanity check.}
-A single qubit driven by a commuting single-axis Hamiltonian \(\hat H(t)=\hbar\Omega(t)\sigma_x/2\), \(\Omega(t)=\Omega_0[1+a\sin(\nu t)]\) (\(\Omega_0=1.7\), \(a=0.55\), \(\nu=2.4\), \(T=1.2\)), moves on a single great circle: the realized path equals the endpoint distance (ratio \(1.000\)), so reconstruction is trivial. The metric-compatible integral recovers the time to relative error \(2.7\times10^{-10}\), while an endpoint estimate using the initial capacity \(D_{\rm end}/H(0)\) still fails (RMSE \(2.6\times10^{-1}\)) because the capacity varies. This case is a routine check on the integration, not a demonstration of the principle (Fig.~\ref{fig:S1}).
+[
+D_{\rm endpoint}=0
+\not\Rightarrow
+\text{zero executed hardware exposure}.
+]
 
-\begin{figure}[h]
-\centering
-\includegraphics[width=\textwidth]{figS1_commuting_sanity.pdf}
-\caption{Supplementary Figure S1. Commuting-drive sanity check. (a) The path coincides with the endpoint distance (geodesic motion, ratio \(1.000\)). (b) The metric-compatible reconstruction recovers elapsed time, while the fixed-capacity endpoint estimate fails because the capacity is time-dependent.}
-\label{fig:S1}
-\end{figure}
+---
 
-\end{document}
+## 3. IonQ simulator preflight
+
+IonQ ideal and Forte-like noise simulators were used as pre-QPU checks.
+
+The ideal simulator gives zero odd-parity residual for endpoint-equivalent identity loops.
+
+Forte-like noise models show a strong increase of (P_{\rm odd}) with the number of executed native ZZ operations. A linear regression of the form
+
+[
+P_{\rm odd}
+===========
+
+\alpha
++
+\beta_N N_{\rm ZZ}
++
+\eta_\theta \theta_{L1}
+]
+
+shows that the dominant predictor is the executed native-ZZ operation count (N_{\rm ZZ}), not the continuous angle ledger (\theta_{L1}=\sum_i|\theta_i|).
+
+Representative simulator regression:
+
+```text
+P_odd = 0.002636 + 0.007664 N_ZZ + 0.005420 theta_L1
+R^2   = 0.9590
+```
+
+A broader multi-noise-model check gives:
+
+```text
+ideal:
+  beta_N = 0
+  eta_theta = 0
+
+forte-1:
+  beta_N > 0
+  R^2 ≈ 0.95
+
+forte-enterprise-1:
+  beta_N > 0
+  R^2 ≈ 0.96
+```
+
+Interpretation:
+
+```text
+The IonQ/Forte noise simulators support an executed-operation exposure model.
+The effective hardware ledger is primarily N_ZZ rather than sum |theta_i|.
+```
+
+This simulator result is not QPU evidence. It is a preflight check motivating real QPU tests.
+
+---
+
+## 4. Preliminary IonQ Forte Enterprise QPU pilot
+
+A preliminary IonQ Forte Enterprise QPU pilot was run using native-ZZ identity-loop circuits.
+
+Backend:
+
+```text
+qpu.forte-enterprise-1
+```
+
+Execution mode:
+
+```text
+dry_run = false
+```
+
+Shots:
+
+```text
+200 shots per circuit per run
+```
+
+The tested circuits were:
+
+```text
+ZZ(0)^1
+ZZ(0)^4
+ZZ(0)^8
+```
+
+Two independent 200-shot runs were performed. The odd-parity residual increased reproducibly with the number of executed native ZZ operations.
+
+### Run 1
+
+```text
+ZZ(0)^1:  P_odd = 0.010
+ZZ(0)^4:  P_odd = 0.020
+ZZ(0)^8:  P_odd = 0.105
+```
+
+### Run 2
+
+```text
+ZZ(0)^1:  P_odd = 0.005
+ZZ(0)^4:  P_odd = 0.015
+ZZ(0)^8:  P_odd = 0.055
+```
+
+### Combined result
+
+Each combined point uses 400 shots.
+
+| Circuit   | Odd counts | Total shots | (P_{\rm odd}) |
+| --------- | ---------: | ----------: | ------------: |
+| (ZZ(0)^1) |          3 |         400 |        0.0075 |
+| (ZZ(0)^4) |          7 |         400 |        0.0175 |
+| (ZZ(0)^8) |         32 |         400 |        0.0800 |
+
+The combined trend is:
+
+[
+P_{\rm odd}!\left(ZZ(0)^8\right)
+
+>
+
+P_{\rm odd}!\left(ZZ(0)^4\right)
+
+>
+
+P_{\rm odd}!\left(ZZ(0)^1\right).
+]
+
+Interpretation:
+
+```text
+The preliminary QPU data support the hardware-facing prediction that endpoint-equivalent native-ZZ identity circuits can accumulate residual error with executed native operation exposure.
+```
+
+This is preliminary QPU pilot evidence, not a full hardware benchmark. Larger shot counts, interleaved randomized ordering, calibration controls, and repeated sessions are needed for a dedicated hardware study.
+
+---
+
+## 5. What is validated where?
+
+| Claim                                                             | Validation source                           |
+| ----------------------------------------------------------------- | ------------------------------------------- |
+| (dt_{\rm info}=d\Phi_g/H_{\rm cap}) reconstructs elapsed time     | Core Q3/Q4/Q5 numerical validation          |
+| (H_{\rm cap}) is fixed by the metric speed of the true generator  | Core selection-rule validation              |
+| Wrong generator / wrong metric / endpoint-only assignments fail   | Core negative controls                      |
+| Closed loops can have (D_{\rm endpoint}=0) but nonzero path       | Two-qubit closed-loop validation            |
+| Endpoint-equivalent circuits can have nonzero hardware exposure   | IonQ simulator and preliminary QPU pilot    |
+| Forte-like effective ledger is mainly executed ZZ operation count | IonQ simulator regression                   |
+| True hardware residual increases with executed native ZZ depth    | Preliminary IonQ Forte Enterprise QPU pilot |
+
+---
+
+## 6. Important limitations
+
+The IonQ QPU data in this repository are preliminary.
+
+They should be interpreted as:
+
+```text
+pilot evidence for the hardware-facing path-exposure prediction
+```
+
+not as:
+
+```text
+a complete experimental verification of the full theory
+```
+
+The core path-capacity equations are validated by controlled state-trajectory simulations. The IonQ experiments test a hardware-facing consequence: endpoint-equivalent circuits may accumulate different residual errors because they execute different native-operation paths.
+
+The current QPU pilot supports an operation-count exposure ledger,
+
+[
+\Phi_{\rm exec}^{\rm Forte}
+\sim
+N_{\rm ZZ},
+]
+
+rather than a clearly resolved continuous-angle ledger,
+
+[
+\Phi_{\rm exec}
+\sim
+\sum_i|\theta_i|.
+]
+
+---
+
+## 7. Reproducibility notes
+
+Do not commit API keys to this repository.
+
+Recommended local setup:
+
+```python
+import os
+from getpass import getpass
+
+os.environ["IONQ_API_KEY"] = getpass("Paste IonQ API key: ")
+```
+
+The IonQ API key should be stored only as an environment variable or secret.
+
+The QPU pilot jobs used native gates:
+
+```json
+{
+  "gateset": "native",
+  "circuit": [
+    {"gate": "zz", "targets": [0, 1], "angle": 0.0}
+  ]
+}
+```
+
+For the identity-loop depth tests:
+
+```python
+def zz0_list(n):
+    return [{"gate": "zz", "targets": [0, 1], "angle": 0.0} for _ in range(n)]
+```
+
+---
+
+## 8. Recommended next steps
+
+1. Repeat the three-point QPU test in another session:
+
+[
+ZZ(0)^1,\quad ZZ(0)^4,\quad ZZ(0)^8.
+]
+
+2. Increase shots after confirming the trend remains stable.
+
+3. Interleave circuit order to suppress drift:
+
+```text
+8ZZ → 1ZZ → 4ZZ
+4ZZ → 8ZZ → 1ZZ
+1ZZ → 8ZZ → 4ZZ
+```
+
+4. Add nonzero-angle controls:
+
+[
+ZZ(0.25)^4,\qquad ZZ(0.25)^8.
+]
+
+5. Fit a hardware ledger:
+
+[
+P_{\rm odd}
+===========
+
+\alpha
++
+\beta_N N_{\rm ZZ}
++
+\eta_\theta \theta_{L1}.
+]
+
+6. Compare simulator and QPU coefficients.
+
+---
+
+## 9. Summary
+
+The core path-capacity principle is validated by direct state-trajectory simulations.
+
+IonQ/Forte simulator tests support the hardware-facing extension: endpoint-equivalent native-ZZ circuits accumulate residual error primarily with executed native operation count.
+
+Preliminary IonQ Forte Enterprise QPU pilot data reproduce the same qualitative trend:
+
+[
+P_{\rm odd}(8ZZ)>P_{\rm odd}(4ZZ)>P_{\rm odd}(1ZZ).
+]
+
+This provides first hardware-facing support for the idea that endpoint equivalence does not imply zero executed physical cost.
+
+
+
+Y.Y.N., L. (2026, June 19). A Metric-Compatible Path-Capacity Principle for Quantum Control Time. Zenodo. https://doi.org/10.5281/zenodo.20767791
+
+
+
