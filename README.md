@@ -1,3 +1,10 @@
+The QPU pilot is reproducible at the protocol and analysis level from this repository.
+Direct reruns of IonQ QPU jobs require independent IonQ Cloud access, backend availability,
+and user-provided API credentials. No API keys or private account metadata are included.
+
+
+
+
 # Metric-Compatible Path-Capacity Principle for Quantum Control Time
 
 This repository contains validation code, figures, simulator checks, and preliminary QPU pilot data for the manuscript:
