@@ -49,6 +49,7 @@ pasqal_geometric_flow_minimal_results/
 
 
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -108,7 +109,7 @@ class Config:
     ridge: float = 1.0e-10
     rotated_control_angle: float = 0.61
 
-    sampling_rate: float = 0.08
+    sampling_rate: float = 1.0
 
     # ---------------------------------------------------------------------
     # Fixed external objective, declared independently of z=0.
@@ -133,7 +134,28 @@ class Config:
     optimization_starts: int = 2
     optimization_maxiter: int = 7
     optimization_start_radius: float = 0.075
-    finite_difference_h: float = 0.004
+    finite_difference_h: float = 0.002
+
+    # Numerical-truth audits. The main experiment always uses sampling_rate=1.
+    sampling_rate_scan: tuple[float, ...] = (
+        0.08,
+        0.16,
+        0.32,
+        0.64,
+        1.0,
+    )
+    finite_difference_steps: tuple[float, ...] = (
+        8.0e-3,
+        4.0e-3,
+        2.0e-3,
+        1.0e-3,
+        5.0e-4,
+    )
+    sampling_gradient_tolerance: float = 0.01
+    sampling_hessian_tolerance: float = 0.02
+    fit_vs_direct_hessian_tolerance: float = 0.10
+    full_vs_linear_mae_ratio_min: float = 1.05
+
     preconditioner_floor_fraction: float = 0.08
     max_step_norm: float = 0.030
 
@@ -151,7 +173,7 @@ def preset_config(name: str, seed: int, output_dir: str) -> Config:
             split_recoveries=5,
             optimization_starts=1,
             optimization_maxiter=4,
-            sampling_rate=0.06,
+            sampling_rate=1.0,
             output_dir=output_dir,
         )
     if name == "screen":
@@ -166,7 +188,7 @@ def preset_config(name: str, seed: int, output_dir: str) -> Config:
             split_recoveries=30,
             optimization_starts=5,
             optimization_maxiter=12,
-            sampling_rate=0.12,
+            sampling_rate=1.0,
             output_dir=output_dir,
         )
     raise ValueError(f"Unknown preset: {name}")
@@ -591,6 +613,259 @@ def operator_diagnostics(a: np.ndarray) -> dict[str, float]:
 
 
 # =============================================================================
+# Independent numerical-truth audits
+# =============================================================================
+
+def fit_constant(z: np.ndarray, y: np.ndarray) -> float:
+    del z
+    return float(np.mean(np.asarray(y, dtype=float)))
+
+
+def fit_linear(
+    z: np.ndarray,
+    y: np.ndarray,
+    ridge: float,
+) -> tuple[float, np.ndarray]:
+    z = np.asarray(z, dtype=float)
+    y = np.asarray(y, dtype=float)
+    design = np.column_stack([np.ones(len(z)), z])
+    penalty = np.eye(design.shape[1])
+    penalty[0, 0] = 0.0
+    beta = np.linalg.solve(
+        design.T @ design + ridge * penalty,
+        design.T @ y,
+    )
+    return float(beta[0]), np.asarray(beta[1:], dtype=float)
+
+
+def predict_linear(
+    z: np.ndarray,
+    c: float,
+    g: np.ndarray,
+) -> np.ndarray:
+    z = np.asarray(z, dtype=float)
+    return c + z @ np.asarray(g, dtype=float)
+
+
+def relative_vector_error(
+    estimate: np.ndarray,
+    reference: np.ndarray,
+) -> float:
+    estimate = np.asarray(estimate, dtype=float)
+    reference = np.asarray(reference, dtype=float)
+    return float(
+        np.linalg.norm(estimate - reference)
+        / max(np.linalg.norm(reference), 1.0e-14)
+    )
+
+
+def relative_matrix_error(
+    estimate: np.ndarray,
+    reference: np.ndarray,
+) -> float:
+    estimate = np.asarray(estimate, dtype=float)
+    reference = np.asarray(reference, dtype=float)
+    return float(
+        np.linalg.norm(estimate - reference, "fro")
+        / max(np.linalg.norm(reference, "fro"), 1.0e-14)
+    )
+
+
+def finite_difference_audit(
+    cfg: Config,
+    out: Path,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """
+    Directly differentiate the sampling_rate=1 objective over an h scan.
+
+    A stable central-difference window is selected by minimizing the combined
+    relative change in gradient and Hessian between adjacent step sizes.
+    """
+    cfg_ref = replace(cfg, sampling_rate=1.0)
+    model = RydbergLocalGeometry(cfg_ref)
+    z0 = np.zeros(4, dtype=float)
+
+    rows: list[dict[str, float]] = []
+    derivatives: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+    previous_g: np.ndarray | None = None
+    previous_a: np.ndarray | None = None
+
+    for h in cfg.finite_difference_steps:
+        h = float(h)
+        g = model.gradient(z0, h)
+        a = model.local_hessian(z0, h)
+        derivatives[h] = (g, a)
+
+        row = {
+            "h": h,
+            "loss_z0": float(model.loss(z0)),
+            "gradient_norm": float(np.linalg.norm(g)),
+            "hessian_frobenius_norm": float(np.linalg.norm(a, "fro")),
+            "hessian_min_eigenvalue": float(np.min(np.linalg.eigvalsh(a))),
+            "hessian_max_eigenvalue": float(np.max(np.linalg.eigvalsh(a))),
+            "gradient_rel_change_from_previous": float("nan"),
+            "hessian_rel_change_from_previous": float("nan"),
+            "combined_rel_change": float("nan"),
+        }
+
+        if previous_g is not None and previous_a is not None:
+            g_change = relative_vector_error(g, previous_g)
+            a_change = relative_matrix_error(a, previous_a)
+            row["gradient_rel_change_from_previous"] = g_change
+            row["hessian_rel_change_from_previous"] = a_change
+            row["combined_rel_change"] = g_change + a_change
+
+        rows.append(row)
+        previous_g = g
+        previous_a = a
+
+    df = pd.DataFrame(rows)
+    finite = df[np.isfinite(df["combined_rel_change"])]
+
+    if finite.empty:
+        selected_h = float(cfg.finite_difference_steps[0])
+    else:
+        selected_h = float(
+            finite.loc[finite["combined_rel_change"].idxmin(), "h"]
+        )
+
+    g_ref, a_ref = derivatives[selected_h]
+    selected_row = df.loc[df["h"] == selected_h].iloc[0]
+
+    summary = {
+        "selected_h": selected_h,
+        "loss_z0": float(model.loss(z0)),
+        "gradient": g_ref.tolist(),
+        "gradient_norm": float(np.linalg.norm(g_ref)),
+        "hessian": a_ref.tolist(),
+        "hessian_frobenius_norm": float(np.linalg.norm(a_ref, "fro")),
+        "hessian_eigenvalues": np.linalg.eigvalsh(a_ref).tolist(),
+        "selected_gradient_rel_change": float(
+            selected_row["gradient_rel_change_from_previous"]
+        ),
+        "selected_hessian_rel_change": float(
+            selected_row["hessian_rel_change_from_previous"]
+        ),
+        "simulator_calls": int(model.simulator_calls),
+    }
+
+    out.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out / "finite_difference_convergence.csv", index=False)
+    (out / "finite_difference_reference.json").write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8",
+    )
+    return df, summary
+
+
+def sampling_rate_convergence_audit(
+    cfg: Config,
+    selected_h: float,
+    g_reference: np.ndarray,
+    a_reference: np.ndarray,
+    out: Path,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """
+    Compare J(0), direct gradient, and direct Hessian against sampling_rate=1.
+
+    This is an external discretization audit: internal held-out consistency is
+    not allowed to substitute for convergence to the full-resolution backend.
+    """
+    z0 = np.zeros(4, dtype=float)
+    rows: list[dict[str, float]] = []
+
+    cfg_full = replace(cfg, sampling_rate=1.0)
+    full_model = RydbergLocalGeometry(cfg_full)
+    j_reference = float(full_model.loss(z0))
+
+    for sr in cfg.sampling_rate_scan:
+        sr = float(sr)
+        model = RydbergLocalGeometry(replace(cfg, sampling_rate=sr))
+        j = float(model.loss(z0))
+        g = model.gradient(z0, selected_h)
+        a = model.local_hessian(z0, selected_h)
+
+        rows.append(
+            {
+                "sampling_rate": sr,
+                "loss_z0": j,
+                "loss_absolute_error": abs(j - j_reference),
+                "gradient_norm": float(np.linalg.norm(g)),
+                "gradient_relative_error_vs_sr1": relative_vector_error(
+                    g, g_reference
+                ),
+                "hessian_frobenius_norm": float(np.linalg.norm(a, "fro")),
+                "hessian_relative_error_vs_sr1": relative_matrix_error(
+                    a, a_reference
+                ),
+                "simulator_calls": int(model.simulator_calls),
+            }
+        )
+
+    df = pd.DataFrame(rows).sort_values("sampling_rate")
+    low_sr_row = df.iloc[0]
+    formal_row = df.loc[
+        np.isclose(df["sampling_rate"], 1.0)
+    ].iloc[-1]
+
+    summary = {
+        "reference_sampling_rate": 1.0,
+        "selected_h": float(selected_h),
+        "lowest_sampling_rate": float(low_sr_row["sampling_rate"]),
+        "lowest_rate_gradient_relative_error": float(
+            low_sr_row["gradient_relative_error_vs_sr1"]
+        ),
+        "lowest_rate_hessian_relative_error": float(
+            low_sr_row["hessian_relative_error_vs_sr1"]
+        ),
+        "formal_rate_gradient_relative_error": float(
+            formal_row["gradient_relative_error_vs_sr1"]
+        ),
+        "formal_rate_hessian_relative_error": float(
+            formal_row["hessian_relative_error_vs_sr1"]
+        ),
+    }
+
+    out.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out / "sampling_rate_convergence.csv", index=False)
+    (out / "sampling_rate_convergence.json").write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8",
+    )
+    return df, summary
+
+
+def numerical_truth_audit(
+    cfg: Config,
+    out: Path,
+) -> dict[str, object]:
+    fd_df, fd_summary = finite_difference_audit(cfg, out)
+    selected_h = float(fd_summary["selected_h"])
+    g_reference = np.asarray(fd_summary["gradient"], dtype=float)
+    a_reference = np.asarray(fd_summary["hessian"], dtype=float)
+
+    sampling_df, sampling_summary = sampling_rate_convergence_audit(
+        cfg=cfg,
+        selected_h=selected_h,
+        g_reference=g_reference,
+        a_reference=a_reference,
+        out=out,
+    )
+
+    payload = {
+        "finite_difference": fd_summary,
+        "sampling_rate": sampling_summary,
+        "reference_gradient": g_reference.tolist(),
+        "reference_hessian": a_reference.tolist(),
+    }
+    (out / "numerical_truth_audit.json").write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
+    return payload
+
+
+# =============================================================================
 # Recovery stability
 # =============================================================================
 
@@ -997,6 +1272,14 @@ def parse_args():
     p.add_argument("--skip-radius-scan", action="store_true")
     p.add_argument("--skip-optimizer", action="store_true")
     p.add_argument("--skip-coordinate-audit", action="store_true")
+    p.add_argument(
+        "--skip-numerical-audit",
+        action="store_true",
+        help=(
+            "Skip sampling-rate and finite-difference truth audits. "
+            "Not recommended for formal evidence."
+        ),
+    )
     args, unknown = p.parse_known_args()
     if unknown:
         print(f"[notice] Ignored notebook/kernel arguments: {unknown}")
@@ -1005,7 +1288,7 @@ def parse_args():
 
 def config_for_atoms(preset: str, seed: int, outdir: str, n_atoms: int) -> Config:
     """Original v1 settings, changing only the requested atom count."""
-    cfg = preset_config(preset, seed, outdir)
+    cfg = replace(preset_config(preset, seed, outdir), sampling_rate=1.0)
     if preset == "debug":
         return replace(
             cfg,
@@ -1013,7 +1296,7 @@ def config_for_atoms(preset: str, seed: int, outdir: str, n_atoms: int) -> Confi
             train_points=22,
             heldout_points=12,
             split_recoveries=5,
-            sampling_rate=0.055,
+            sampling_rate=1.0,
         )
     if preset == "screen":
         return replace(
@@ -1022,7 +1305,7 @@ def config_for_atoms(preset: str, seed: int, outdir: str, n_atoms: int) -> Confi
             train_points=40,
             heldout_points=24,
             split_recoveries=12,
-            sampling_rate=0.08,
+            sampling_rate=1.0,
         )
     return replace(
         cfg,
@@ -1030,7 +1313,7 @@ def config_for_atoms(preset: str, seed: int, outdir: str, n_atoms: int) -> Confi
         train_points=72,
         heldout_points=48,
         split_recoveries=30,
-        sampling_rate=0.12,
+        sampling_rate=1.0,
     )
 
 
@@ -1116,16 +1399,44 @@ def run_identification_case(
     cfg: Config,
     rng: np.random.Generator,
     case_out: Path,
-) -> tuple[dict, pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
+    numerical_reference: dict[str, object] | None = None,
+) -> tuple[
+    dict,
+    pd.DataFrame,
+    pd.DataFrame,
+    np.ndarray,
+    np.ndarray,
+    float,
+    np.ndarray,
+    np.ndarray,
+]:
     """
-    Original v1 identification/prediction protocol, unchanged in substance.
+    Fixed-external-objective identification at sampling_rate=1.
+
+    The fitted quadratic is evaluated against:
+      1. independently fitted constant and linear baselines,
+      2. diagonal/scalar/rotated quadratic ablations,
+      3. a direct finite-difference Hessian reference.
     """
+    if not np.isclose(cfg.sampling_rate, 1.0):
+        raise ValueError(
+            "Formal identification must use sampling_rate=1.0. "
+            "Lower rates belong only in the discretization audit."
+        )
+
     model = RydbergLocalGeometry(cfg)
+    z0 = np.zeros(4, dtype=float)
 
     z_train = symmetric_local_design(
-        rng, cfg.train_points, cfg.perturbation_radius, dim=4
+        rng,
+        cfg.train_points,
+        cfg.perturbation_radius,
+        dim=4,
     )
     y_train = np.asarray([model.loss(z) for z in z_train])
+
+    c_constant = fit_constant(z_train, y_train)
+    c_linear, g_linear = fit_linear(z_train, y_train, cfg.ridge)
     (c, g, a), _ = fit_quadratic(z_train, y_train, cfg.ridge)
 
     split_df = split_recovery_audit(rng, z_train, y_train, cfg, a)
@@ -1142,44 +1453,96 @@ def run_identification_case(
     )
     y_test = np.asarray([model.loss(z) for z in z_test])
 
-    operators = {
-        "full": a,
-        "diagonal": np.diag(np.diag(a)),
-        "scalar": scalar_operator(a),
-        "rotated": rotated_operator(a, cfg.rotated_control_angle),
+    predictions = {
+        "constant": np.full(len(z_test), c_constant, dtype=float),
+        "linear": predict_linear(z_test, c_linear, g_linear),
+        "full": predict_quadratic(z_test, c, g, a),
+        "diagonal": predict_quadratic(
+            z_test,
+            c,
+            g,
+            np.diag(np.diag(a)),
+        ),
+        "scalar": predict_quadratic(
+            z_test,
+            c,
+            g,
+            scalar_operator(a),
+        ),
+        "rotated": predict_quadratic(
+            z_test,
+            c,
+            g,
+            rotated_operator(a, cfg.rotated_control_angle),
+        ),
     }
 
-    metrics = {}
+    metrics = {
+        name: regression_metrics(y_test, pred)
+        for name, pred in predictions.items()
+    }
+
     heldout = pd.DataFrame(z_test, columns=model.parameter_names)
     heldout["observed_loss"] = y_test
     heldout["n_atoms"] = cfg.n_atoms
     heldout["seed"] = cfg.seed
     heldout["radius"] = cfg.perturbation_radius
 
-    for name, operator in operators.items():
-        pred = predict_quadratic(z_test, c, g, operator)
-        metrics[name] = regression_metrics(y_test, pred)
+    for name, pred in predictions.items():
         heldout[f"pred_{name}"] = pred
         heldout[f"abs_error_{name}"] = np.abs(y_test - pred)
 
+    baseline_gradient = model.gradient(z0, cfg.finite_difference_h)
+    direct_hessian = model.local_hessian(z0, cfg.finite_difference_h)
+
+    if numerical_reference is not None:
+        selected_h = float(
+            numerical_reference["finite_difference"]["selected_h"]
+        )
+        direct_gradient_reference = np.asarray(
+            numerical_reference["reference_gradient"],
+            dtype=float,
+        )
+        direct_hessian_reference = np.asarray(
+            numerical_reference["reference_hessian"],
+            dtype=float,
+        )
+    else:
+        selected_h = float(cfg.finite_difference_h)
+        direct_gradient_reference = baseline_gradient
+        direct_hessian_reference = direct_hessian
+
+    fit_vs_direct_hessian_error = relative_matrix_error(
+        a,
+        direct_hessian_reference,
+    )
+    fit_vs_direct_gradient_error = relative_vector_error(
+        g,
+        direct_gradient_reference,
+    )
+
     diag = operator_diagnostics(a)
     full_mae = metrics["full"]["mae"]
+    linear_mae = metrics["linear"]["mae"]
 
     row = {
         "n_atoms": cfg.n_atoms,
         "seed": cfg.seed,
         "radius": cfg.perturbation_radius,
+        "sampling_rate": cfg.sampling_rate,
         "simulator_calls_identification": model.simulator_calls,
         "objective_mode": cfg.objective_mode,
         "target_bitstring": model.target_bitstring,
-        "baseline_loss": model.loss(np.zeros(4)),
+        "baseline_loss": model.loss(z0),
+        "direct_reference_h": selected_h,
         "baseline_gradient_norm": float(
-            np.linalg.norm(
-                model.gradient(
-                    np.zeros(4),
-                    cfg.finite_difference_h,
-                )
-            )
+            np.linalg.norm(direct_gradient_reference)
+        ),
+        "fit_gradient_relative_error_vs_direct": float(
+            fit_vs_direct_gradient_error
+        ),
+        "fit_hessian_relative_error_vs_direct": float(
+            fit_vs_direct_hessian_error
         ),
         "recovery_median_fro_error": float(
             split_df["relative_frobenius_error"].median()
@@ -1188,27 +1551,54 @@ def run_identification_case(
             split_df["principal_eigenvector_alignment"].median()
         ),
         **diag,
+        "constant_r2": metrics["constant"]["r2"],
+        "constant_mae": metrics["constant"]["mae"],
+        "linear_r2": metrics["linear"]["r2"],
+        "linear_mae": linear_mae,
         "full_r2": metrics["full"]["r2"],
         "full_spearman": metrics["full"]["spearman"],
         "full_mae": full_mae,
+        "linear_mae_ratio_vs_full": linear_mae / max(full_mae, 1e-30),
         "diag_mae_ratio": metrics["diagonal"]["mae"] / max(full_mae, 1e-30),
         "scalar_mae_ratio": metrics["scalar"]["mae"] / max(full_mae, 1e-30),
         "rotated_mae_ratio": metrics["rotated"]["mae"] / max(full_mae, 1e-30),
     }
 
     case_out.mkdir(parents=True, exist_ok=True)
+
     pd.DataFrame(z_train, columns=model.parameter_names).assign(
         loss=y_train
     ).to_csv(case_out / "train_data.csv", index=False)
     heldout.to_csv(case_out / "heldout_data.csv", index=False)
     split_df.to_csv(case_out / "recovery_splits.csv", index=False)
+
     (case_out / "A_full.json").write_text(
         json.dumps(
             {
                 "config": asdict(cfg),
-                "c": c,
-                "g": g.tolist(),
-                "A_full": a.tolist(),
+                "objective_mode": cfg.objective_mode,
+                "target_bitstring": model.target_bitstring,
+                "constant_model": {"c": c_constant},
+                "linear_model": {
+                    "c": c_linear,
+                    "g": g_linear.tolist(),
+                },
+                "quadratic_model": {
+                    "c": c,
+                    "g": g.tolist(),
+                    "A_full": a.tolist(),
+                },
+                "direct_reference": {
+                    "h": selected_h,
+                    "g": direct_gradient_reference.tolist(),
+                    "A": direct_hessian_reference.tolist(),
+                    "fit_gradient_relative_error": (
+                        fit_vs_direct_gradient_error
+                    ),
+                    "fit_hessian_relative_error": (
+                        fit_vs_direct_hessian_error
+                    ),
+                },
                 "metrics": metrics,
             },
             indent=2,
@@ -1239,6 +1629,7 @@ def radius_scan(
         cfg = replace(
             base_cfg,
             seed=seed + 100_000 + j,
+            sampling_rate=1.0,
             perturbation_radius=float(radius),
             heldout_radius_min=max(0.30 * float(radius), 1e-4),
             heldout_radius_max=1.05 * float(radius),
@@ -1525,6 +1916,18 @@ def _plot_multiseed(summary: pd.DataFrame, out: Path) -> None:
 
 def main():
     args = parse_args()
+    # __file__ is undefined when the script is pasted directly into a
+    # Jupyter/Colab cell. Fall back to hashing the in-memory source marker.
+    try:
+        source_bytes = Path(__file__).read_bytes()
+    except NameError:
+        source_bytes = (
+            "FIXED_EXTERNAL_OBJECTIVE_SR1_NUMERICAL_TRUTH_V3"
+        ).encode("utf-8")
+
+    source_hash = hashlib.sha256(
+        source_bytes
+    ).hexdigest()[:16]
     atoms = _csv_ints(args.atoms)
     seeds = _csv_ints(args.seeds)
     radii = _csv_floats(args.radii)
@@ -1533,8 +1936,10 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     print("=" * 118)
-    print("PASQAL / PULSER — SOURCE-ALIGNED COMPLETE LOCAL-GEOMETRY VALIDATION")
+    print("PASQAL / PULSER — FIXED-EXTERNAL-OBJECTIVE NUMERICAL-TRUTH VALIDATION v3")
     print("=" * 118)
+    print(f"source_sha256_16={source_hash}")
+    print("RUN_PROVENANCE=FIXED_EXTERNAL_OBJECTIVE_SR1_NUMERICAL_TRUTH_V3")
     print(f"atoms={atoms}")
     print(f"seeds={seeds}")
     print(f"preset={args.preset}")
@@ -1553,9 +1958,9 @@ def main():
         )
     except Exception as version_exc:
         print(f"[warning] version report failed: {version_exc}")
-    print("backend=original Pulser/QutipEmulator")
-    print("pulse model=original two-segment global Rydberg pulse")
-    print(f"loss=fixed external objective: {Config().objective_mode}")
+    print("backend=Pulser/QutipEmulator; FORMAL sampling_rate=1.0")
+    print("pulse model=two-segment global Rydberg pulse; original physical parameters")
+    print(f"loss=FIXED_EXTERNAL_OBJECTIVE::{Config().objective_mode}::V3")
     print("heldout target=unseen FULL-emulator external-objective loss")
     print()
 
@@ -1575,9 +1980,29 @@ def main():
                 str(case_out),
                 n_atoms,
             )
+            print(
+                f"    resolved formal sampling_rate={cfg.sampling_rate}"
+            )
+            if not np.isclose(cfg.sampling_rate, 1.0):
+                raise RuntimeError(
+                    "Internal configuration error: formal runs must resolve "
+                    f"to sampling_rate=1.0, got {cfg.sampling_rate}."
+                )
             rng = np.random.default_rng(case_seed)
 
-            print(f"[N={n_atoms} seed={seed}] original identification run...")
+            print(
+                f"[N={n_atoms} seed={seed}] "
+                "sampling_rate=1 fixed-objective identification..."
+            )
+
+            numerical_reference = None
+            if not args.skip_numerical_audit:
+                print("    numerical-truth audit (FD + sampling-rate scan)...")
+                numerical_reference = numerical_truth_audit(
+                    cfg,
+                    case_out / "numerical_truth",
+                )
+
             (
                 row,
                 split_df,
@@ -1587,7 +2012,35 @@ def main():
                 c,
                 g,
                 a,
-            ) = run_identification_case(cfg, rng, case_out)
+            ) = run_identification_case(
+                cfg,
+                rng,
+                case_out,
+                numerical_reference=numerical_reference,
+            )
+
+            if numerical_reference is not None:
+                sampling_summary = numerical_reference["sampling_rate"]
+                row["lowest_rate_gradient_relative_error"] = float(
+                    sampling_summary[
+                        "lowest_rate_gradient_relative_error"
+                    ]
+                )
+                row["lowest_rate_hessian_relative_error"] = float(
+                    sampling_summary[
+                        "lowest_rate_hessian_relative_error"
+                    ]
+                )
+                row["fd_selected_gradient_rel_change"] = float(
+                    numerical_reference["finite_difference"][
+                        "selected_gradient_rel_change"
+                    ]
+                )
+                row["fd_selected_hessian_rel_change"] = float(
+                    numerical_reference["finite_difference"][
+                        "selected_hessian_rel_change"
+                    ]
+                )
 
             if not args.skip_coordinate_audit:
                 covariance = coordinate_covariance_audit(
@@ -1668,6 +2121,8 @@ def main():
                 f"rho={row['full_spearman']:.6f} "
                 f"off={row['offdiagonal_frobenius_fraction']:.4f} "
                 f"|g0|={row['baseline_gradient_norm']:.3e} "
+                f"Afit/AFD={row['fit_hessian_relative_error_vs_direct']:.3e} "
+                f"linear/full={row['linear_mae_ratio_vs_full']:.2f}x "
                 f"diag/full={row['diag_mae_ratio']:.2f}x "
                 f"calls={row['simulator_calls_identification']}"
             )
@@ -1692,31 +2147,71 @@ def main():
         )
 
     gates = {
-        "M1_all_recovery_errors_lt_0_10": bool(
-            np.all(primary["recovery_median_fro_error"] < 0.10)
+        "T1_formal_sampling_rate_is_one_everywhere": bool(
+            np.all(np.isclose(primary["sampling_rate"], 1.0))
         ),
-        "M2_all_alignments_gt_0_95": bool(
-            np.all(primary["recovery_median_alignment"] > 0.95)
-        ),
-        "M3_all_full_R2_gt_0_95": bool(
-            np.all(primary["full_r2"] > 0.95)
-        ),
-        "M4_all_full_Spearman_gt_0_95": bool(
-            np.all(primary["full_spearman"] > 0.95)
-        ),
-        "M5_full_beats_diagonal_everywhere": bool(
-            np.all(primary["diag_mae_ratio"] > 1.0)
-        ),
-        "M6_full_beats_scalar_everywhere": bool(
-            np.all(primary["scalar_mae_ratio"] > 1.0)
-        ),
-        "M7_nontrivial_offdiagonal_everywhere": bool(
-            np.all(primary["offdiagonal_frobenius_fraction"] > 0.10)
-        ),
-        "M7b_external_objective_gradient_nonzero_everywhere": bool(
+        "T2_external_objective_gradient_nonzero_everywhere": bool(
             np.all(primary["baseline_gradient_norm"] > 1.0e-8)
         ),
+        "T3_fitted_hessian_agrees_with_direct_FD": bool(
+            np.all(
+                primary["fit_hessian_relative_error_vs_direct"]
+                < Config().fit_vs_direct_hessian_tolerance
+            )
+        ),
+        "T4_full_quadratic_beats_linear_MAE_everywhere": bool(
+            np.all(
+                primary["linear_mae_ratio_vs_full"]
+                > Config().full_vs_linear_mae_ratio_min
+            )
+        ),
+        "T5_all_recovery_errors_lt_0_10": bool(
+            np.all(primary["recovery_median_fro_error"] < 0.10)
+        ),
+        "T6_all_alignments_gt_0_95": bool(
+            np.all(primary["recovery_median_alignment"] > 0.95)
+        ),
+        "T7_all_full_R2_gt_0_95": bool(
+            np.all(primary["full_r2"] > 0.95)
+        ),
+        "T8_all_full_Spearman_gt_0_95": bool(
+            np.all(primary["full_spearman"] > 0.95)
+        ),
+        "T9_full_beats_diagonal_everywhere": bool(
+            np.all(primary["diag_mae_ratio"] > 1.0)
+        ),
+        "T10_full_beats_scalar_everywhere": bool(
+            np.all(primary["scalar_mae_ratio"] > 1.0)
+        ),
+        "T11_nontrivial_offdiagonal_everywhere": bool(
+            np.all(primary["offdiagonal_frobenius_fraction"] > 0.10)
+        ),
     }
+
+    if "lowest_rate_gradient_relative_error" in primary.columns:
+        gates[
+            "T12_low_sampling_rate_bias_is_explicitly_detected"
+        ] = bool(
+            np.any(
+                primary["lowest_rate_gradient_relative_error"]
+                > Config().sampling_gradient_tolerance
+            )
+            or np.any(
+                primary["lowest_rate_hessian_relative_error"]
+                > Config().sampling_hessian_tolerance
+            )
+        )
+
+        gates[
+            "T13_selected_FD_window_is_stable"
+        ] = bool(
+            np.all(
+                primary["fd_selected_gradient_rel_change"] < 0.05
+            )
+            and np.all(
+                primary["fd_selected_hessian_rel_change"] < 0.05
+            )
+        )
 
     if "covariance_median_operator_error" in primary.columns:
         gates["M8_coordinate_covariance_median_error_lt_0_08"] = bool(
@@ -1727,7 +2222,7 @@ def main():
             np.all(primary["radius_scan_stable_points"] >= 2)
         )
 
-    gates["ALL_MINIMAL_CLOSURE_GATES_PASS"] = bool(all(gates.values()))
+    gates["ALL_NUMERICAL_TRUTH_GATES_PASS"] = bool(all(gates.values()))
 
     payload = {
         "scope": (
@@ -1754,17 +2249,25 @@ def main():
     columns = [
         "n_atoms",
         "seed",
-        "simulator_calls_identification",
+        "sampling_rate",
         "objective_mode",
         "target_bitstring",
         "baseline_loss",
         "baseline_gradient_norm",
+        "fit_gradient_relative_error_vs_direct",
+        "fit_hessian_relative_error_vs_direct",
+        "simulator_calls_identification",
         "recovery_median_fro_error",
         "recovery_median_alignment",
         "offdiagonal_frobenius_fraction",
+        "constant_r2",
+        "linear_r2",
         "full_r2",
         "full_spearman",
+        "constant_mae",
+        "linear_mae",
         "full_mae",
+        "linear_mae_ratio_vs_full",
         "diag_mae_ratio",
         "scalar_mae_ratio",
         "rotated_mae_ratio",
@@ -1777,6 +2280,10 @@ def main():
         "gf_lm_median_calls",
         "powell_independent_median_final_loss",
         "powell_independent_median_calls",
+        "lowest_rate_gradient_relative_error",
+        "lowest_rate_hessian_relative_error",
+        "fd_selected_gradient_rel_change",
+        "fd_selected_hessian_rel_change",
     ]
     columns.extend([name for name in optional if name in primary.columns])
 
