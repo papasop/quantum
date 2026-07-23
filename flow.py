@@ -6,19 +6,20 @@ from __future__ import annotations
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PASQAL / PULSER — GEOMETRIC FLOW MINIMAL VALIDATION v1
+PASQAL / PULSER — EXTERNAL-OBJECTIVE RESPONSE GEOMETRY VALIDATION v2
 
 Question tested
 ---------------
 In a genuine interacting Rydberg many-body simulation, can a locally identified
-FULL coupled response operator:
+FULL coupled response operator for a fixed external observable objective:
 
   1) be recovered stably from local pulse perturbations,
   2) predict unseen perturbations better than diagonal/scalar/rotated controls,
   3) improve local optimization through regularized A^{-1} preconditioning?
 
-This is a local Pulser + QuTiP emulator experiment. It is not a QPU claim and
-not a universal compiler test.
+This is a local Pulser + QuTiP emulator experiment with a target fixed
+independently of the unperturbed pulse. It is not a QPU claim and not a
+universal compiler test.
 
 Install in Colab
 ----------------
@@ -109,6 +110,23 @@ class Config:
 
     sampling_rate: float = 0.08
 
+    # ---------------------------------------------------------------------
+    # Fixed external objective, declared independently of z=0.
+    #
+    # Supported:
+    #   "staggered_density"   : mean sitewise match to 1010... pattern
+    #   "target_bitstring"    : 1 - P(1010...)
+    #   "rydberg_density"     : 1 - mean Rydberg excitation
+    #   "parity"              : (1 - <Π Z_i>)/2
+    #
+    # Recommended default: staggered_density.
+    # It is a genuine fixed observable objective and is usually less sparse
+    # than an exact target-bitstring projector.
+    # ---------------------------------------------------------------------
+    objective_mode: str = "staggered_density"
+    staggered_starts_with_one: bool = True
+    reverse_bit_order: bool = False
+
     split_recoveries: int = 12
     split_fraction: float = 0.72
 
@@ -159,7 +177,14 @@ def preset_config(name: str, seed: int, output_dir: str) -> Config:
 # =============================================================================
 
 class RydbergLocalGeometry:
-    """Two-segment global Rydberg pulse with four fractional controls."""
+    """
+    Two-segment global Rydberg pulse with four fractional controls and a
+    fixed external objective.
+
+    The target is declared independently of z=0. Therefore z=0 is not forced
+    to be an exact minimum, the local gradient need not vanish, and the fitted
+    Hessian is not forced to equal the self-reference FS/QFI pullback metric.
+    """
 
     parameter_names = ("dOmega1", "dDelta1", "dOmega2", "dDelta2")
 
@@ -167,13 +192,60 @@ class RydbergLocalGeometry:
         self.cfg = cfg
         coords = [(i * cfg.spacing_um, 0.0) for i in range(cfg.n_atoms)]
         self.register = Register.from_coordinates(coords, prefix="q")
-        self._cache: dict[tuple[float, ...], float] = {}
+
+        self._loss_cache: dict[tuple[float, ...], float] = {}
+        self._state_cache: dict[tuple[float, ...], np.ndarray] = {}
         self.simulator_calls = 0
 
-        self.target_state = self._simulate_state(np.zeros(4, dtype=float))
-        self.target_norm = float(self.target_state.norm())
-        if not np.isfinite(self.target_norm) or self.target_norm <= 0:
-            raise RuntimeError("Invalid reference state returned by Pulser simulation.")
+        self.target_bitstring = self._staggered_target(
+            cfg.n_atoms,
+            starts_with_one=cfg.staggered_starts_with_one,
+        )
+        self.target_index = self._bitstring_to_index(
+            self.target_bitstring,
+            reverse=cfg.reverse_bit_order,
+        )
+
+        if cfg.objective_mode not in {
+            "staggered_density",
+            "target_bitstring",
+            "rydberg_density",
+            "parity",
+        }:
+            raise ValueError(
+                "Unknown objective_mode. Supported values are: "
+                "'staggered_density', 'target_bitstring', "
+                "'rydberg_density', and 'parity'."
+            )
+
+        # Pre-flight simulation only. This state does NOT define the target.
+        psi0 = self._simulate_state(np.zeros(4, dtype=float))
+        expected_dim = 2 ** cfg.n_atoms
+        if psi0.size != expected_dim:
+            raise RuntimeError(
+                f"Expected Hilbert dimension {expected_dim}, "
+                f"but Pulser returned {psi0.size}."
+            )
+
+    @staticmethod
+    def _staggered_target(
+        n_atoms: int,
+        starts_with_one: bool = True,
+    ) -> str:
+        first = "1" if starts_with_one else "0"
+        second = "0" if starts_with_one else "1"
+        return "".join(
+            first if i % 2 == 0 else second
+            for i in range(n_atoms)
+        )
+
+    @staticmethod
+    def _bitstring_to_index(
+        bitstring: str,
+        reverse: bool = False,
+    ) -> int:
+        bits = bitstring[::-1] if reverse else bitstring
+        return int(bits, 2)
 
     def build_sequence(self, z: np.ndarray) -> Sequence:
         z = np.asarray(z, dtype=float)
@@ -186,7 +258,9 @@ class RydbergLocalGeometry:
         delta2 = self.cfg.delta_2 * (1.0 + z[3])
 
         if omega1 <= 0 or omega2 <= 0:
-            raise ValueError("Perturbation produced a non-positive Rabi amplitude.")
+            raise ValueError(
+                "Perturbation produced a non-positive Rabi amplitude."
+            )
 
         seq = Sequence(self.register, MockDevice)
         seq.declare_channel("rydberg", "rydberg_global")
@@ -210,7 +284,13 @@ class RydbergLocalGeometry:
         )
         return seq
 
-    def _simulate_state(self, z: np.ndarray):
+    def _simulate_state(self, z: np.ndarray) -> np.ndarray:
+        z = np.asarray(z, dtype=float)
+        key = tuple(np.round(z, 12))
+
+        if key in self._state_cache:
+            return self._state_cache[key].copy()
+
         seq = self.build_sequence(z)
         emulator = QutipEmulator.from_sequence(
             seq,
@@ -219,35 +299,163 @@ class RydbergLocalGeometry:
         )
         result = emulator.run()
         self.simulator_calls += 1
-        return result.get_final_state()
+
+        state = result.get_final_state()
+        if hasattr(state, "full"):
+            psi = np.asarray(
+                state.full(),
+                dtype=np.complex128,
+            ).reshape(-1)
+        else:
+            psi = np.asarray(
+                state,
+                dtype=np.complex128,
+            ).reshape(-1)
+
+        norm = float(np.linalg.norm(psi))
+        if not np.isfinite(norm) or norm <= 0.0:
+            raise RuntimeError("Pulser returned an invalid final state.")
+
+        psi = psi / norm
+        self._state_cache[key] = psi.copy()
+        return psi
+
+    def _probabilities(self, z: np.ndarray) -> np.ndarray:
+        psi = self._simulate_state(z)
+        probabilities = np.abs(psi) ** 2
+        probabilities /= np.sum(probabilities)
+        return probabilities.real
+
+    def _basis_bits(self) -> np.ndarray:
+        """
+        Return an array of shape (2**N, N) containing computational-basis bits.
+
+        The direct convention maps index -> format(index, f"0{N}b").
+        Set reverse_bit_order=True only after an explicit basis-order check.
+        """
+        n = self.cfg.n_atoms
+        dim = 2 ** n
+        rows = []
+
+        for index in range(dim):
+            bitstring = format(index, f"0{n}b")
+            if self.cfg.reverse_bit_order:
+                bitstring = bitstring[::-1]
+            rows.append([int(bit) for bit in bitstring])
+
+        return np.asarray(rows, dtype=float)
+
+    def observable_reward(self, z: np.ndarray) -> float:
+        """
+        Return a reward in [0, 1] for the selected fixed external objective.
+
+        The optimized loss is J(z) = 1 - reward(z).
+        """
+        probabilities = self._probabilities(z)
+        mode = self.cfg.objective_mode
+
+        if mode == "target_bitstring":
+            return float(
+                np.clip(
+                    probabilities[self.target_index],
+                    0.0,
+                    1.0,
+                )
+            )
+
+        bits = self._basis_bits()
+
+        if mode == "rydberg_density":
+            reward_per_basis_state = np.mean(bits, axis=1)
+
+        elif mode == "staggered_density":
+            target = np.asarray(
+                [int(bit) for bit in self.target_bitstring],
+                dtype=float,
+            )
+            matches = (
+                bits * target[None, :]
+                + (1.0 - bits) * (1.0 - target[None, :])
+            )
+            reward_per_basis_state = np.mean(matches, axis=1)
+
+        elif mode == "parity":
+            # Map bit 0 -> +1 and bit 1 -> -1.
+            parity_eigenvalue = np.prod(1.0 - 2.0 * bits, axis=1)
+            reward_per_basis_state = 0.5 * (1.0 + parity_eigenvalue)
+
+        else:
+            raise RuntimeError(f"Unhandled objective mode: {mode}")
+
+        reward = float(probabilities @ reward_per_basis_state)
+        return float(np.clip(reward, 0.0, 1.0))
 
     def loss(self, z: np.ndarray) -> float:
         """
-        Infidelity to the unperturbed many-body final state.
+        Fixed external-objective loss:
 
-        This gives a device/process-local robustness landscape:
-            J(z) = 1 - |<psi(0)|psi(z)>|^2.
+            J(z) = 1 - R(z),
+
+        where R is selected by cfg.objective_mode and does not depend on
+        the unperturbed final state.
         """
         z = np.asarray(z, dtype=float)
         key = tuple(np.round(z, 12))
-        if key in self._cache:
-            return self._cache[key]
 
-        state = self._simulate_state(z)
-        overlap = self.target_state.overlap(state)
-        fidelity = float(np.clip(abs(overlap) ** 2, 0.0, 1.0))
-        value = 1.0 - fidelity
-        self._cache[key] = value
+        if key in self._loss_cache:
+            return self._loss_cache[key]
+
+        value = 1.0 - self.observable_reward(z)
+        value = float(np.clip(value, 0.0, 1.0))
+        self._loss_cache[key] = value
         return value
 
     def gradient(self, z: np.ndarray, h: float) -> np.ndarray:
         z = np.asarray(z, dtype=float)
         grad = np.zeros(4, dtype=float)
+
         for j in range(4):
             e = np.zeros(4, dtype=float)
             e[j] = h
-            grad[j] = (self.loss(z + e) - self.loss(z - e)) / (2.0 * h)
+            grad[j] = (
+                self.loss(z + e) - self.loss(z - e)
+            ) / (2.0 * h)
+
         return grad
+
+    def local_hessian(self, z: np.ndarray, h: float) -> np.ndarray:
+        """
+        Direct finite-difference Hessian used only for structural auditing.
+        """
+        z = np.asarray(z, dtype=float)
+        hessian = np.zeros((4, 4), dtype=float)
+        f0 = self.loss(z)
+
+        for i in range(4):
+            ei = np.zeros(4, dtype=float)
+            ei[i] = h
+
+            hessian[i, i] = (
+                self.loss(z + ei)
+                - 2.0 * f0
+                + self.loss(z - ei)
+            ) / (h ** 2)
+
+            for j in range(i + 1, 4):
+                ej = np.zeros(4, dtype=float)
+                ej[j] = h
+
+                value = (
+                    self.loss(z + ei + ej)
+                    - self.loss(z + ei - ej)
+                    - self.loss(z - ei + ej)
+                    + self.loss(z - ei - ej)
+                ) / (4.0 * h ** 2)
+
+                hessian[i, j] = value
+                hessian[j, i] = value
+
+        return 0.5 * (hessian + hessian.T)
 
 
 # =============================================================================
@@ -517,9 +725,9 @@ def plot_heldout(y: np.ndarray, predictions: dict[str, np.ndarray], path: Path) 
     lo = min(float(np.min(y)), *(float(np.min(v)) for v in predictions.values()))
     hi = max(float(np.max(y)), *(float(np.max(v)) for v in predictions.values()))
     plt.plot([lo, hi], [lo, hi], linestyle="--")
-    plt.xlabel("Observed held-out infidelity")
-    plt.ylabel("Predicted held-out infidelity")
-    plt.title("Rydberg pulse held-out prediction")
+    plt.xlabel("Observed held-out external-objective loss")
+    plt.ylabel("Predicted held-out external-objective loss")
+    plt.title("Fixed-objective Rydberg held-out prediction")
     plt.legend()
     plt.tight_layout()
     plt.savefig(path, dpi=180)
@@ -539,7 +747,7 @@ def plot_optimization(df: pd.DataFrame, path: Path) -> None:
         plt.plot(sub["iteration"], sub["loss"], marker="o", label=method)
     plt.yscale("log")
     plt.xlabel("Iteration")
-    plt.ylabel("Median infidelity")
+    plt.ylabel("Median external-objective loss")
     plt.title("Local optimization: raw gradient vs geometric preconditioning")
     plt.legend()
     plt.tight_layout()
@@ -557,10 +765,10 @@ def run(cfg: Config) -> dict[str, object]:
     out = Path(cfg.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    print("[1/5] Building interacting Pulser model and reference state...")
+    print("[1/5] Building interacting Pulser model and fixed external objective...")
     model = RydbergLocalGeometry(cfg)
     baseline_loss = model.loss(np.zeros(4))
-    print(f"      baseline infidelity = {baseline_loss:.3e}")
+    print(f"      baseline external-objective loss = {baseline_loss:.3e}")
 
     print("[2/5] Simulating local discovery perturbations...")
     z_train = symmetric_local_design(
@@ -704,6 +912,8 @@ def run(cfg: Config) -> dict[str, object]:
         "config": asdict(cfg),
         "pulser_version": getattr(pulser, "__version__", "unknown"),
         "baseline_loss": baseline_loss,
+        "objective_mode": cfg.objective_mode,
+        "target_bitstring": model.target_bitstring,
         "quadratic_intercept": c,
         "quadratic_gradient": g.tolist(),
         "A_full": a_full.tolist(),
@@ -759,7 +969,7 @@ def run(cfg: Config) -> dict[str, object]:
 #   3. independent full-emulator optimizer comparison,
 #   4. coordinate-transformation covariance audit.
 #
-# Primary held-out target remains the original unseen FULL-emulator infidelity.
+# Primary held-out target remains the unseen FULL-emulator external-objective loss.
 # No surrogate is relabelled as a re-optimized simulator target.
 # =============================================================================
 
@@ -960,7 +1170,17 @@ def run_identification_case(
         "seed": cfg.seed,
         "radius": cfg.perturbation_radius,
         "simulator_calls_identification": model.simulator_calls,
+        "objective_mode": cfg.objective_mode,
+        "target_bitstring": model.target_bitstring,
         "baseline_loss": model.loss(np.zeros(4)),
+        "baseline_gradient_norm": float(
+            np.linalg.norm(
+                model.gradient(
+                    np.zeros(4),
+                    cfg.finite_difference_h,
+                )
+            )
+        ),
         "recovery_median_fro_error": float(
             split_df["relative_frobenius_error"].median()
         ),
@@ -1335,8 +1555,8 @@ def main():
         print(f"[warning] version report failed: {version_exc}")
     print("backend=original Pulser/QutipEmulator")
     print("pulse model=original two-segment global Rydberg pulse")
-    print("loss=original infidelity to unperturbed many-body final state")
-    print("heldout target=original unseen FULL-emulator infidelity")
+    print(f"loss=fixed external objective: {Config().objective_mode}")
+    print("heldout target=unseen FULL-emulator external-objective loss")
     print()
 
     t0 = time.time()
@@ -1447,6 +1667,7 @@ def main():
                 f"R2={row['full_r2']:.6f} "
                 f"rho={row['full_spearman']:.6f} "
                 f"off={row['offdiagonal_frobenius_fraction']:.4f} "
+                f"|g0|={row['baseline_gradient_norm']:.3e} "
                 f"diag/full={row['diag_mae_ratio']:.2f}x "
                 f"calls={row['simulator_calls_identification']}"
             )
@@ -1492,6 +1713,9 @@ def main():
         "M7_nontrivial_offdiagonal_everywhere": bool(
             np.all(primary["offdiagonal_frobenius_fraction"] > 0.10)
         ),
+        "M7b_external_objective_gradient_nonzero_everywhere": bool(
+            np.all(primary["baseline_gradient_norm"] > 1.0e-8)
+        ),
     }
 
     if "covariance_median_operator_error" in primary.columns:
@@ -1507,7 +1731,7 @@ def main():
 
     payload = {
         "scope": (
-            "Original ideal interacting Pulser/QutipEmulator 5→7→9 model, "
+            "Interacting Pulser/QutipEmulator 5→7→9 model with a fixed external objective, "
             "extended only by multi-seed, radius, independent-optimizer, "
             "and coordinate-covariance audits."
         ),
@@ -1531,6 +1755,10 @@ def main():
         "n_atoms",
         "seed",
         "simulator_calls_identification",
+        "objective_mode",
+        "target_bitstring",
+        "baseline_loss",
+        "baseline_gradient_norm",
         "recovery_median_fro_error",
         "recovery_median_alignment",
         "offdiagonal_frobenius_fraction",
@@ -1566,7 +1794,7 @@ def main():
     print(f"Outputs: {out}")
     print(
         "\nInterpretation boundary: these extensions test robustness of the "
-        "original local Pulser/QutipEmulator result. They do not establish "
+        "fixed-external-objective local Pulser/QutipEmulator result. They do not establish "
         "a global geodesic law or a universal computation-as-flow theorem."
     )
 
