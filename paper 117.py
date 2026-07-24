@@ -36,8 +36,9 @@ Paper closure
 - Adds the exact signed-gap schedule identity as a fail-fast schedule check:
     D(1-f,+g) = D(f,-g).
 - Decomposes positive-gap witnesses into f-reflection even and odd parts.
-- Turns equal-A2 three-segment pairs into a decisive insufficiency diagnostic
-  and measures one-pulse versus three-identical-pulse segmentation artifacts.
+- Turns equal-A2 three-segment pairs into a predeclared, non-fail-fast
+  scientific test and measures the exact-expm segmentation floor; the Pulser
+  constant-waveform comparison is an implementation identity only.
 - Records script SHA256, pip freeze, per-point timing, and installed versions.
 
 Colab install:
@@ -82,18 +83,36 @@ MAX_DURATION_NS = 10000
 OMEGA = 1.22
 SPACING_UM = 8.0
 AVG_DETUNING = -0.31
-# Frozen common duration for every N=8 paper diagnostic. It is divisible by
-# 3*CLOCK_NS, so the two-segment scan and equal-duration three-segment test use
-# exactly the same physical duration.
-PAPER_TOTAL_NS = 4044
+PAPER_N = 8
+PAPER_LOOP = 2.22
+PAPER_RAW_DURATION_NS = (
+    1000.0
+    * 2.0
+    * math.pi
+    * PAPER_LOOP
+    / (math.sqrt(PAPER_N) * OMEGA)
+)
+# Support both three equal clock-aligned segments and a clock-aligned half
+# split. The nearest compatible duration to the continuous loop prescription
+# lies on an lcm(12 ns, 8 ns)=24 ns grid.
+PAPER_DURATION_ALIGNMENT_NS = math.lcm(3 * CLOCK_NS, 2 * CLOCK_NS)
+PAPER_TOTAL_NS = int(
+    round(PAPER_RAW_DURATION_NS / PAPER_DURATION_ALIGNMENT_NS)
+    * PAPER_DURATION_ALIGNMENT_NS
+)
 CROSS_VALIDATION_MAX_INFIDELITY = 1.0e-5
+CROSS_VALIDATION_MAX_PAIR_D_REL_ERROR = 5.0e-2
+CROSS_VALIDATION_MAX_PAIR_TVD_REL_ERROR = 5.0e-2
 ZERO_GAP_INFIDELITY_TOL = 1.0e-10
 ZERO_GAP_TVD_TOL = 1.0e-7
 MIN_SIGNAL_TO_FLOOR = 50.0
 SCHEDULE_MATCH_TOL = 1.0e-12
 
-if PAPER_TOTAL_NS % (3 * CLOCK_NS) != 0:
-    raise RuntimeError("PAPER_TOTAL_NS must be divisible by 3*CLOCK_NS.")
+if PAPER_TOTAL_NS % PAPER_DURATION_ALIGNMENT_NS != 0:
+    raise RuntimeError(
+        "PAPER_TOTAL_NS must support three equal clock-aligned segments "
+        "and a clock-aligned half split."
+    )
 if not (MIN_DURATION_NS <= PAPER_TOTAL_NS <= MAX_DURATION_NS):
     raise RuntimeError("PAPER_TOTAL_NS is outside the supported duration range.")
 
@@ -164,12 +183,6 @@ def state_fidelity(psi, phi):
     return float(abs(state_overlap(psi, phi)) ** 2)
 
 
-def pure_trace_distance(psi, phi):
-    """Physical pure-state trace distance with roundoff-safe clipping."""
-    fidelity = float(np.clip(state_fidelity(psi, phi), 0.0, 1.0))
-    return float(math.sqrt(1.0 - fidelity))
-
-
 def fidelity_roundoff_scale(psi, phi):
     """
     Conservative cancellation/roundoff scale from raw 1-F.
@@ -187,6 +200,20 @@ def phase_aligned_state_residual(psi, phi):
     overlap = np.vdot(phi, psi)
     phase = overlap / abs(overlap) if abs(overlap) > 0.0 else 1.0 + 0.0j
     return float(np.linalg.norm(psi - phase * phi))
+
+
+def pure_trace_distance(psi, phi):
+    """
+    Stable physical pure-state trace distance.
+
+    If r is the phase-aligned Euclidean residual, then
+    |<psi|phi>| = 1-r^2/2 and D = r*sqrt(1-r^2/4). This avoids catastrophic
+    cancellation in 1-F for nearly identical states.
+    """
+    residual = phase_aligned_state_residual(psi, phi)
+    return float(
+        residual * math.sqrt(max(0.0, 1.0 - residual**2 / 4.0))
+    )
 
 
 def fubini_study_angle(psi, phi):
@@ -510,10 +537,10 @@ def signed_second_order_detuning_area(segments):
 
 
 def run_3segment_magnus_diagnostic(
+    nominal_total_ns,
     n=8,
     omega=OMEGA,
     avg_det=AVG_DETUNING,
-    nominal_total_ns=None,
     numerical_floor_D=0.0,
     numerical_floor_TVD=0.0,
 ):
@@ -528,8 +555,6 @@ def run_3segment_magnus_diagnostic(
     diagnostic beyond the paper's two-segment claim, not a proof of a universal
     three-segment law.
     """
-    if nominal_total_ns is None:
-        nominal_total_ns = PAPER_TOTAL_NS if n == 8 else duration_from_loop_ns(n)
     nominal_total_ns = int(nominal_total_ns)
     if nominal_total_ns % (3 * CLOCK_NS) != 0:
         raise ValueError(
@@ -568,7 +593,7 @@ def run_3segment_magnus_diagnostic(
         "constant_one_pulse_vs_three_identical_pulser",
     )
     segmentation_exact_D_numerical_scale = max(
-        float(segmentation_exact["fidelity_roundoff_scale"]),
+        float(segmentation_exact["pure_trace_distance"]),
         float(segmentation_exact["phase_aligned_state_residual"]),
     )
     pulser_segmentation_check = {
@@ -854,11 +879,23 @@ def run_117_scan():
     comm_norm = fixed_commutator_norm(n)
     print(f"N={n}, total_ns={total_ns}, fixed_comm_norm={comm_norm:.6f}")
     print("Grid: 9 gaps in [0, 0.24], 13 fractions in [0.10, 0.90]")
+    gap_grid = np.linspace(0.0, 0.24, 9)
+    fraction_grid = np.linspace(0.10, 0.90, 13)
+    d1_set = {
+        split_duration_clock(total_ns, float(frac))[0]
+        for frac in fraction_grid
+    }
+    reflected_duration_set = {total_ns - duration for duration in d1_set}
+    reflection_grid_closed = d1_set == reflected_duration_set
+    if not reflection_grid_closed:
+        raise AssertionError(
+            "Fraction grid is not closed under f -> 1-f after clock rounding."
+        )
 
     rows = []
     idx = 0
-    for gap in np.linspace(0.0, 0.24, 9):
-        for frac_nom in np.linspace(0.10, 0.90, 13):
+    for gap in gap_grid:
+        for frac_nom in fraction_grid:
             point_start = time.perf_counter()
             idx += 1
             d1, d2, T = split_duration_clock(total_ns, frac_nom)
@@ -966,7 +1003,7 @@ def run_117_scan():
     min_signal_D = float(nonzero["pure_trace_distance"].min())
     effective_D_floor = max(
         numerical_floor["max_D"],
-        numerical_floor["max_fidelity_roundoff_scale"],
+        numerical_floor["max_phase_aligned_state_residual"],
         1.0e-15,
     )
     signal_to_floor = min_signal_D / effective_D_floor
@@ -1048,6 +1085,19 @@ def run_117_scan():
             )
         even_odd_rows.append(out)
     even_odd_df = pd.DataFrame(even_odd_rows)
+    left_half_count = sum(
+        split_duration_clock(total_ns, float(frac))[0]
+        <= split_duration_clock(total_ns, float(frac))[1]
+        for frac in fraction_grid
+    )
+    expected_even_odd_rows = int(np.count_nonzero(gap_grid > 0.0)) * int(
+        left_half_count
+    )
+    if len(even_odd_df) != expected_even_odd_rows:
+        raise AssertionError(
+            f"Reflection audit has {len(even_odd_df)} rows; expected "
+            f"{expected_even_odd_rows}."
+        )
     even_odd_df.to_csv(OUTDIR / "f_reflection_even_odd.csv", index=False)
 
     # Exact signed-gap schedule identity. This is an algebraic relabelling and
@@ -1126,15 +1176,16 @@ def run_117_scan():
         "D_RMSE_linear_support": float(
             d_models.loc["C_linear_support", "rmse"]
         ),
-        "preferred_on_this_fixed_T_grid": (
+        "better_of_two_predeclared_proxies_on_fixed_T_grid": (
             "C_linear_support"
             if d_models.loc["C_linear_support", "rmse"]
             < d_models.loc["C_BCH_shape", "rmse"]
             else "C_BCH_shape"
         ),
         "boundary": (
-            "Fixed T cannot determine T versus T^2 scaling; this comparison "
-            "selects schedule-shape proxies only."
+            "Only two predeclared physically motivated proxies are compared. "
+            "This is not a search over arbitrary functions, and fixed T "
+            "cannot determine T versus T^2 scaling."
         ),
     }
 
@@ -1143,17 +1194,39 @@ def run_117_scan():
         "primary_backend": "scipy_expm",
         "N": n,
         "points": len(df),
-        "grid": {"gaps": [float(x) for x in np.linspace(0.0,0.24,9)],
-                 "fracs": [float(x) for x in np.linspace(0.10,0.90,13)]},
+        "grid": {
+            "gaps": [float(x) for x in gap_grid],
+            "fracs": [float(x) for x in fraction_grid],
+            "reflection_closed_after_clock_rounding": reflection_grid_closed,
+            "duration1_values_ns": sorted(int(x) for x in d1_set),
+            "expected_even_odd_rows": expected_even_odd_rows,
+        },
         "zero_gap_control_points": int((df["gap"]==0).sum()),
         "nonzero_gap_points": int((df["gap"]>0).sum()),
         "total_duration_ns": total_ns,
+        "duration_selection": {
+            "continuous_loop_target_ns": PAPER_RAW_DURATION_NS,
+            "required_alignment_ns": PAPER_DURATION_ALIGNMENT_NS,
+            "selected_total_ns": PAPER_TOTAL_NS,
+            "offset_from_continuous_target_ns": (
+                PAPER_TOTAL_NS - PAPER_RAW_DURATION_NS
+            ),
+            "reason": (
+                "Nearest duration supporting three equal clock-aligned "
+                "segments and a reflection-closed half split."
+            ),
+        },
         "Omega": OMEGA,
         "pulse_area": float(df["pulse_area"].iloc[0]),
         "avg_detuning_target": AVG_DETUNING,
         "fixed_commutator_norm_metadata": comm_norm,
         "zero_gap_numerical_floor": numerical_floor,
         "effective_D_floor": effective_D_floor,
+        "fidelity_roundoff_scale_role": (
+            "Overlap-cancellation diagnostic only; it is not used as the "
+            "physical D floor because D is computed from the stable "
+            "phase-aligned residual."
+        ),
         "weakest_nonzero_D": min_signal_D,
         "weakest_D_to_floor_ratio": signal_to_floor,
         "rough_shot_scale_from_N8_TVD": {
@@ -1240,19 +1313,25 @@ def run_cross_validation():
         (8, 0.50, 0.12),
         (8, 0.80, 0.24),
     ]
-    rows = []
+    state_rows = []
+    pair_rows = []
     for n, fraction, gap in test_specs:
         total_ns = PAPER_TOTAL_NS if n == 8 else duration_from_loop_ns(n)
         d1, d2, _ = split_duration_clock(total_ns, fraction)
         forward, reverse, f_actual = make_two_segment_schedules(
             total_ns, d1, gap, AVG_DETUNING
         )
+        states = {}
         for order_name, segments in [("forward", forward), ("reverse", reverse)]:
             psi_p, branch = final_statevector_from_segments(n, segments)
             psi_e = exact_state_from_segments(n, segments)
+            states[order_name] = {
+                "pulser": psi_p,
+                "expm": psi_e,
+            }
             fidelity = state_fidelity(psi_p, psi_e)
             infidelity = abs(1.0 - fidelity)
-            rows.append(
+            state_rows.append(
                 {
                     "N": n,
                     "frac_actual": f_actual,
@@ -1269,19 +1348,100 @@ def run_cross_validation():
                 f"fidelity={fidelity:.12f} infidelity={infidelity:.3e}"
             )
 
-    cv_df = pd.DataFrame(rows)
+        exact_pair = pair_metrics(
+            states["forward"]["expm"],
+            states["reverse"]["expm"],
+            "forward_vs_reverse_expm",
+        )
+        pulser_pair = pair_metrics(
+            states["forward"]["pulser"],
+            states["reverse"]["pulser"],
+            "forward_vs_reverse_pulser",
+        )
+        d_exact = float(exact_pair["pure_trace_distance"])
+        d_pulser = float(pulser_pair["pure_trace_distance"])
+        tvd_exact = float(exact_pair["TVD_distribution"])
+        tvd_pulser = float(pulser_pair["TVD_distribution"])
+        pair_row = {
+            "N": n,
+            "total_duration_ns": total_ns,
+            "frac_actual": f_actual,
+            "gap": gap,
+            "D_expm": d_exact,
+            "D_pulser": d_pulser,
+            "D_abs_error": abs(d_pulser - d_exact),
+            "D_relative_error": (
+                abs(d_pulser - d_exact) / d_exact
+                if d_exact > 0.0
+                else None
+            ),
+            "TVD_expm": tvd_exact,
+            "TVD_pulser": tvd_pulser,
+            "TVD_abs_error": abs(tvd_pulser - tvd_exact),
+            "TVD_relative_error": (
+                abs(tvd_pulser - tvd_exact) / tvd_exact
+                if tvd_exact > 0.0
+                else None
+            ),
+        }
+        pair_rows.append(pair_row)
+        print(
+            "  pair witness errors: "
+            f"|dD|={pair_row['D_abs_error']:.3e}, "
+            f"|dTVD|={pair_row['TVD_abs_error']:.3e}"
+        )
+
+    cv_df = pd.DataFrame(state_rows)
+    pair_df = pd.DataFrame(pair_rows)
     max_infidelity = float(cv_df["infidelity"].max())
+    max_pair_D_abs_error = float(pair_df["D_abs_error"].max())
+    max_pair_TVD_abs_error = float(pair_df["TVD_abs_error"].max())
+    max_pair_D_relative_error = float(pair_df["D_relative_error"].max())
+    max_pair_TVD_relative_error = float(
+        pair_df["TVD_relative_error"].max()
+    )
     if max_infidelity > CROSS_VALIDATION_MAX_INFIDELITY:
         raise AssertionError(
             f"Pulser/expm cross-validation failed: max infidelity "
             f"{max_infidelity:.3e} > {CROSS_VALIDATION_MAX_INFIDELITY:.3e}"
         )
+    if max_pair_D_relative_error > CROSS_VALIDATION_MAX_PAIR_D_REL_ERROR:
+        raise AssertionError(
+            "Pulser/expm D-witness cross-validation failed: "
+            f"{max_pair_D_relative_error:.3e} > "
+            f"{CROSS_VALIDATION_MAX_PAIR_D_REL_ERROR:.3e}"
+        )
+    if max_pair_TVD_relative_error > CROSS_VALIDATION_MAX_PAIR_TVD_REL_ERROR:
+        raise AssertionError(
+            "Pulser/expm TVD-witness cross-validation failed: "
+            f"{max_pair_TVD_relative_error:.3e} > "
+            f"{CROSS_VALIDATION_MAX_PAIR_TVD_REL_ERROR:.3e}"
+        )
 
     cv_df.to_csv(OUTDIR / "cross_validation_points.csv", index=False)
+    pair_df.to_csv(
+        OUTDIR / "cross_validation_pair_witnesses.csv", index=False
+    )
     cv_cert = {
         "points": cv_df.to_dict(orient="records"),
+        "pair_witnesses": pair_df.to_dict(orient="records"),
         "max_infidelity": max_infidelity,
         "max_allowed_infidelity": CROSS_VALIDATION_MAX_INFIDELITY,
+        "max_pair_D_abs_error": max_pair_D_abs_error,
+        "max_pair_TVD_abs_error": max_pair_TVD_abs_error,
+        "max_pair_D_relative_error": max_pair_D_relative_error,
+        "max_pair_TVD_relative_error": max_pair_TVD_relative_error,
+        "max_allowed_pair_D_relative_error": (
+            CROSS_VALIDATION_MAX_PAIR_D_REL_ERROR
+        ),
+        "max_allowed_pair_TVD_relative_error": (
+            CROSS_VALIDATION_MAX_PAIR_TVD_REL_ERROR
+        ),
+        "pair_witness_role": (
+            "Direct Pulser-versus-expm agreement for the paper's forward/"
+            "reverse D and TVD witnesses, reported in addition to individual-"
+            "state fidelity."
+        ),
         "versions": {
             "platform": platform.platform(),
             "python": sys.version,
@@ -1294,7 +1454,9 @@ def run_cross_validation():
     with open(OUTDIR / "cross_validation.json", "w") as f:
         json.dump(json_sanitize(cv_cert), f, indent=2, allow_nan=False)
     print(
-        f"CROSS-VALIDATION PASS: max infidelity={max_infidelity:.3e}"
+        f"CROSS-VALIDATION PASS: max infidelity={max_infidelity:.3e}, "
+        f"max |dD|={max_pair_D_abs_error:.3e}, "
+        f"max |dTVD|={max_pair_TVD_abs_error:.3e}"
     )
     return cv_df, cv_cert
 
@@ -1372,8 +1534,8 @@ def main():
     print("output:", OUTDIR)
     print(
         "scope: 117-point scan + signed-gap/reflection audit + "
-        "six equal-duration permutations + segmentation control + "
-        "sampled Pulser cross-validation"
+        "six equal-duration permutations + exact-expm segmentation floor + "
+        "Pulser implementation identity + direct witness cross-validation"
     )
     started = time.perf_counter()
 
@@ -1412,6 +1574,12 @@ def main():
             == three_segment["matched_total_duration_ns"]
             == PAPER_TOTAL_NS
         ),
+        "reflection_grid_closed": (
+            scan_cert["grid"]["reflection_closed_after_clock_rounding"]
+            and len(even_odd_df)
+            == scan_cert["grid"]["expected_even_odd_rows"]
+            == 56
+        ),
         "signed_gap_schedule_identity_pass": (
             scan_cert["signed_gap_schedule_identity"][
                 "max_schedule_parameter_error"
@@ -1423,6 +1591,12 @@ def main():
         ),
         "pulser_cross_validation_pass": (
             cv_cert["max_infidelity"] <= CROSS_VALIDATION_MAX_INFIDELITY
+        ),
+        "direct_pair_witness_cross_validation_pass": (
+            cv_cert["max_pair_D_relative_error"]
+            <= CROSS_VALIDATION_MAX_PAIR_D_REL_ERROR
+            and cv_cert["max_pair_TVD_relative_error"]
+            <= CROSS_VALIDATION_MAX_PAIR_TVD_REL_ERROR
         ),
         "six_permutations_present": len(permutation_df) == 6,
         "expm_segmentation_floor_below_signal": (
@@ -1495,6 +1669,16 @@ def main():
         ],
         "effective_D_floor": scan_cert["effective_D_floor"],
         "cross_validation_max_infidelity": cv_cert["max_infidelity"],
+        "cross_validation_pair_witness_errors": {
+            "max_D_abs_error": cv_cert["max_pair_D_abs_error"],
+            "max_TVD_abs_error": cv_cert["max_pair_TVD_abs_error"],
+            "max_D_relative_error": cv_cert[
+                "max_pair_D_relative_error"
+            ],
+            "max_TVD_relative_error": cv_cert[
+                "max_pair_TVD_relative_error"
+            ],
+        },
         "segmentation_control_expm": segmentation_expm,
         "segmentation_control_pulser": segmentation_pulser,
         "equal_A2_differences": equal_a2,
