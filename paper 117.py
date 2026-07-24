@@ -18,9 +18,11 @@ Scientific scope
   With only one T, the scan cannot determine T versus T^2 scaling.
 - Correlations describe a deterministic parameter scan. No iid significance
   p-values are reported.
-- Signed-gap symmetry, f-reflection even/odd response, zero-gap numerical
-  floors, equal-A2 three-segment degeneracies, and the one-pulse versus
-  three-identical-pulse segmentation control are reported explicitly.
+- The signed-gap relation is treated as an algebraic schedule identity, not as
+  an independent numerical witness. The f-reflection even/odd response,
+  zero-gap numerical floors, equal-A2 three-segment degeneracies, and the
+  one-pulse versus three-identical-pulse numerical segmentation check are
+  reported explicitly.
 - This file deliberately excludes the N=2 shared-generator certificate and
   every variable-partition extension. Those are separate research questions.
 
@@ -31,7 +33,7 @@ Paper closure
 - Uses scipy evolution for the full scan and adds the weakest g=0.03 point to
   Pulser cross-validation.
 - Compares BCH and linear-response-support proxies with residual tables.
-- Adds the exact signed-gap schedule identity and numerical witness gate:
+- Adds the exact signed-gap schedule identity as a fail-fast schedule check:
     D(1-f,+g) = D(f,-g).
 - Decomposes positive-gap witnesses into f-reflection even and odd parts.
 - Turns equal-A2 three-segment pairs into a decisive insufficiency diagnostic
@@ -80,12 +82,20 @@ MAX_DURATION_NS = 10000
 OMEGA = 1.22
 SPACING_UM = 8.0
 AVG_DETUNING = -0.31
+# Frozen common duration for every N=8 paper diagnostic. It is divisible by
+# 3*CLOCK_NS, so the two-segment scan and equal-duration three-segment test use
+# exactly the same physical duration.
+PAPER_TOTAL_NS = 4044
 CROSS_VALIDATION_MAX_INFIDELITY = 1.0e-5
 ZERO_GAP_INFIDELITY_TOL = 1.0e-10
 ZERO_GAP_TVD_TOL = 1.0e-7
 MIN_SIGNAL_TO_FLOOR = 50.0
-SYMMETRY_ABS_TOL = 2.0e-10
 SCHEDULE_MATCH_TOL = 1.0e-12
+
+if PAPER_TOTAL_NS % (3 * CLOCK_NS) != 0:
+    raise RuntimeError("PAPER_TOTAL_NS must be divisible by 3*CLOCK_NS.")
+if not (MIN_DURATION_NS <= PAPER_TOTAL_NS <= MAX_DURATION_NS):
+    raise RuntimeError("PAPER_TOTAL_NS is outside the supported duration range.")
 
 # ---------- output directory with timestamp ----------
 TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
@@ -155,7 +165,28 @@ def state_fidelity(psi, phi):
 
 
 def pure_trace_distance(psi, phi):
-    return float(math.sqrt(max(0.0, 1.0 - state_fidelity(psi, phi))))
+    """Physical pure-state trace distance with roundoff-safe clipping."""
+    fidelity = float(np.clip(state_fidelity(psi, phi), 0.0, 1.0))
+    return float(math.sqrt(1.0 - fidelity))
+
+
+def fidelity_roundoff_scale(psi, phi):
+    """
+    Conservative cancellation/roundoff scale from raw 1-F.
+
+    This is a numerical diagnostic, not a physical distance. In particular,
+    raw F may exceed one by floating-point roundoff.
+    """
+    return float(math.sqrt(abs(1.0 - state_fidelity(psi, phi))))
+
+
+def phase_aligned_state_residual(psi, phi):
+    """Direct projective vector residual, avoiding cancellation in 1-F."""
+    psi = normalize_state(psi)
+    phi = normalize_state(phi)
+    overlap = np.vdot(phi, psi)
+    phase = overlap / abs(overlap) if abs(overlap) > 0.0 else 1.0 + 0.0j
+    return float(np.linalg.norm(psi - phase * phi))
 
 
 def fubini_study_angle(psi, phi):
@@ -192,6 +223,10 @@ def pair_metrics(psi_a, psi_b, pair_label):
         "fidelity": state_fidelity(psi_a, psi_b),
         "overlap_abs": overlap_abs,
         "pure_trace_distance": pure_trace_distance(psi_a, psi_b),
+        "fidelity_roundoff_scale": fidelity_roundoff_scale(psi_a, psi_b),
+        "phase_aligned_state_residual": phase_aligned_state_residual(
+            psi_a, psi_b
+        ),
         "fubini_study_angle_rad": fubini_study_angle(psi_a, psi_b),
         "TVD_distribution": tvd_prob(p, q),
         "phase_gap_BC_minus_overlap": phase_gap,
@@ -480,6 +515,7 @@ def run_3segment_magnus_diagnostic(
     avg_det=AVG_DETUNING,
     nominal_total_ns=None,
     numerical_floor_D=0.0,
+    numerical_floor_TVD=0.0,
 ):
     """
     Compare all six temporal permutations of three detunings.
@@ -493,14 +529,20 @@ def run_3segment_magnus_diagnostic(
     three-segment law.
     """
     if nominal_total_ns is None:
-        nominal_total_ns = duration_from_loop_ns(n)
-    duration_each_ns = int(
-        round((nominal_total_ns / 3.0) / CLOCK_NS) * CLOCK_NS
-    )
+        nominal_total_ns = PAPER_TOTAL_NS if n == 8 else duration_from_loop_ns(n)
+    nominal_total_ns = int(nominal_total_ns)
+    if nominal_total_ns % (3 * CLOCK_NS) != 0:
+        raise ValueError(
+            f"Three-segment total {nominal_total_ns} ns must be divisible by "
+            f"3*CLOCK_NS={3 * CLOCK_NS} ns."
+        )
+    duration_each_ns = nominal_total_ns // 3
     if duration_each_ns < MIN_DURATION_NS:
         raise ValueError("Clock-aligned three-segment duration is too short.")
 
     total_ns = 3 * duration_each_ns
+    if total_ns != nominal_total_ns:
+        raise AssertionError("Three-segment diagnostic changed total duration.")
     detunings = (avg_det - 0.12, avg_det, avg_det + 0.12)
     constant_single = [(avg_det, total_ns)]
     constant_three = [(avg_det, duration_each_ns)] * 3
@@ -525,6 +567,21 @@ def run_3segment_magnus_diagnostic(
         psi_constant_three_pulser,
         "constant_one_pulse_vs_three_identical_pulser",
     )
+    segmentation_exact_D_numerical_scale = max(
+        float(segmentation_exact["fidelity_roundoff_scale"]),
+        float(segmentation_exact["phase_aligned_state_residual"]),
+    )
+    pulser_segmentation_check = {
+        "structurally_non_independent": True,
+        "input_waveform_definition_identical": True,
+        "single_branch": branch_single,
+        "three_branch": branch_three,
+        "interpretation": (
+            "Implementation sanity check only. The one-pulse and three-pulse "
+            "constant schedules define the same sampled control waveform, so "
+            "their Pulser equality is not independent physical evidence."
+        ),
+    }
 
     reference_total = total_ns
     reference_area = integrated_rabi_area(constant_single, omega)
@@ -609,10 +666,11 @@ def run_3segment_magnus_diagnostic(
     decision_threshold_D = max(
         MIN_SIGNAL_TO_FLOOR * numerical_floor_D,
         MIN_SIGNAL_TO_FLOOR
-        * float(segmentation_exact["pure_trace_distance"]),
+        * segmentation_exact_D_numerical_scale,
         1.0e-10,
     )
     decision_threshold_TVD = max(
+        MIN_SIGNAL_TO_FLOOR * numerical_floor_TVD,
         MIN_SIGNAL_TO_FLOOR
         * float(segmentation_exact["TVD_distribution"]),
         1.0e-10,
@@ -670,9 +728,13 @@ def run_3segment_magnus_diagnostic(
         "A2_closed_form_max_error": a2_closed_form_error,
         "segmentation_artifact_expm": segmentation_exact,
         "segmentation_artifact_pulser": segmentation_pulser,
-        "pulser_segmentation_branches": {
-            "single": branch_single,
-            "three": branch_three,
+        "segmentation_expm_D_numerical_scale": (
+            segmentation_exact_D_numerical_scale
+        ),
+        "pulser_segmentation_check": pulser_segmentation_check,
+        "input_numerical_floors": {
+            "zero_gap_D": float(numerical_floor_D),
+            "zero_gap_TVD": float(numerical_floor_TVD),
         },
         "equal_A2_differences": equal_a2_differences,
         "D_decision_threshold": decision_threshold_D,
@@ -788,7 +850,7 @@ def fit_summary_for_witness(sub_df, xcol, ycol, subset_name):
 def run_117_scan():
     print("\n" + "="*80 + "\nB) 117-POINT SIGNED-RESPONSE SCAN\n" + "="*80)
     n = 8
-    total_ns = duration_from_loop_ns(n)
+    total_ns = PAPER_TOTAL_NS
     comm_norm = fixed_commutator_norm(n)
     print(f"N={n}, total_ns={total_ns}, fixed_comm_norm={comm_norm:.6f}")
     print("Grid: 9 gaps in [0, 0.24], 13 fractions in [0.10, 0.90]")
@@ -858,6 +920,12 @@ def run_117_scan():
             np.max(np.abs(1.0 - zero["fidelity"].to_numpy(dtype=float)))
         ),
         "max_D": float(np.max(np.abs(zero["pure_trace_distance"]))),
+        "max_fidelity_roundoff_scale": float(
+            np.max(np.abs(zero["fidelity_roundoff_scale"]))
+        ),
+        "max_phase_aligned_state_residual": float(
+            np.max(np.abs(zero["phase_aligned_state_residual"]))
+        ),
         "max_TVD": float(np.max(np.abs(zero["TVD_distribution"]))),
         "max_phase_gap": float(
             np.max(np.abs(zero["phase_gap_BC_minus_overlap"]))
@@ -898,7 +966,7 @@ def run_117_scan():
     min_signal_D = float(nonzero["pure_trace_distance"].min())
     effective_D_floor = max(
         numerical_floor["max_D"],
-        math.sqrt(numerical_floor["max_abs_infidelity"]),
+        numerical_floor["max_fidelity_roundoff_scale"],
         1.0e-15,
     )
     signal_to_floor = min_signal_D / effective_D_floor
@@ -982,7 +1050,9 @@ def run_117_scan():
     even_odd_df = pd.DataFrame(even_odd_rows)
     even_odd_df.to_csv(OUTDIR / "f_reflection_even_odd.csv", index=False)
 
-    # Exact signed-gap schedule identity and numerical witness gate.
+    # Exact signed-gap schedule identity. This is an algebraic relabelling and
+    # therefore only a schedule-construction invariant, not an independent
+    # statevector/TVD witness.
     symmetry_rows = []
     max_schedule_parameter_error = 0.0
     for row in nonzero.itertuples(index=False):
@@ -1012,62 +1082,35 @@ def run_117_scan():
         max_schedule_parameter_error = max(
             max_schedule_parameter_error, schedule_error
         )
-        psi_fn = exact_state_from_segments(n, f_negative)
-        psi_rn = exact_state_from_segments(n, r_negative)
-        negative_metrics = pair_metrics(
-            psi_fn, psi_rn, "forward_vs_reverse_negative_gap"
-        )
-        reflected_row = lookup[
-            (round(float(row.gap), 12), int(row.duration2_ns))
-        ]
         symmetry_rows.append(
             {
                 "gap_positive": float(row.gap),
                 "f_original": float(row.frac_actual),
-                "f_reflected": float(reflected_row.frac_actual),
-                "D_negative_gap": negative_metrics["pure_trace_distance"],
-                "D_reflected_positive_gap": float(
-                    reflected_row.pure_trace_distance
+                "f_reflected": float(1.0 - row.frac_actual),
+                "forward_reflected_equals_reverse_negative_exactly": (
+                    f_pos_reflected == r_negative
                 ),
-                "D_abs_error": abs(
-                    negative_metrics["pure_trace_distance"]
-                    - float(reflected_row.pure_trace_distance)
-                ),
-                "TVD_negative_gap": negative_metrics["TVD_distribution"],
-                "TVD_reflected_positive_gap": float(
-                    reflected_row.TVD_distribution
-                ),
-                "TVD_abs_error": abs(
-                    negative_metrics["TVD_distribution"]
-                    - float(reflected_row.TVD_distribution)
+                "reverse_reflected_equals_forward_negative_exactly": (
+                    r_pos_reflected == f_negative
                 ),
                 "schedule_parameter_error": schedule_error,
             }
         )
     symmetry_df = pd.DataFrame(symmetry_rows)
     symmetry_df.to_csv(OUTDIR / "signed_gap_symmetry_audit.csv", index=False)
-    symmetry_max_D_error = float(symmetry_df["D_abs_error"].max())
-    symmetry_max_TVD_error = float(symmetry_df["TVD_abs_error"].max())
-    symmetry_threshold = max(
-        SYMMETRY_ABS_TOL, MIN_SIGNAL_TO_FLOOR * effective_D_floor
-    )
-    symmetry_tvd_threshold = max(
-        SYMMETRY_ABS_TOL,
-        MIN_SIGNAL_TO_FLOOR * numerical_floor["max_TVD"],
+    exact_schedule_identity_fraction = float(
+        (
+            symmetry_df[
+                "forward_reflected_equals_reverse_negative_exactly"
+            ]
+            & symmetry_df[
+                "reverse_reflected_equals_forward_negative_exactly"
+            ]
+        ).mean()
     )
     if max_schedule_parameter_error > SCHEDULE_MATCH_TOL:
         raise AssertionError(
             f"Signed-gap schedule identity failed: {max_schedule_parameter_error}"
-        )
-    if symmetry_max_D_error > symmetry_threshold:
-        raise AssertionError(
-            f"Signed-gap D identity failed: {symmetry_max_D_error} > "
-            f"{symmetry_threshold}"
-        )
-    if symmetry_max_TVD_error > symmetry_tvd_threshold:
-        raise AssertionError(
-            f"Signed-gap TVD identity failed: {symmetry_max_TVD_error} > "
-            f"{symmetry_tvd_threshold}"
         )
 
     primary = summary_df[
@@ -1110,6 +1153,7 @@ def run_117_scan():
         "avg_detuning_target": AVG_DETUNING,
         "fixed_commutator_norm_metadata": comm_norm,
         "zero_gap_numerical_floor": numerical_floor,
+        "effective_D_floor": effective_D_floor,
         "weakest_nonzero_D": min_signal_D,
         "weakest_D_to_floor_ratio": signal_to_floor,
         "rough_shot_scale_from_N8_TVD": {
@@ -1128,13 +1172,19 @@ def run_117_scan():
             orient="records"
         ),
         "proxy_comparison": proxy_verdict,
-        "signed_gap_symmetry": {
-            "identity": "D(1-f,+g) = D(f,-g)",
+        "signed_gap_schedule_identity": {
+            "schedule_identity": (
+                "S_f(1-f,+g)=S_r(f,-g), "
+                "S_r(1-f,+g)=S_f(f,-g)"
+            ),
+            "implied_witness_identity": "D(1-f,+g)=D(f,-g)",
             "max_schedule_parameter_error": max_schedule_parameter_error,
-            "max_D_error": symmetry_max_D_error,
-            "max_TVD_error": symmetry_max_TVD_error,
-            "D_threshold": symmetry_threshold,
-            "TVD_threshold": symmetry_tvd_threshold,
+            "schedule_match_tolerance": SCHEDULE_MATCH_TOL,
+            "exact_tuple_identity_fraction": exact_schedule_identity_fraction,
+            "evidence_class": (
+                "Algebraic schedule identity and software regression check; "
+                "not an independent numerical or physical witness."
+            ),
         },
         "max_positive_gap_D_odd_fraction": float(
             even_odd_df["pure_trace_distance_odd_fraction"].max()
@@ -1169,8 +1219,9 @@ def run_117_scan():
     print("\nD/g LINEARITY BY FRACTION")
     print(gap_linearity_df.to_string(index=False))
     print(
-        "Signed-gap symmetry max D/TVD errors:",
-        f"{symmetry_max_D_error:.3e}/{symmetry_max_TVD_error:.3e}",
+        "Signed-gap schedule identity max parameter error:",
+        f"{max_schedule_parameter_error:.3e}",
+        "(algebraic check; no independent D/TVD witness)",
     )
     print("\nSaved outputs under", OUTDIR)
     return df, summary_df, residual_df, even_odd_df, symmetry_df, cert
@@ -1191,7 +1242,7 @@ def run_cross_validation():
     ]
     rows = []
     for n, fraction, gap in test_specs:
-        total_ns = duration_from_loop_ns(n)
+        total_ns = PAPER_TOTAL_NS if n == 8 else duration_from_loop_ns(n)
         d1, d2, _ = split_duration_clock(total_ns, fraction)
         forward, reverse, f_actual = make_two_segment_schedules(
             total_ns, d1, gap, AVG_DETUNING
@@ -1343,22 +1394,29 @@ def main():
         scan_cert,
     ) = run_117_scan()
     permutation_df, three_segment = run_3segment_magnus_diagnostic(
-        numerical_floor_D=scan_cert["zero_gap_numerical_floor"]["max_D"]
+        nominal_total_ns=scan_cert["total_duration_ns"],
+        numerical_floor_D=scan_cert["effective_D_floor"],
+        numerical_floor_TVD=scan_cert["zero_gap_numerical_floor"]["max_TVD"],
     )
 
     segmentation_expm = three_segment["segmentation_artifact_expm"]
     segmentation_pulser = three_segment["segmentation_artifact_pulser"]
     equal_a2 = three_segment["equal_A2_differences"]
     elapsed = time.perf_counter() - started
-    gates = {
+    validation_gates = {
         "scan_has_117_points": len(scan_df) == 117,
         "scan_has_104_nonzero_gap_points": int((scan_df["gap"] > 0).sum())
         == 104,
-        "signed_gap_identity_pass": (
-            scan_cert["signed_gap_symmetry"]["max_D_error"]
-            <= scan_cert["signed_gap_symmetry"]["D_threshold"]
-            and scan_cert["signed_gap_symmetry"]["max_TVD_error"]
-            <= scan_cert["signed_gap_symmetry"]["TVD_threshold"]
+        "common_N8_total_duration": (
+            scan_cert["total_duration_ns"]
+            == three_segment["matched_total_duration_ns"]
+            == PAPER_TOTAL_NS
+        ),
+        "signed_gap_schedule_identity_pass": (
+            scan_cert["signed_gap_schedule_identity"][
+                "max_schedule_parameter_error"
+            ]
+            <= SCHEDULE_MATCH_TOL
         ),
         "weakest_signal_above_floor": (
             scan_cert["weakest_D_to_floor_ratio"] >= MIN_SIGNAL_TO_FLOOR
@@ -1367,8 +1425,8 @@ def main():
             cv_cert["max_infidelity"] <= CROSS_VALIDATION_MAX_INFIDELITY
         ),
         "six_permutations_present": len(permutation_df) == 6,
-        "segmentation_control_resolved": (
-            segmentation_expm["pure_trace_distance"]
+        "expm_segmentation_floor_below_signal": (
+            three_segment["segmentation_expm_D_numerical_scale"]
             < min(permutation_df["pure_trace_distance"]) / 1.0e5
             and segmentation_expm["TVD_distribution"]
             < min(
@@ -1376,21 +1434,45 @@ def main():
                 equal_a2["TVD_perm4_minus_perm5_abs"],
             )
             / 1.0e10
-            and segmentation_pulser["pure_trace_distance"]
-            < min(permutation_df["pure_trace_distance"]) / 1.0e5
-            and segmentation_pulser["TVD_distribution"]
-            < min(
-                equal_a2["TVD_perm2_minus_perm3_abs"],
-                equal_a2["TVD_perm4_minus_perm5_abs"],
-            )
-            / 1.0e10
-        ),
-        "equal_A2_TVD_difference_resolved": (
-            three_segment["primary_TVD_non_reversal_verdict"]
-            == "A2_insufficient_for_non_reversal_comparisons"
         ),
     }
-    status = "PASS" if all(gates.values()) else "FAIL"
+    scientific_tests = {
+        "equal_A2_TVD_insufficiency": {
+            "status": (
+                "SUPPORTED"
+                if three_segment["primary_TVD_non_reversal_verdict"]
+                == "A2_insufficient_for_non_reversal_comparisons"
+                else "NOT_RESOLVED"
+            ),
+            "max_observed_difference": max(
+                equal_a2["TVD_perm2_minus_perm3_abs"],
+                equal_a2["TVD_perm4_minus_perm5_abs"],
+            ),
+            "decision_threshold": three_segment["TVD_decision_threshold"],
+            "fail_fast": False,
+        },
+        "equal_A2_D_insufficiency": {
+            "status": (
+                "SUPPORTED"
+                if three_segment["secondary_D_non_reversal_verdict"]
+                == "A2_insufficient_for_non_reversal_comparisons"
+                else "NOT_RESOLVED"
+            ),
+            "max_observed_difference": max(
+                equal_a2["D_perm2_minus_perm3_abs"],
+                equal_a2["D_perm4_minus_perm5_abs"],
+            ),
+            "decision_threshold": three_segment["D_decision_threshold"],
+            "fail_fast": False,
+        },
+    }
+    implementation_checks = {
+        "pulser_constant_segmentation": three_segment[
+            "pulser_segmentation_check"
+        ],
+        "metrics": segmentation_pulser,
+    }
+    status = "VALID" if all(validation_gates.values()) else "INVALID"
     summary = {
         "status": status,
         "paper_scope": (
@@ -1411,11 +1493,14 @@ def main():
         "weakest_D_to_floor_ratio": scan_cert[
             "weakest_D_to_floor_ratio"
         ],
+        "effective_D_floor": scan_cert["effective_D_floor"],
         "cross_validation_max_infidelity": cv_cert["max_infidelity"],
         "segmentation_control_expm": segmentation_expm,
         "segmentation_control_pulser": segmentation_pulser,
         "equal_A2_differences": equal_a2,
-        "gates": gates,
+        "validation_gates": validation_gates,
+        "scientific_tests": scientific_tests,
+        "implementation_checks": implementation_checks,
         "source_sha256": provenance["source_sha256"],
         "elapsed_sec": elapsed,
         "output_directory": str(OUTDIR),
@@ -1433,9 +1518,11 @@ def main():
     print("GLOBAL VERDICT")
     print("=" * 88)
     print(json.dumps(json_sanitize(summary), indent=2, allow_nan=False))
-    if status != "PASS":
-        failed = [name for name, passed in gates.items() if not passed]
-        raise AssertionError(f"Paper117 gates failed: {failed}")
+    if status != "VALID":
+        failed = [
+            name for name, passed in validation_gates.items() if not passed
+        ]
+        raise AssertionError(f"Paper117 validation gates failed: {failed}")
     print(f"elapsed={elapsed:.2f}s")
     print(f"outputs={OUTDIR}")
 
