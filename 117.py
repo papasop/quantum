@@ -696,15 +696,11 @@ def run_3segment_magnus_diagnostic(
         equal_a2_differences["TVD_perm2_minus_perm3_abs"],
         equal_a2_differences["TVD_perm4_minus_perm5_abs"],
     )
-    tvd_verdict = (
-        "second_order_Magnus_scalar_insufficient"
-        if max_equal_a2_TVD_difference > decision_threshold_TVD
-        else "consistent_with_second_order_scalar_at_resolved_precision"
+    tvd_non_reversal_insufficiency_resolved = (
+        max_equal_a2_TVD_difference > decision_threshold_TVD
     )
-    d_verdict = (
-        "second_order_Magnus_scalar_insufficient"
-        if max_equal_a2_D_difference > decision_threshold_D
-        else "consistent_with_second_order_scalar_at_resolved_precision"
+    d_non_reversal_insufficiency_resolved = (
+        max_equal_a2_D_difference > decision_threshold_D
     )
 
     first_segment_summary = (
@@ -740,6 +736,29 @@ def run_3segment_magnus_diagnostic(
         )
         reversal_metrics["permutation_left"] = left_index
         reversal_metrics["permutation_right"] = right_index
+        left_a2 = abs(
+            float(
+                df.loc[
+                    df["permutation_index"] == left_index, "A2_signed"
+                ].iloc[0]
+            )
+        )
+        right_a2 = abs(
+            float(
+                df.loc[
+                    df["permutation_index"] == right_index, "A2_signed"
+                ].iloc[0]
+            )
+        )
+        if abs(left_a2 - right_a2) > 1.0e-12:
+            raise AssertionError("Reversal pair does not have matched |A2|.")
+        reversal_metrics["A2_abs_each_schedule"] = left_a2
+        reversal_metrics["D_over_A2_abs"] = (
+            reversal_metrics["pure_trace_distance"] / left_a2
+        )
+        reversal_metrics["TVD_over_A2_abs"] = (
+            reversal_metrics["TVD_distribution"] / left_a2
+        )
         reversal_metrics["rough_shot_scale_1_over_TVD2"] = (
             float(1.0 / reversal_metrics["TVD_distribution"] ** 2)
             if reversal_metrics["TVD_distribution"] > 0
@@ -747,6 +766,34 @@ def run_3segment_magnus_diagnostic(
         )
         reversal_rows.append(reversal_metrics)
     reversal_df = pd.DataFrame(reversal_rows)
+
+    def relative_span(values):
+        values = np.asarray(values, dtype=float)
+        return float((np.max(values) - np.min(values)) / np.mean(values))
+
+    reversal_pair_scaling = {
+        "D_over_abs_A2_mean": float(reversal_df["D_over_A2_abs"].mean()),
+        "D_over_abs_A2_relative_span": relative_span(
+            reversal_df["D_over_A2_abs"]
+        ),
+        "TVD_over_abs_A2_mean": float(
+            reversal_df["TVD_over_A2_abs"].mean()
+        ),
+        "TVD_over_abs_A2_relative_span": relative_span(
+            reversal_df["TVD_over_A2_abs"]
+        ),
+        "interpretation": (
+            "Across these three exact reversal pairs, |A2| remains a strong "
+            "organizer. This is a three-pair consistency result, not a "
+            "universal scaling proof."
+        ),
+    }
+
+    non_reversal_verdict = (
+        "A2_insufficient_for_non_reversal_comparisons"
+        if tvd_non_reversal_insufficiency_resolved
+        else "non_reversal_A2_insufficiency_not_resolved_at_current_precision"
+    )
 
     diagnostic = {
         "backend_for_permutations": "scipy_expm",
@@ -763,17 +810,24 @@ def run_3segment_magnus_diagnostic(
         "equal_A2_differences": equal_a2_differences,
         "D_decision_threshold": decision_threshold_D,
         "TVD_decision_threshold": decision_threshold_TVD,
-        "primary_TVD_verdict": tvd_verdict,
-        "secondary_D_verdict": d_verdict,
+        "primary_TVD_non_reversal_verdict": non_reversal_verdict,
+        "secondary_D_non_reversal_verdict": (
+            "A2_insufficient_for_non_reversal_comparisons"
+            if d_non_reversal_insufficiency_resolved
+            else "non_reversal_A2_insufficiency_not_resolved_at_current_precision"
+        ),
         "first_segment_group_summary": first_segment_summary.to_dict(
             orient="records"
         ),
         "nonmid_to_mid_mean_TVD_ratio": first_segment_suppression_ratio,
         "reversal_pair_metrics": reversal_df.to_dict(orient="records"),
+        "reversal_pair_A2_scaling": reversal_pair_scaling,
         "interpretation_boundary": (
-            "TVD is the primary population-level discriminator. D is reported "
-            "as a secondary statevector witness. Rough 1/TVD^2 values are scale "
-            "indicators, not powered sample-size calculations."
+            "The A2 insufficiency verdict applies only to non-reversal path "
+            "comparisons such as permutation 2 versus 3. Exact reversal pairs "
+            "remain well organized by |A2| in this diagnostic. TVD is the "
+            "primary population-level discriminator; D is secondary. Rough "
+            "1/TVD^2 values are scale indicators, not powered sample sizes."
         ),
     }
 
@@ -818,14 +872,21 @@ def run_3segment_magnus_diagnostic(
             [
                 "permutation_left",
                 "permutation_right",
+                "A2_abs_each_schedule",
                 "pure_trace_distance",
+                "D_over_A2_abs",
                 "TVD_distribution",
+                "TVD_over_A2_abs",
                 "rough_shot_scale_1_over_TVD2",
             ]
         ].to_string(index=False)
     )
-    print("PRIMARY TVD VERDICT:", tvd_verdict)
-    print("SECONDARY D VERDICT:", d_verdict)
+    print("REVERSAL-PAIR A2 SCALING:", reversal_pair_scaling)
+    print("PRIMARY TVD NON-REVERSAL VERDICT:", non_reversal_verdict)
+    print(
+        "SECONDARY D NON-REVERSAL VERDICT:",
+        diagnostic["secondary_D_non_reversal_verdict"],
+    )
     return df, diagnostic
 
 
@@ -1438,11 +1499,14 @@ def main():
         "primary_backend": "scipy_expm",
         "cross_validation_max_infidelity": cv_cert["max_infidelity"],
         "three_segment_rows": int(len(df3)),
-        "three_segment_primary_TVD_verdict": three_segment[
-            "primary_TVD_verdict"
+        "three_segment_primary_TVD_non_reversal_verdict": three_segment[
+            "primary_TVD_non_reversal_verdict"
         ],
-        "three_segment_secondary_D_verdict": three_segment[
-            "secondary_D_verdict"
+        "three_segment_secondary_D_non_reversal_verdict": three_segment[
+            "secondary_D_non_reversal_verdict"
+        ],
+        "three_segment_reversal_pair_A2_scaling": three_segment[
+            "reversal_pair_A2_scaling"
         ],
         "three_segment_nonmid_to_mid_mean_TVD_ratio": three_segment[
             "nonmid_to_mid_mean_TVD_ratio"
