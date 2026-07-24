@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-M1.1 coordinate-covariant closed-loop test of one proposition:
+M2 coordinate-covariant closed-loop test of one proposition:
 
     The task returns to its origin, but its implementation retains
     orientation-dependent, area-scaled geometric memory that is invariant
@@ -22,7 +22,7 @@ My=I; it must disagree, showing that covariance is not automatic.
 
 Colab:
     !pip install -q -U numpy scipy
-    !python geometric_memory_covariant_m1_1.py
+    !python geometric_memory_covariant_m2.py
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ from scipy.linalg import expm
 from scipy.optimize import least_squares
 
 
-VERSION = "M1.1"
+VERSION = "M2"
 C6 = 5_420_158.53                  # rad um^6 / us
 GAMMA = 0.030                       # local dephasing rate, 1/us
 FLOOR = 1e-13
@@ -61,6 +61,8 @@ class Cfg:
     endpoint_residual_tol: float = 2e-9
     reachability_tol: float = 2e-4
     lift_tol: float = 1e-7
+    path_rank_relative_cut: float = 1e-6
+    path_spectral_gap_min: float = 1e4
     convergence_tol: float = 0.10
     fiber_normal_fraction_tol: float = 0.02
     exponent_range: tuple[float, float] = (1.65, 2.35)
@@ -285,11 +287,30 @@ def geometry(q1: np.ndarray, q2: np.ndarray) -> dict[str, Any]:
     }
 
 
+def path_rank_diagnostic(
+    qmat: np.ndarray, expected_rank: int, relative_cut: float,
+) -> dict[str, float | int]:
+    sv = np.linalg.svd(qmat, compute_uv=False)
+    cut = max(relative_cut * sv[0], FLOOR)
+    numerical_rank = int(np.count_nonzero(sv > cut))
+    retained = float(sv[expected_rank - 1])
+    discarded = float(sv[expected_rank]) if expected_rank < len(sv) else 0.0
+    return {
+        "numerical_rank": numerical_rank,
+        "relative_cut": float(cut),
+        "smallest_retained_singular_value": retained,
+        "largest_discarded_singular_value": discarded,
+        "retained_to_discarded_gap":
+            float(retained / max(discarded, FLOOR)),
+    }
+
+
 def lift_and_correct(
     c: Cfg, chart: Chart, q0: np.ndarray, s: np.ndarray,
     ds: np.ndarray, rank: int,
-) -> tuple[np.ndarray, dict[str, float]]:
+) -> tuple[np.ndarray, dict[str, Any]]:
     q, b = jac_q(chart, q0, s, c.fd), jac_s(chart, q0, s, c.task_fd)
+    rank_diag = path_rank_diagnostic(q, rank, c.path_rank_relative_cut)
     u, _, _ = np.linalg.svd(q, full_matrices=True)
     image = u[:, :rank]
     qr, br = image.T @ q, image.T @ b
@@ -315,6 +336,7 @@ def lift_and_correct(
         "lift_error": float(lift_error),
         "residual": float(np.linalg.norm(chart.residual(q2, s2))),
         "infidelity": chart.infidelity(q2, s2),
+        "rank_diagnostic": rank_diag,
     }
 
 
@@ -334,6 +356,30 @@ def loop(
 ) -> dict:
     q, s = chart.q0.copy(), np.zeros(2)
     worst = {"reachability": 0., "lift_error": 0., "residual": 0., "infidelity": 0.}
+    rank_audit = {
+        "point_count": 0,
+        "observed_numerical_ranks": set(),
+        "minimum_retained_singular_value": math.inf,
+        "maximum_discarded_singular_value": 0.0,
+        "minimum_retained_to_discarded_gap": math.inf,
+    }
+
+    def record_rank(d: dict[str, float | int]) -> None:
+        rank_audit["point_count"] += 1
+        rank_audit["observed_numerical_ranks"].add(int(d["numerical_rank"]))
+        rank_audit["minimum_retained_singular_value"] = min(
+            rank_audit["minimum_retained_singular_value"],
+            float(d["smallest_retained_singular_value"]),
+        )
+        rank_audit["maximum_discarded_singular_value"] = max(
+            rank_audit["maximum_discarded_singular_value"],
+            float(d["largest_discarded_singular_value"]),
+        )
+        rank_audit["minimum_retained_to_discarded_gap"] = min(
+            rank_audit["minimum_retained_to_discarded_gap"],
+            float(d["retained_to_discarded_gap"]),
+        )
+
     nsteps = 0
     path = vertices(kind, e)
     for a, b in zip(path[:-1], path[1:]):
@@ -342,10 +388,23 @@ def loop(
         ds = edge/n
         for _ in range(n):
             q, d = lift_and_correct(c, chart, q, s, ds, rank)
+            record_rank(d["rank_diagnostic"])
             s += ds
             for k in worst:
                 worst[k] = max(worst[k], d[k])
             nsteps += 1
+    final_qmat = jac_q(chart, q, s, c.fd)
+    record_rank(path_rank_diagnostic(
+        final_qmat, rank, c.path_rank_relative_cut
+    ))
+    rank_audit["observed_numerical_ranks"] = sorted(
+        rank_audit["observed_numerical_ranks"]
+    )
+    rank_audit["stable"] = bool(
+        rank_audit["observed_numerical_ranks"] == [rank]
+        and rank_audit["minimum_retained_to_discarded_gap"]
+            >= c.path_spectral_gap_min
+    )
     residual = float(np.linalg.norm(chart.residual(q, np.zeros(2))))
     infid = chart.infidelity(q, np.zeros(2))
     ok = (
@@ -355,11 +414,13 @@ def loop(
         and worst["infidelity"] <= c.endpoint_infidelity_tol
         and worst["reachability"] <= c.reachability_tol
         and worst["lift_error"] <= c.lift_tol
+        and rank_audit["stable"]
     )
     return {
         "q": q, "z": chart.physical(q), "channel": chart.channel(q),
         "steps": nsteps, "worst": worst,
         "endpoint_residual": residual, "endpoint_infidelity": infid,
+        "path_rank_audit": rank_audit,
         "numerical_pass": bool(ok),
     }
 
@@ -389,6 +450,11 @@ def chart_suite(
                 "epsilon": e, "kind": kind, "steps": r["steps"],
                 "endpoint_infidelity": r["endpoint_infidelity"],
                 "endpoint_residual": r["endpoint_residual"],
+                "maximum_task_reachability_residual": r["worst"]["reachability"],
+                "maximum_lift_constraint_residual": r["worst"]["lift_error"],
+                "maximum_step_endpoint_residual": r["worst"]["residual"],
+                "maximum_step_endpoint_infidelity": r["worst"]["infidelity"],
+                "path_rank_audit": r["path_rank_audit"],
                 "vertical_control_norm": r["vnorm"],
                 "fiber_normal_fraction": r["normal_fraction"],
                 "channel_distance": r["cdist"],
@@ -424,21 +490,82 @@ def chart_suite(
     conv_c = np.linalg.norm(coarse["dc"]-fine_dc) / max(
         0.5*(np.linalg.norm(coarse["dc"])+np.linalg.norm(fine_dc)), FLOOR
     )
-    vmax, cmax = cw_v[-1], cw_c[-1]
+    oriented_v_largest = min(
+        runs[largest, "CW"]["vnorm"], runs[largest, "CCW"]["vnorm"]
+    )
+    oriented_c_largest = min(
+        runs[largest, "CW"]["cdist"], runs[largest, "CCW"]["cdist"]
+    )
     vfloor, cfloor = max(z_v.max(), FLOOR), max(z_c.max(), FLOOR)
+    audited_runs = list(runs.values()) + [fine]
+    gate_maxima = {
+        "maximum_endpoint_residual": max(
+            r["endpoint_residual"] for r in audited_runs
+        ),
+        "maximum_endpoint_infidelity": max(
+            r["endpoint_infidelity"] for r in audited_runs
+        ),
+        "maximum_step_endpoint_residual": max(
+            r["worst"]["residual"] for r in audited_runs
+        ),
+        "maximum_step_endpoint_infidelity": max(
+            r["worst"]["infidelity"] for r in audited_runs
+        ),
+        "maximum_task_reachability_residual": max(
+            r["worst"]["reachability"] for r in audited_runs
+        ),
+        "maximum_lift_constraint_residual": max(
+            r["worst"]["lift_error"] for r in audited_runs
+        ),
+    }
+    path_rank_summary = {
+        "expected_rank": rank,
+        "relative_singular_value_cut": c.path_rank_relative_cut,
+        "minimum_required_retained_to_discarded_gap":
+            c.path_spectral_gap_min,
+        "audited_point_count": sum(
+            r["path_rank_audit"]["point_count"] for r in audited_runs
+        ),
+        "observed_numerical_ranks": sorted({
+            rank_value
+            for r in audited_runs
+            for rank_value in r["path_rank_audit"]["observed_numerical_ranks"]
+        }),
+        "minimum_retained_singular_value": min(
+            r["path_rank_audit"]["minimum_retained_singular_value"]
+            for r in audited_runs
+        ),
+        "maximum_discarded_singular_value": max(
+            r["path_rank_audit"]["maximum_discarded_singular_value"]
+            for r in audited_runs
+        ),
+        "minimum_retained_to_discarded_gap": min(
+            r["path_rank_audit"]["minimum_retained_to_discarded_gap"]
+            for r in audited_runs
+        ),
+        "stable": bool(all(
+            r["path_rank_audit"]["stable"] for r in audited_runs
+        )),
+    }
     measurements = {
         "control_exponent_vs_epsilon": slope(e, cw_v),
         "channel_exponent_vs_epsilon": slope(e, cw_c),
         "largest_orientation": orient[-1],
-        "control_signal_to_zero_area_floor": float(vmax/vfloor),
-        "channel_signal_to_zero_area_floor": float(cmax/cfloor),
-        "zero_area_to_rectangle_control_ratio": float(z_v[-1]/max(vmax, FLOOR)),
-        "zero_area_to_rectangle_channel_ratio": float(z_c[-1]/max(cmax, FLOOR)),
+        "minimum_oriented_control_signal_to_zero_area_floor":
+            float(oriented_v_largest/vfloor),
+        "minimum_oriented_channel_signal_to_zero_area_floor":
+            float(oriented_c_largest/cfloor),
+        "zero_area_to_minimum_oriented_control_ratio":
+            float(z_v[-1]/max(oriented_v_largest, FLOOR)),
+        "zero_area_to_minimum_oriented_channel_ratio":
+            float(z_c[-1]/max(oriented_c_largest, FLOOR)),
         "step_halving_control_difference": float(conv_v),
         "step_halving_channel_difference": float(conv_c),
         "maximum_fiber_normal_fraction": max(
             r["normal_fraction"] for (x, k), r in runs.items() if k != "ZERO_AREA"
         ),
+        "numerical_gate_maxima": gate_maxima,
+        "path_rank_summary": path_rank_summary,
     }
     lo, hi = c.exponent_range
     o = orient[-1]
@@ -449,6 +576,7 @@ def chart_suite(
     )
     gates = {
         "numerical_closure_and_convergence": numerical,
+        "path_rank_stability": path_rank_summary["stable"],
         "fiber_membership": measurements["maximum_fiber_normal_fraction"]
             <= c.fiber_normal_fraction_tol,
         "control_area_scaling": lo <= measurements["control_exponent_vs_epsilon"] <= hi,
@@ -456,13 +584,17 @@ def chart_suite(
         "orientation_reversal": o["control_cosine"] <= c.orientation_cosine_max
             and o["control_oddness"] <= c.orientation_oddness_tol,
         "control_signal_above_floor":
-            measurements["control_signal_to_zero_area_floor"] >= c.signal_to_floor_min,
+            measurements["minimum_oriented_control_signal_to_zero_area_floor"]
+            >= c.signal_to_floor_min,
         "channel_signal_above_floor":
-            measurements["channel_signal_to_zero_area_floor"] >= c.signal_to_floor_min,
+            measurements["minimum_oriented_channel_signal_to_zero_area_floor"]
+            >= c.signal_to_floor_min,
         "zero_area_control_small":
-            measurements["zero_area_to_rectangle_control_ratio"] <= c.collapsed_ratio_max,
+            measurements["zero_area_to_minimum_oriented_control_ratio"]
+            <= c.collapsed_ratio_max,
         "zero_area_channel_small":
-            measurements["zero_area_to_rectangle_channel_ratio"] <= c.collapsed_ratio_max,
+            measurements["zero_area_to_minimum_oriented_channel_ratio"]
+            <= c.collapsed_ratio_max,
     }
     return {
         "chart": chart.name,
@@ -574,12 +706,16 @@ def audit(c: Cfg) -> dict[str, Any]:
     )
     gates = {
         "numerical_validity": numerical,
-        "original_M1_pass": bool(all(original["gates"].values())),
-        "transformed_M1_pass": bool(all(covariant["gates"].values())),
+        "original_M2_pass": bool(all(original["gates"].values())),
+        "transformed_M2_pass": bool(all(covariant["gates"].values())),
         "transformed_endpoint_rank_stable": bool(
             covariant["endpoint_geometry"]["stable"]
             and covariant["endpoint_geometry"]["rank_half"] == rank
         ),
+        "original_path_rank_stable":
+            original["measurements"]["path_rank_summary"]["stable"],
+        "transformed_path_rank_stable":
+            covariant["measurements"]["path_rank_summary"]["stable"],
         "physical_control_covariance": max_control <= c.covariance_control_tol,
         "complete_channel_covariance": max_channel <= c.covariance_channel_tol,
         "scaling_exponent_covariance":
@@ -659,7 +795,10 @@ def args() -> argparse.Namespace:
 
 def main() -> None:
     a, started = args(), time.perf_counter()
-    out = Path(a.output_dir or f"geometric_memory_m1_1_{time.strftime('%Y%m%d_%H%M%S')}")
+    out = Path(
+        a.output_dir
+        or f"geometric_memory_m2_{time.strftime('%Y%m%d_%H%M%S')}"
+    )
     out.mkdir(parents=True, exist_ok=False)
     script = globals().get("__file__")
     summary = {
@@ -668,7 +807,7 @@ def main() -> None:
     }
     save_json(out/"summary.json", summary)
     print("\n"+"="*92)
-    print("M1.1 COORDINATE-COVARIANT GEOMETRIC-MEMORY AUDIT")
+    print("M2 COORDINATE-COVARIANT GEOMETRIC-MEMORY AUDIT")
     print("="*92)
     try:
         result = audit(Cfg())
@@ -678,7 +817,7 @@ def main() -> None:
             "status": result["status"],
             "physical_support": result["physical_support"],
             "coordinate_transform": result["coordinate_transform"],
-            "original_M1_measurements":
+            "original_M2_measurements":
                 result["original_chart"]["measurements"],
             "covariance_measurements": result["covariance_measurements"],
             "gates": result["gates"],
