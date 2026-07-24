@@ -11,11 +11,13 @@ Scientific scope
   Pulser/Qutip statevectors are used for sampled cross-validation.
 - Two-segment forward/reverse schedules have exactly matched total duration,
   integrated Rabi area, and weighted-average detuning.
-- A small PREDECLARED set of physically motivated fixed-T schedule-shape
+- A small SPECIFIED set of physically motivated fixed-T schedule-shape
   proxies is compared rather than presupposing a path-area law:
       C_BCH = |g| f(1-f)          second-order Magnus shape
       C_lin = |g| min(f,1-f)      support of the differential schedule
-  This is a falsification test, not a search over arbitrary functions. The
+  This is an exclusion test, not a search over arbitrary functions. The set is
+  specified, NOT preregistered: C_lin was introduced after early data
+  analysis. Only the 117-point grid is frozen. The
   reference shape C_sin2 = |g| sin^2(pi f) is computed and reported but is
   EXCLUDED from the verdict. It is an exploratory smooth symmetric reference
   shape used only to diagnose structured residuals; it is not derived here and
@@ -134,6 +136,9 @@ SCHEDULE_MATCH_TOL = 1.0e-12
 # Agreement required between the cancellation-free D estimator and the naive
 # sqrt(1-F) estimator, on points where the naive one is not floor-limited.
 D_ESTIMATOR_MAX_REL_DISAGREEMENT = 1.0e-9
+# The differential-schedule support quantities are exact constructions, so
+# they are gated at floating-point level rather than merely recorded.
+DIFFERENTIAL_SUPPORT_TOL = 1.0e-12
 
 GRID_CLOSURE_NOTE = (
     "The f-reflection decomposition requires the clock-aligned duration grid "
@@ -710,7 +715,9 @@ def differential_schedule_support_us(total_ns, duration1_ns):
     so the differential schedule is supported on a set of total length 2*m*T.
     This is a property of make_two_segment_schedules, and it is NOT asserted
     on the strength of this docstring: measure_differential_support() below
-    evaluates the actual schedules and the scan gates the agreement.
+    evaluates the actual schedules, the scan records the residuals, and the
+    validation gate differential_support_identity_pass requires all three of
+    them to sit below DIFFERENTIAL_SUPPORT_TOL.
     """
     f = duration1_ns / total_ns
     return float(2.0 * min(f, 1.0 - f) * total_ns / 1000.0)
@@ -1139,21 +1146,26 @@ def fit_summary_for_witness(sub_df, xcol, ycol, subset_name):
     }
 
 
-# The manuscript's comparison is over a small PREDECLARED set of physically
-# motivated shapes. Keeping this set fixed and small is what makes the
-# comparison a falsification test rather than a function search.
-DECLARED_PROXY_COLUMNS = ["C_BCH_shape", "C_linear_support"]
+# The manuscript's comparison is over a small SPECIFIED mechanistic proxy set.
+# Keeping the set small and fixed is what keeps this an exclusion test rather
+# than a function search.
+#
+# Naming note: the 117-point duration/gap grid is FROZEN (it is fixed before
+# the states are evolved and is asserted for reflection closure). The proxy
+# set is only SPECIFIED, not preregistered: C_lin was introduced after early
+# data analysis, so no claim of preregistration is made anywhere.
+SPECIFIED_PROXY_COLUMNS = ["C_BCH_shape", "C_linear_support"]
 
 # Reference shapes are recorded but NEVER enter the preference verdict. They
-# exist to answer one question: is the declared winner's residual unstructured,
+# exist to answer one question: is the specified-set winner's residual unstructured,
 # or is there an obvious shape it is missing?
 #
 # sin^2(pi f) is an exploratory smooth symmetric reference shape used only to
 # diagnose structured residuals. It is not derived here and does not enter the
-# declared proxy comparison.
+# specified proxy comparison.
 REFERENCE_SHAPE_COLUMNS = ["C_sin2_shape"]
-ALL_SHAPE_COLUMNS = DECLARED_PROXY_COLUMNS + REFERENCE_SHAPE_COLUMNS
-PROXY_COLUMNS = DECLARED_PROXY_COLUMNS
+ALL_SHAPE_COLUMNS = SPECIFIED_PROXY_COLUMNS + REFERENCE_SHAPE_COLUMNS
+PROXY_COLUMNS = SPECIFIED_PROXY_COLUMNS
 WITNESS_COLUMNS = [
     "pure_trace_distance",
     "phase_gap_BC_minus_overlap",
@@ -1508,7 +1520,7 @@ def run_117_scan():
     primary = summary_df[summary_df["subset"] == "nonzero_gap_primary"]
     d_models = primary[primary["y"] == "pure_trace_distance"].set_index("x")
     pooled_ranked = (
-        d_models.loc[DECLARED_PROXY_COLUMNS, "rmse"].sort_values()
+        d_models.loc[SPECIFIED_PROXY_COLUMNS, "rmse"].sort_values()
     )
 
     # A pooled fit across all gaps mixes the schedule-shape question (the
@@ -1525,22 +1537,22 @@ def run_117_scan():
             entry[f"rmse_{proxy}"] = fit["rmse"]
             entry[f"R2_{proxy}"] = fit["ols_R2"]
         entry["winner"] = min(
-            DECLARED_PROXY_COLUMNS, key=lambda p: entry[f"rmse_{p}"]
+            SPECIFIED_PROXY_COLUMNS, key=lambda p: entry[f"rmse_{p}"]
         )
         ordered = sorted(
-            DECLARED_PROXY_COLUMNS, key=lambda p: entry[f"rmse_{p}"]
+            SPECIFIED_PROXY_COLUMNS, key=lambda p: entry[f"rmse_{p}"]
         )
         entry["winner_to_runner_up_rmse_ratio"] = float(
             entry[f"rmse_{ordered[0]}"] / entry[f"rmse_{ordered[1]}"]
         )
-        # How much of the declared winner's residual is explained by a shape
-        # outside the declared set. A ratio far below 1 means the winner's
+        # How much of the specified-set winner's residual is explained by a shape
+        # outside the specified set. A ratio far below 1 means the winner's
         # residual is structured, not noise.
         best_reference = min(
             REFERENCE_SHAPE_COLUMNS, key=lambda p: entry[f"rmse_{p}"]
         )
         entry["best_reference_shape"] = best_reference
-        entry["reference_to_declared_winner_rmse_ratio"] = float(
+        entry["reference_to_specified_winner_rmse_ratio"] = float(
             entry[f"rmse_{best_reference}"] / entry[f"rmse_{entry['winner']}"]
         )
         per_gap_rows.append(entry)
@@ -1555,10 +1567,10 @@ def run_117_scan():
     rankings_agree = bool(unanimous and per_gap_preferred == pooled_preferred)
 
     reference_ratio = float(
-        per_gap_df["reference_to_declared_winner_rmse_ratio"].max()
+        per_gap_df["reference_to_specified_winner_rmse_ratio"].max()
     )
-    declared_winner_max_rmse = float(
-        per_gap_df[[f"rmse_{p}" for p in DECLARED_PROXY_COLUMNS]]
+    specified_winner_max_rmse = float(
+        per_gap_df[[f"rmse_{p}" for p in SPECIFIED_PROXY_COLUMNS]]
         .min(axis=1)
         .max()
     )
@@ -1566,9 +1578,9 @@ def run_117_scan():
         "verdict_role": "NOT_PART_OF_VERDICT",
         "reference_shapes": list(REFERENCE_SHAPE_COLUMNS),
         "worst_case_reference_to_winner_rmse_ratio": reference_ratio,
-        "declared_winner_worst_per_gap_rmse": declared_winner_max_rmse,
-        "declared_winner_worst_rmse_as_fraction_of_D_range": float(
-            declared_winner_max_rmse
+        "specified_winner_worst_per_gap_rmse": specified_winner_max_rmse,
+        "specified_winner_worst_rmse_as_fraction_of_D_range": float(
+            specified_winner_max_rmse
             / float(nonzero["pure_trace_distance"].max())
         ),
         "residual_is_structured": bool(reference_ratio < 0.5),
@@ -1576,20 +1588,21 @@ def run_117_scan():
             "Exploratory smooth symmetric reference shape used only to "
             "diagnose structured residuals. It is not derived here, has no "
             "theoretical status in this manuscript, and does not enter the "
-            "declared proxy comparison."
+            "specified proxy comparison."
         ),
         "interpretation": (
-            "A reference shape outside the declared set reduces the per-gap "
+            "A reference shape outside the specified set reduces the per-gap "
             "RMSE by the stated factor. When that factor is well below one, "
-            "the declared winner's residual is structured rather than noise, "
-            "so the comparison should be reported as a falsification of the "
-            "losing declared proxy and NOT as support for the winner being "
-            "the correct functional form."
+            "the specified-set winner's residual is structured rather than noise, "
+            "so the comparison should be reported as excluding the losing "
+            "specified proxy as a sufficient global finite-time organizer, "
+            "and NOT as support for the winner being the correct functional "
+            "form."
         ),
     }
 
     proxy_verdict = {
-        "declared_proxy_set": list(DECLARED_PROXY_COLUMNS),
+        "specified_proxy_set": list(SPECIFIED_PROXY_COLUMNS),
         "reference_shapes_excluded_from_verdict": list(
             REFERENCE_SHAPE_COLUMNS
         ),
@@ -1598,7 +1611,7 @@ def run_117_scan():
             "rows": per_gap_df.to_dict(orient="records"),
             "winners": per_gap_winners,
             "unanimous": bool(unanimous),
-            "preferred_within_declared_set": per_gap_preferred,
+            "preferred_within_specified_set": per_gap_preferred,
             "median_winner_to_runner_up_rmse_ratio": float(
                 per_gap_df["winner_to_runner_up_rmse_ratio"].median()
             ),
@@ -1606,14 +1619,14 @@ def run_117_scan():
         "pooled_sensitivity": {
             "D_R2": {
                 p: float(d_models.loc[p, "ols_R2"])
-                for p in DECLARED_PROXY_COLUMNS
+                for p in SPECIFIED_PROXY_COLUMNS
             },
             "D_RMSE": {
                 p: float(d_models.loc[p, "rmse"])
-                for p in DECLARED_PROXY_COLUMNS
+                for p in SPECIFIED_PROXY_COLUMNS
             },
             "rmse_ranking_best_first": list(pooled_ranked.index),
-            "preferred_within_declared_set": pooled_preferred,
+            "preferred_within_specified_set": pooled_preferred,
             "caveat": (
                 "Pooling all gaps into one fit with a single slope and "
                 "intercept lets the residual g-dependence of D contaminate a "
@@ -1634,12 +1647,25 @@ def run_117_scan():
         ),
         "residual_structure_diagnostic": residual_structure_diagnostic,
         "boundary": (
-            "Only a small predeclared set of physically motivated shapes is "
-            "compared; this is not a search over arbitrary functions. The "
-            "result is a FALSIFICATION of the losing declared proxy on this "
-            "grid. It is not evidence that the winner is the correct "
-            "functional form: see residual_structure_diagnostic. Fixed T "
-            "cannot determine T versus T^2 scaling."
+            "Only a small specified mechanistic proxy set is compared; this "
+            "is not a search over arbitrary functions, and the set is "
+            "specified rather than preregistered. The result excludes the "
+            "losing specified proxy as a sufficient global finite-time "
+            "organizer on this grid. It does not falsify its possible "
+            "small-partition asymptotic role or the Magnus expansion, whose "
+            "second-order truncation is not uniformly controlled across this "
+            "grid: see perturbative_validity. It is also not evidence that "
+            "the winner is the correct functional form: see "
+            "residual_structure_diagnostic. Fixed T cannot determine T "
+            "versus T^2 scaling."
+        ),
+        "result_statement": (
+            "C_BCH = |g| f(1-f) is insufficient as a global finite-time "
+            "organizing proxy on the tested grid."
+        ),
+        "set_provenance": (
+            "Specified mechanistic proxy set, not a preregistration. The "
+            "117-point grid is frozen; the proxy set is not."
         ),
     }
 
@@ -1677,6 +1703,21 @@ def run_117_scan():
             ),
             "max_off_support_magnitude": float(
                 nonzero["differential_off_support_magnitude"].max()
+            ),
+            "tolerance": DIFFERENTIAL_SUPPORT_TOL,
+            "passes": bool(
+                max(
+                    float(nonzero["differential_support_abs_error_us"].max()),
+                    float(
+                        nonzero[
+                            "differential_on_support_magnitude_error"
+                        ].max()
+                    ),
+                    float(
+                        nonzero["differential_off_support_magnitude"].max()
+                    ),
+                )
+                <= DIFFERENTIAL_SUPPORT_TOL
             ),
         },
         "zero_gap_numerical_floor": numerical_floor,
@@ -1742,16 +1783,16 @@ def run_117_scan():
         per_gap_df[
             ["gap"]
             + [f"rmse_{p}" for p in ALL_SHAPE_COLUMNS]
-            + ["winner", "reference_to_declared_winner_rmse_ratio"]
+            + ["winner", "reference_to_specified_winner_rmse_ratio"]
         ].to_string(index=False)
     )
     print(
-        "per-gap declared winner:",
+        "per-gap specified-set winner:",
         per_gap_preferred if unanimous else f"not unanimous {per_gap_winners}",
     )
     print(
         "residual structure: best reference shape reaches",
-        f"{reference_ratio:.3g}x the declared winner's per-gap RMSE",
+        f"{reference_ratio:.3g}x the specified-set winner's per-gap RMSE",
         "-> structured" if residual_structure_diagnostic[
             "residual_is_structured"
         ] else "-> not obviously structured",
@@ -1759,13 +1800,13 @@ def run_117_scan():
     print("\nPOOLED SENSITIVITY (not primary). Column x is the proxy.")
     print(
         d_models.loc[
-            DECLARED_PROXY_COLUMNS, ["ols_R2", "rmse", "spearman_rho"]
+            SPECIFIED_PROXY_COLUMNS, ["ols_R2", "rmse", "spearman_rho"]
         ]
         .sort_values("rmse")
         .reset_index()
         .to_string(index=False)
     )
-    print("pooled declared winner:", pooled_preferred)
+    print("pooled specified-set winner:", pooled_preferred)
     if not rankings_agree:
         print(
             "RANKING WARNING:",
@@ -1921,8 +1962,10 @@ def run_cross_validation():
     witness_scale_for_one_percent = float(max_witness_abs / 0.01)
     # Rows whose witness is itself below the measured absolute agreement.
     degenerate_rows = []
+    nondegenerate_relative_errors = []
     for record in witness_df.to_dict(orient="records"):
         for witness_name in ("D", "TVD"):
+            relative_error = record[f"{witness_name}_relative_error"]
             if record[f"{witness_name}_expm"] < max_witness_abs:
                 degenerate_rows.append(
                     {
@@ -1931,11 +1974,16 @@ def run_cross_validation():
                         "witness": witness_name,
                         "expm_value": record[f"{witness_name}_expm"],
                         "absolute_agreement_scale": max_witness_abs,
-                        "relative_error": record[
-                            f"{witness_name}_relative_error"
-                        ],
+                        "relative_error": relative_error,
                     }
                 )
+            else:
+                nondegenerate_relative_errors.append(float(relative_error))
+    max_nondegenerate_relative_error = (
+        float(max(nondegenerate_relative_errors))
+        if nondegenerate_relative_errors
+        else float("nan")
+    )
 
     if max_infidelity > CROSS_VALIDATION_MAX_INFIDELITY:
         raise AssertionError(
@@ -1967,7 +2015,19 @@ def run_cross_validation():
             "max_allowed_absolute_error": (
                 WITNESS_CROSS_VALIDATION_MAX_ABS_ERROR
             ),
-            "max_relative_error": max_witness_rel,
+            "max_relative_error_all_rows": max_witness_rel,
+            "max_nondegenerate_relative_error": (
+                max_nondegenerate_relative_error
+            ),
+            "degenerate_witness_count": len(degenerate_rows),
+            "relative_error_reading_note": (
+                "max_relative_error_all_rows is inflated by witnesses that "
+                "are themselves smaller than the measured absolute backend "
+                "agreement; it must not be read as a backend disagreement. "
+                "max_nondegenerate_relative_error is the figure that "
+                "characterises Pulser-versus-exponentiation agreement on the "
+                "witnesses the manuscript actually uses."
+            ),
             "max_allowed_relative_error": (
                 WITNESS_CROSS_VALIDATION_MAX_REL_ERROR
             ),
@@ -2011,8 +2071,16 @@ def run_cross_validation():
     print(
         f"CROSS-VALIDATION PASS: state max infidelity={max_infidelity:.3e}, "
         f"witness max abs error={max_witness_abs:.3e}, "
-        f"witness max rel error={max_witness_rel:.3e}, "
         f"1%-agreement witness scale={witness_scale_for_one_percent:.3e}"
+    )
+    print(
+        f"  max relative error over all rows = {max_witness_rel:.4%} "
+        f"(includes {len(degenerate_rows)} degenerate witness"
+        f"{'' if len(degenerate_rows) == 1 else 's'})"
+    )
+    print(
+        "  max relative error over nondegenerate witnesses = "
+        f"{max_nondegenerate_relative_error:.4%}"
     )
     return state_df, witness_df, cv_cert
 
@@ -2161,6 +2229,9 @@ def main():
             ]
             <= SCHEDULE_MATCH_TOL
         ),
+        "differential_support_identity_pass": bool(
+            scan_cert["differential_support_identity"]["passes"]
+        ),
         "D_estimators_agree": (
             scan_cert["D_estimator_max_relative_disagreement"]
             <= D_ESTIMATOR_MAX_REL_DISAGREEMENT
@@ -2215,20 +2286,20 @@ def main():
             "decision_threshold": three_segment["D_decision_threshold"],
             "fail_fast": False,
         },
-        "proxy_selection_within_declared_set": {
+        "proxy_selection_within_specified_set": {
             "status": "RECORDED",
-            "declared_proxy_set": scan_cert["proxy_comparison"][
-                "declared_proxy_set"
+            "specified_proxy_set": scan_cert["proxy_comparison"][
+                "specified_proxy_set"
             ],
             "primary_per_gap_preferred": scan_cert["proxy_comparison"][
                 "per_gap"
-            ]["preferred_within_declared_set"],
+            ]["preferred_within_specified_set"],
             "per_gap_unanimous": scan_cert["proxy_comparison"]["per_gap"][
                 "unanimous"
             ],
             "pooled_preferred": scan_cert["proxy_comparison"][
                 "pooled_sensitivity"
-            ]["preferred_within_declared_set"],
+            ]["preferred_within_specified_set"],
             "rankings_agree": scan_cert["proxy_comparison"][
                 "per_gap_and_pooled_rankings_agree"
             ],
@@ -2284,9 +2355,12 @@ def main():
         "cross_validation_witness_max_absolute_error": cv_cert[
             "witness_level"
         ]["max_absolute_error"],
-        "cross_validation_witness_max_relative_error": cv_cert[
+        "cross_validation_witness_max_relative_error_all_rows": cv_cert[
             "witness_level"
-        ]["max_relative_error"],
+        ]["max_relative_error_all_rows"],
+        "cross_validation_witness_max_nondegenerate_relative_error": cv_cert[
+            "witness_level"
+        ]["max_nondegenerate_relative_error"],
         "witness_magnitude_for_one_percent_backend_agreement": cv_cert[
             "witness_level"
         ]["witness_magnitude_for_one_percent_agreement"],
