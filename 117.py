@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-fixedH_path_order_response_v8.py
+fixedH_path_order_response_v9.py
 
 Fail-fast response-geometry validation for Y.Y.N. Li's two-segment
 neutral-atom pulse-ordering work.
@@ -35,10 +35,20 @@ Major v8 repairs
   and measures one-pulse versus three-identical-pulse segmentation artifacts.
 - Records script SHA256, pip freeze, per-point timing, and installed versions.
 
+Major v9 extension
+------------------
+- Adds the missing exact-reversal direction: fixed detuning multiset,
+  fixed total duration, fixed weighted-average detuning, and variable
+  three-segment time partitions.
+- Scans three reversal-pair topologies at every partition and compares the two
+  topologies that have exactly identical |A2| but different temporal placement.
+- Separates "A2 is a strong organizer" from the stricter and independently
+  testable statement "A2 is sufficient for reversal pairs."
+
 Colab install:
     !pip install -q -U pulser==1.8.0 pulser-simulation==1.8.0 pandas numpy matplotlib scipy
 Run:
-    python fixedH_path_order_response_v8.py
+    python fixedH_path_order_response_v9.py
 """
 
 import hashlib
@@ -86,7 +96,7 @@ SCHEDULE_MATCH_TOL = 1.0e-12
 
 # ---------- output directory with timestamp ----------
 TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
-OUTDIR = Path(f"fixedH_path_order_response_v8_{TIMESTAMP}")
+OUTDIR = Path(f"fixedH_path_order_response_v9_{TIMESTAMP}")
 OUTDIR.mkdir(exist_ok=True)
 
 # ----------------------------------------------------------------------
@@ -891,6 +901,399 @@ def run_3segment_magnus_diagnostic(
 
 
 # ----------------------------------------------------------------------
+# Fixed-multiset, variable-time-partition exact-reversal audit
+# ----------------------------------------------------------------------
+def run_variable_partition_reversal_audit(
+    n=8,
+    omega=OMEGA,
+    avg_det=AVG_DETUNING,
+    detuning_half_gap=0.12,
+    nominal_total_ns=None,
+    numerical_floor=None,
+):
+    """
+    Test the missing A2 direction using exact reversal pairs.
+
+    Controls held fixed across the audit:
+      - detuning multiset {c-h, c, c+h},
+      - total duration,
+      - integrated Rabi area,
+      - weighted-average detuning c,
+      - geometry, N, and Omega.
+
+    The low and high detunings each receive duration a, while the middle
+    detuning receives T-2a. Varying a therefore changes only the time partition.
+    At every partition we evaluate three independent exact-reversal topologies:
+
+      P1: low, mid, high  <-> high, mid, low
+      P2: low, high, mid <-> mid, high, low
+      P3: mid, low, high <-> high, low, mid
+
+    P2 and P3 have exactly the same |A2| = 2*h*a^2 for every partition. Their
+    witness difference is therefore a direct sufficiency test for scalar A2
+    within the exact-reversal class.
+    """
+    if numerical_floor is None:
+        numerical_floor = {"max_D": 0.0, "max_TVD": 0.0}
+    if nominal_total_ns is None:
+        nominal_total_ns = duration_from_loop_ns(n)
+
+    # Use the nearest clock-aligned total divisible into three equal segments,
+    # so endpoint_fraction=1/3 reproduces the equal-duration v8 diagnostic.
+    equal_duration_ns = int(
+        round((nominal_total_ns / 3.0) / CLOCK_NS) * CLOCK_NS
+    )
+    total_ns = 3 * equal_duration_ns
+    pulse_area = omega * total_ns / 1000.0
+
+    endpoint_fraction_nominals = [
+        0.05,
+        0.08,
+        0.12,
+        0.16,
+        0.20,
+        0.25,
+        1.0 / 3.0,
+        0.38,
+        0.42,
+        0.46,
+        0.48,
+    ]
+    endpoint_durations = []
+    for fraction in endpoint_fraction_nominals:
+        duration = int(round((fraction * total_ns) / CLOCK_NS) * CLOCK_NS)
+        duration = max(
+            MIN_DURATION_NS,
+            min((total_ns - MIN_DURATION_NS) // 2, duration),
+        )
+        duration = int(round(duration / CLOCK_NS) * CLOCK_NS)
+        if duration not in endpoint_durations:
+            endpoint_durations.append(duration)
+
+    detuning_by_role = {
+        "low": avg_det - detuning_half_gap,
+        "mid": avg_det,
+        "high": avg_det + detuning_half_gap,
+    }
+    topologies = [
+        ("P1_sweep", ("low", "mid", "high")),
+        ("P2_edge_first", ("low", "high", "mid")),
+        ("P3_mid_first", ("mid", "low", "high")),
+    ]
+
+    rows = []
+    for partition_index, endpoint_duration_ns in enumerate(
+        endpoint_durations, start=1
+    ):
+        point_start = time.perf_counter()
+        middle_duration_ns = total_ns - 2 * endpoint_duration_ns
+        if middle_duration_ns < MIN_DURATION_NS:
+            raise AssertionError("Variable-partition middle segment is too short.")
+        duration_by_role = {
+            "low": endpoint_duration_ns,
+            "mid": middle_duration_ns,
+            "high": endpoint_duration_ns,
+        }
+        endpoint_fraction_actual = endpoint_duration_ns / total_ns
+
+        for topology_name, role_order in topologies:
+            reverse_role_order = tuple(reversed(role_order))
+            forward_segments = [
+                (detuning_by_role[role], duration_by_role[role])
+                for role in role_order
+            ]
+            reverse_segments = list(reversed(forward_segments))
+            independently_built_reverse = [
+                (detuning_by_role[role], duration_by_role[role])
+                for role in reverse_role_order
+            ]
+            if reverse_segments != independently_built_reverse:
+                raise AssertionError("Exact reversal construction failed.")
+
+            forward_total = sum(duration for _, duration in forward_segments)
+            reverse_total = sum(duration for _, duration in reverse_segments)
+            forward_average = sum(
+                detuning * duration for detuning, duration in forward_segments
+            ) / forward_total
+            reverse_average = sum(
+                detuning * duration for detuning, duration in reverse_segments
+            ) / reverse_total
+            forward_area = integrated_rabi_area(forward_segments, omega)
+            reverse_area = integrated_rabi_area(reverse_segments, omega)
+            if forward_total != total_ns or reverse_total != total_ns:
+                raise AssertionError("Variable-partition total duration mismatch.")
+            if abs(forward_average - avg_det) > SCHEDULE_MATCH_TOL:
+                raise AssertionError("Variable-partition average detuning mismatch.")
+            if abs(reverse_average - avg_det) > SCHEDULE_MATCH_TOL:
+                raise AssertionError("Reversal average detuning mismatch.")
+            if abs(forward_area - reverse_area) > SCHEDULE_MATCH_TOL:
+                raise AssertionError("Variable-partition pulse area mismatch.")
+
+            a2_forward = signed_second_order_detuning_area(forward_segments)
+            a2_reverse = signed_second_order_detuning_area(reverse_segments)
+            if abs(a2_forward + a2_reverse) > 1.0e-12:
+                raise AssertionError("A2 did not change sign under exact reversal.")
+
+            a_us = endpoint_duration_ns / 1000.0
+            total_us = total_ns / 1000.0
+            if topology_name == "P1_sweep":
+                expected_a2_abs = (
+                    2.0
+                    * detuning_half_gap
+                    * a_us
+                    * (total_us - a_us)
+                )
+            else:
+                expected_a2_abs = (
+                    2.0 * detuning_half_gap * a_us**2
+                )
+            if abs(abs(a2_forward) - expected_a2_abs) > 1.0e-12:
+                raise AssertionError("Variable-partition A2 closed form failed.")
+
+            psi_forward = exact_state_from_segments(n, forward_segments, omega)
+            psi_reverse = exact_state_from_segments(n, reverse_segments, omega)
+            metrics = pair_metrics(
+                psi_forward,
+                psi_reverse,
+                f"{topology_name}_forward_vs_exact_reverse",
+            )
+            row = {
+                "partition_index": partition_index,
+                "endpoint_fraction_actual": endpoint_fraction_actual,
+                "endpoint_duration_ns": endpoint_duration_ns,
+                "middle_duration_ns": middle_duration_ns,
+                "total_duration_ns": total_ns,
+                "pulse_area": pulse_area,
+                "weighted_avg_detuning": forward_average,
+                "topology": topology_name,
+                "forward_role_order": "|".join(role_order),
+                "reverse_role_order": "|".join(reverse_role_order),
+                "A2_signed_forward": a2_forward,
+                "A2_signed_reverse": a2_reverse,
+                "A2_abs_each_schedule": abs(a2_forward),
+                "D_over_A2_abs": (
+                    metrics["pure_trace_distance"] / abs(a2_forward)
+                    if abs(a2_forward) > 0
+                    else None
+                ),
+                "TVD_over_A2_abs": (
+                    metrics["TVD_distribution"] / abs(a2_forward)
+                    if abs(a2_forward) > 0
+                    else None
+                ),
+                "rough_shot_scale_1_over_TVD2": (
+                    1.0 / metrics["TVD_distribution"] ** 2
+                    if metrics["TVD_distribution"] > 0
+                    else None
+                ),
+            }
+            row.update(metrics)
+            row["elapsed_seconds"] = time.perf_counter() - point_start
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df.to_csv(
+        OUTDIR / "variable_partition_reversal_pairs.csv", index=False
+    )
+
+    # P2 and P3 are matched-A2 exact reversal pairs at every partition.
+    matched_rows = []
+    for partition_index, group in df.groupby("partition_index", sort=True):
+        p2 = group[group["topology"] == "P2_edge_first"].iloc[0]
+        p3 = group[group["topology"] == "P3_mid_first"].iloc[0]
+        a2_error = abs(
+            float(p2["A2_abs_each_schedule"])
+            - float(p3["A2_abs_each_schedule"])
+        )
+        if a2_error > 1.0e-12:
+            raise AssertionError("P2/P3 matched-A2 identity failed.")
+        mean_D = 0.5 * (
+            float(p2["pure_trace_distance"])
+            + float(p3["pure_trace_distance"])
+        )
+        mean_TVD = 0.5 * (
+            float(p2["TVD_distribution"])
+            + float(p3["TVD_distribution"])
+        )
+        matched_rows.append(
+            {
+                "partition_index": int(partition_index),
+                "endpoint_fraction_actual": float(
+                    p2["endpoint_fraction_actual"]
+                ),
+                "endpoint_duration_ns": int(p2["endpoint_duration_ns"]),
+                "middle_duration_ns": int(p2["middle_duration_ns"]),
+                "A2_abs_matched": float(p2["A2_abs_each_schedule"]),
+                "A2_abs_error": a2_error,
+                "P2_D": float(p2["pure_trace_distance"]),
+                "P3_D": float(p3["pure_trace_distance"]),
+                "D_abs_split": abs(
+                    float(p2["pure_trace_distance"])
+                    - float(p3["pure_trace_distance"])
+                ),
+                "D_relative_split": (
+                    abs(
+                        float(p2["pure_trace_distance"])
+                        - float(p3["pure_trace_distance"])
+                    )
+                    / mean_D
+                    if mean_D > 0
+                    else 0.0
+                ),
+                "P2_TVD": float(p2["TVD_distribution"]),
+                "P3_TVD": float(p3["TVD_distribution"]),
+                "TVD_abs_split": abs(
+                    float(p2["TVD_distribution"])
+                    - float(p3["TVD_distribution"])
+                ),
+                "TVD_relative_split": (
+                    abs(
+                        float(p2["TVD_distribution"])
+                        - float(p3["TVD_distribution"])
+                    )
+                    / mean_TVD
+                    if mean_TVD > 0
+                    else 0.0
+                ),
+            }
+        )
+    matched_df = pd.DataFrame(matched_rows)
+    matched_df.to_csv(
+        OUTDIR / "variable_partition_matched_A2_splits.csv", index=False
+    )
+
+    # Quantify organizer quality globally and within each topology.
+    fit_rows = []
+    for subset_name, subset in [
+        ("all_reversal_pairs", df),
+        *[
+            (topology_name, df[df["topology"] == topology_name])
+            for topology_name, _ in topologies
+        ],
+    ]:
+        for witness in ["pure_trace_distance", "TVD_distribution"]:
+            summary = fit_summary_for_witness(
+                subset,
+                "A2_abs_each_schedule",
+                witness,
+                subset_name,
+            )
+            fit_rows.append(summary)
+    fit_df = pd.DataFrame(fit_rows)
+    fit_df.to_csv(
+        OUTDIR / "variable_partition_A2_fit_summary.csv", index=False
+    )
+
+    D_threshold = max(
+        MIN_SIGNAL_TO_FLOOR * float(numerical_floor.get("max_D", 0.0)),
+        1.0e-10,
+    )
+    TVD_threshold = max(
+        MIN_SIGNAL_TO_FLOOR * float(numerical_floor.get("max_TVD", 0.0)),
+        1.0e-10,
+    )
+    max_D_split = float(matched_df["D_abs_split"].max())
+    max_TVD_split = float(matched_df["TVD_abs_split"].max())
+    TVD_sufficiency_rejected = max_TVD_split > TVD_threshold
+    D_sufficiency_rejected = max_D_split > D_threshold
+    primary_verdict = (
+        "A2_strong_but_not_sufficient_for_exact_reversal_pairs"
+        if TVD_sufficiency_rejected
+        else "A2_sufficiency_not_rejected_for_exact_reversal_pairs"
+    )
+
+    all_tvd_fit = fit_df[
+        (fit_df["subset"] == "all_reversal_pairs")
+        & (fit_df["y"] == "TVD_distribution")
+    ].iloc[0]
+    all_D_fit = fit_df[
+        (fit_df["subset"] == "all_reversal_pairs")
+        & (fit_df["y"] == "pure_trace_distance")
+    ].iloc[0]
+    diagnostic = {
+        "experiment": (
+            "fixed detuning multiset, fixed average, variable time partition, "
+            "exact reversal pairs"
+        ),
+        "backend": "scipy_expm",
+        "N": n,
+        "total_duration_ns": total_ns,
+        "pulse_area": pulse_area,
+        "avg_detuning": avg_det,
+        "detuning_multiset": list(detuning_by_role.values()),
+        "partitions": int(len(endpoint_durations)),
+        "reversal_pairs": int(len(df)),
+        "matched_A2_P2_P3_pairs": int(len(matched_df)),
+        "D_floor_threshold": D_threshold,
+        "TVD_floor_threshold": TVD_threshold,
+        "max_matched_A2_D_split": max_D_split,
+        "max_matched_A2_TVD_split": max_TVD_split,
+        "max_matched_A2_D_relative_split": float(
+            matched_df["D_relative_split"].max()
+        ),
+        "max_matched_A2_TVD_relative_split": float(
+            matched_df["TVD_relative_split"].max()
+        ),
+        "all_pair_D_A2_R2": float(all_D_fit["ols_R2"]),
+        "all_pair_TVD_A2_R2": float(all_tvd_fit["ols_R2"]),
+        "primary_TVD_verdict": primary_verdict,
+        "secondary_D_verdict": (
+            "A2_strong_but_not_sufficient_for_exact_reversal_pairs"
+            if D_sufficiency_rejected
+            else "A2_sufficiency_not_rejected_for_exact_reversal_pairs"
+        ),
+        "interpretation_boundary": (
+            "A high A2 correlation can coexist with resolved matched-A2 splits. "
+            "Organizer quality and scalar sufficiency are distinct claims. "
+            "This audit fixes the detuning multiset, total time, pulse area, "
+            "weighted-average detuning, geometry, N, and Omega."
+        ),
+    }
+    with open(
+        OUTDIR / "variable_partition_reversal_verdict.json", "w"
+    ) as f:
+        json.dump(json_sanitize(diagnostic), f, indent=2, allow_nan=False)
+
+    print("\n" + "=" * 80)
+    print("D) FIXED-MULTISET VARIABLE-PARTITION REVERSAL AUDIT")
+    print("=" * 80)
+    print(
+        df[
+            [
+                "partition_index",
+                "endpoint_fraction_actual",
+                "topology",
+                "A2_abs_each_schedule",
+                "pure_trace_distance",
+                "TVD_distribution",
+                "D_over_A2_abs",
+                "TVD_over_A2_abs",
+            ]
+        ].to_string(index=False)
+    )
+    print("\nMATCHED-A2 P2/P3 SPLITS")
+    print(matched_df.to_string(index=False))
+    print("\nA2 FIT SUMMARY")
+    print(
+        fit_df[
+            [
+                "subset",
+                "y",
+                "n",
+                "spearman_rho",
+                "ols_slope",
+                "ols_intercept",
+                "ols_R2",
+                "rmse",
+            ]
+        ].to_string(index=False)
+    )
+    print("PRIMARY TVD REVERSAL VERDICT:", primary_verdict)
+    print("SECONDARY D REVERSAL VERDICT:", diagnostic["secondary_D_verdict"])
+    return df, matched_df, fit_df, diagnostic
+
+
+# ----------------------------------------------------------------------
 # 117-point scan
 # ----------------------------------------------------------------------
 def spearman_corr_tiesafe(x, y):
@@ -1462,13 +1865,14 @@ def write_provenance():
 # Main
 # ----------------------------------------------------------------------
 def main():
-    print("\n" + "="*80 + "\nFIXED-H SIGNED-RESPONSE VALIDATION v8\n" + "="*80)
+    print("\n" + "="*80 + "\nFIXED-H SIGNED-RESPONSE VALIDATION v9\n" + "="*80)
     print("OUTDIR:", OUTDIR)
     print("This script includes:\n"
           " - N=2 fixed-H certificate (clarified)\n"
           " - expm-primary 117-point two-proxy scan\n"
           " - signed-gap identity and f-reflection even/odd split\n"
           " - equal-A2 three-segment insufficiency diagnostic\n"
+          " - fixed-multiset variable-partition exact-reversal audit\n"
           " - 12-case forward/reverse Pulser cross-validation\n"
           " - fail-fast numerical-floor and schedule gates\n"
           " - SHA256, pip-freeze, versions, and per-point timing\n")
@@ -1491,6 +1895,14 @@ def main():
     df3, three_segment = run_3segment_magnus_diagnostic(
         numerical_floor_D=cert["zero_gap_numerical_floor"]["max_D"]
     )
+    (
+        variable_partition_df,
+        variable_partition_matched_df,
+        variable_partition_fit_df,
+        variable_partition,
+    ) = run_variable_partition_reversal_audit(
+        numerical_floor=cert["zero_gap_numerical_floor"]
+    )
 
     run_summary = {
         "status": "PASS",
@@ -1510,6 +1922,28 @@ def main():
         ],
         "three_segment_nonmid_to_mid_mean_TVD_ratio": three_segment[
             "nonmid_to_mid_mean_TVD_ratio"
+        ],
+        "variable_partition_reversal_rows": int(len(variable_partition_df)),
+        "variable_partition_matched_A2_rows": int(
+            len(variable_partition_matched_df)
+        ),
+        "variable_partition_primary_TVD_verdict": variable_partition[
+            "primary_TVD_verdict"
+        ],
+        "variable_partition_secondary_D_verdict": variable_partition[
+            "secondary_D_verdict"
+        ],
+        "variable_partition_all_pair_D_A2_R2": variable_partition[
+            "all_pair_D_A2_R2"
+        ],
+        "variable_partition_all_pair_TVD_A2_R2": variable_partition[
+            "all_pair_TVD_A2_R2"
+        ],
+        "variable_partition_max_matched_A2_D_split": variable_partition[
+            "max_matched_A2_D_split"
+        ],
+        "variable_partition_max_matched_A2_TVD_split": variable_partition[
+            "max_matched_A2_TVD_split"
         ],
         "scan_points": int(len(df)),
         "primary_proxy_verdict": cert["proxy_comparison"],
