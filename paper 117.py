@@ -47,8 +47,10 @@ Numerical discipline (v3)
   instead of being relied upon as a rounding accident.
 - Cross-validation is reported at the WITNESS level (D, TVD) in addition to
   the state level, because the paper's claims are about the witnesses.
-- Perturbative-validity metadata max|A2|*||[H_X,N]|| is recorded so that the
-  domain of validity of C_BCH is explicit.
+- The selected second-order term size max|A2|*||[H_X,N]|| is recorded as a
+  TERM-SIZE DIAGNOSTIC. It says whether the particular commutator term that
+  motivates C_BCH is uniformly small on this grid. It is not a Magnus
+  convergence criterion and not a truncation-validity verdict.
 
 Colab install:
     !pip install -q -U pulser==1.8.0 pulser-simulation==1.8.0 pandas numpy scipy
@@ -1181,23 +1183,31 @@ def run_117_scan():
     comm_norm = fixed_commutator_norm(n)
     total_us = total_ns / 1000.0
     max_a2 = float(np.max(GAP_GRID)) * total_us ** 2 * 0.25
+    second_order_scale = float(max_a2 * comm_norm)
     perturbative_validity = {
-        "max_abs_A2_us2_rad": max_a2,
+        "max_abs_A2_rad_us": max_a2,
         "commutator_norm_rad_per_us": comm_norm,
-        "max_A2_times_commutator_norm": max_a2 * comm_norm,
-        "second_order_magnus_truncation_valid": bool(
-            max_a2 * comm_norm < 1.0
+        "max_selected_second_order_scale": second_order_scale,
+        "selected_second_order_scale_below_one": bool(
+            second_order_scale < 1.0
+        ),
+        "diagnostic_role": (
+            "Term-size diagnostic only; not a Magnus-convergence or "
+            "truncation-validity criterion."
         ),
         "note": (
-            "C_BCH is the second-order Magnus shape. When "
-            "max|A2|*||[H_X,N]|| is not small compared with 1, the truncation "
-            "that produces C_BCH is outside its domain of validity on this "
-            "grid, and its poor fit is expected rather than informative."
+            "C_BCH is motivated by the selected second-order commutator term. "
+            "The maximum dimensionless scale "
+            "|A2|*||[H_X,N]|| exceeds unity, showing that this selected "
+            "second-order contribution is not uniformly small over the full "
+            "grid. This does not determine convergence of the Magnus series "
+            "and does not falsify a possible small-partition asymptotic role."
         ),
     }
     print(
         f"N={n}, total_ns={total_ns}, comm_norm={comm_norm:.6f}, "
-        f"max|A2|*||[H_X,N]||={max_a2 * comm_norm:.4f}"
+        f"max selected second-order scale |A2|*||[H_X,N]||="
+        f"{second_order_scale:.4f} (term-size diagnostic only)"
     )
     print(
         f"Grid: {len(GAP_GRID)} gaps x {len(FRACTION_GRID)} fractions, "
@@ -1652,9 +1662,10 @@ def run_117_scan():
             "specified rather than preregistered. The result excludes the "
             "losing specified proxy as a sufficient global finite-time "
             "organizer on this grid. It does not falsify its possible "
-            "small-partition asymptotic role or the Magnus expansion, whose "
-            "second-order truncation is not uniformly controlled across this "
-            "grid: see perturbative_validity. It is also not evidence that "
+            "small-partition asymptotic role or the Magnus expansion. The "
+            "selected second-order term that motivates it is not uniformly "
+            "small across this grid: see perturbative_validity, which is a "
+            "term-size diagnostic only. It is also not evidence that "
             "the winner is the correct functional form: see "
             "residual_structure_diagnostic. Fixed T cannot determine T "
             "versus T^2 scaling."
@@ -1692,8 +1703,8 @@ def run_117_scan():
                 "zero in between, with total support 2*min(f,1-f)*T."
             ),
             "evidence_class": (
-                "Measured on every nonzero-gap schedule in this run, not "
-                "quoted from a derivation."
+                "Algebraic implementation check evaluated on every "
+                "nonzero-gap schedule; not independent physical evidence."
             ),
             "max_support_abs_error_us": float(
                 nonzero["differential_support_abs_error_us"].max()
@@ -2312,7 +2323,7 @@ def main():
             "boundary": scan_cert["proxy_comparison"]["boundary"],
             "fail_fast": False,
         },
-        "second_order_magnus_domain_of_validity": {
+        "selected_second_order_term_size_diagnostic": {
             "status": "RECORDED",
             "detail": scan_cert["perturbative_validity"],
             "fail_fast": False,
