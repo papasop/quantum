@@ -92,7 +92,7 @@ from scipy.linalg import expm
 from scipy.optimize import least_squares
 
 
-SCRIPT_VERSION = "3.1"
+SCRIPT_VERSION = "3.2"
 SEED = 20260725
 CLOCK_NS = 4
 SPACING_UM = 8.0
@@ -112,6 +112,9 @@ PATH_MAX_TEST_D_TARGET = 1.0e-6
 PATH_PARAMETER_RELATIVE_ERROR_TARGET = 1.0e-4
 MIN_RESOLVED_ORDER_D = 1.0e-4
 MIN_PATH_ADVANTAGE_FACTOR = 10.0
+COMPUTATIONAL_BASIS_VISIBILITY_THRESHOLD = 1.0e-4
+FLOAT64_EPS = float(np.finfo(np.float64).eps)
+FLOAT64_DISPLAY_FLOOR = 1.0e-15
 
 # Independent N=2 117-point benchmark.  8088 ns is divisible by 24 ns, so the
 # 4 ns clock grid, exact half split, thirds, and f -> 1-f reflection coexist.
@@ -231,6 +234,21 @@ def jsonable(value: Any) -> Any:
     return value
 
 
+def float64_floor_report(value: float) -> dict[str, Any]:
+    """Keep the raw value for audit, but classify floor-scale quantities."""
+    value = float(value)
+    floor_limited = abs(value) < FLOAT64_DISPLAY_FLOOR
+    return {
+        "display": (
+            f"< {FLOAT64_DISPLAY_FLOOR:.0e} (float64 floor)"
+            if floor_limited else f"{value:.6e}"
+        ),
+        "raw_value": value,
+        "absolute_float64_epsilon_units": abs(value) / FLOAT64_EPS,
+        "floor_limited": floor_limited,
+    }
+
+
 def normalize_state(psi: np.ndarray) -> np.ndarray:
     psi = np.asarray(psi, dtype=np.complex128).ravel()
     norm = float(np.linalg.norm(psi))
@@ -303,6 +321,9 @@ def shared_endpoint_minimax(
         abs(distance_to_first - analytic_bound),
         abs(distance_to_second - analytic_bound),
     )
+    conservative_numeric_lower_bound = max(
+        0.0, analytic_bound - verification_error
+    )
     return {
         "target_overlap_abs": overlap_abs,
         "target_overlap_abs_direct": overlap_abs_direct,
@@ -312,6 +333,9 @@ def shared_endpoint_minimax(
         "target_projective_residual": pair_residual,
         "target_pair_D": pure_trace_distance(psi, phi),
         "analytic_minimax_D_lower_bound": analytic_bound,
+        "conservative_numeric_minimax_D_lower_bound": (
+            conservative_numeric_lower_bound
+        ),
         "analytic_minimum_mean_infidelity": mean_infidelity_bound,
         "constructed_midpoint_D_to_first": distance_to_first,
         "constructed_midpoint_D_to_second": distance_to_second,
@@ -664,6 +688,9 @@ def shared_fixedH_bound_rows(
             "shared_fixedH_minimax_D_lower_bound": bound[
                 "analytic_minimax_D_lower_bound"
             ],
+            "shared_fixedH_conservative_numeric_D_lower_bound": bound[
+                "conservative_numeric_minimax_D_lower_bound"
+            ],
             "shared_fixedH_minimum_mean_infidelity": bound[
                 "analytic_minimum_mean_infidelity"
             ],
@@ -761,6 +788,11 @@ def run_n2_117_scan() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 "shared_fixedH_minimax_D_lower_bound": shared_bound[
                     "analytic_minimax_D_lower_bound"
                 ],
+                "shared_fixedH_conservative_numeric_D_lower_bound": (
+                    shared_bound[
+                        "conservative_numeric_minimax_D_lower_bound"
+                    ]
+                ),
                 "shared_fixedH_minimum_mean_infidelity": shared_bound[
                     "analytic_minimum_mean_infidelity"
                 ],
@@ -829,9 +861,15 @@ def run_n2_117_scan() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         row["D_over_TVD"] for row in nonzero_rows
         if np.isfinite(row["D_over_TVD"])
     ]
+    max_scan_d = max(
+        row["pure_trace_distance"] for row in nonzero_rows
+    )
+    max_scan_tvd = max(
+        row["TVD_distribution"] for row in nonzero_rows
+    )
     incompatible_rows = [
         row for row in nonzero_rows
-        if row["shared_fixedH_minimax_D_lower_bound"]
+        if row["shared_fixedH_conservative_numeric_D_lower_bound"]
         >= MIN_RESOLVED_ORDER_D
     ]
     certificate = {
@@ -847,10 +885,36 @@ def run_n2_117_scan() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         "max_zero_gap_TVD_floor": floor_tvd,
         "weakest_nonzero_D": weakest_d,
         "weakest_nonzero_TVD": weakest_tvd,
-        "weakest_D_to_floor_ratio": weakest_d / max(floor_d, 1.0e-16),
-        "max_D": max(row["pure_trace_distance"] for row in nonzero_rows),
-        "max_TVD": max(row["TVD_distribution"] for row in nonzero_rows),
+        "weakest_D_to_float64_floor_ratio_not_for_inference": (
+            weakest_d / max(floor_d, 1.0e-16)
+        ),
+        "zero_gap_D_floor_report": float64_floor_report(floor_d),
+        "max_D": max_scan_d,
+        "max_TVD": max_scan_tvd,
         "max_finite_D_over_TVD": max(finite_hidden_ratios),
+        "witness_channel_visibility": {
+            "full_state_signal_resolved": (
+                max_scan_d >= MIN_RESOLVED_ORDER_D
+            ),
+            "computational_basis_visibility_suppressed": (
+                max_scan_tvd
+                < COMPUTATIONAL_BASIS_VISIBILITY_THRESHOLD
+            ),
+            "computational_basis_visibility_threshold": (
+                COMPUTATIONAL_BASIS_VISIBILITY_THRESHOLD
+            ),
+            "maximum_full_state_D": max_scan_d,
+            "maximum_computational_basis_TVD": max_scan_tvd,
+            "maximum_pointwise_D_over_TVD": max(
+                finite_hidden_ratios
+            ),
+            "interpretation": (
+                "In this N=2 scan the resolved order information is "
+                "predominantly phase/coherence encoded and is strongly "
+                "suppressed in computational-basis probabilities."
+            ),
+            "claim_role": "SCIENTIFIC_OUTCOME_NOT_IMPLEMENTATION_GATE",
+        },
         "shared_fixedH_obstruction": {
             "representation": (
                 "One unrestricted common output ray for both orderings, "
@@ -872,6 +936,14 @@ def run_n2_117_scan() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             ])),
             "maximum_minimax_D_lower_bound": max(
                 row["shared_fixedH_minimax_D_lower_bound"]
+                for row in nonzero_rows
+            ),
+            "minimum_conservative_numeric_D_lower_bound": min(
+                row["shared_fixedH_conservative_numeric_D_lower_bound"]
+                for row in nonzero_rows
+            ),
+            "maximum_conservative_numeric_D_lower_bound": max(
+                row["shared_fixedH_conservative_numeric_D_lower_bound"]
                 for row in nonzero_rows
             ),
             "maximum_bound_verification_error": max(
@@ -1082,7 +1154,9 @@ def main() -> None:
         f"(nonzero={scan_certificate['nonzero_gap_points']}) | "
         f"max D={scan_certificate['max_D']:.6f} | "
         f"max TVD={scan_certificate['max_TVD']:.6f} | "
-        f"weakest D/floor={scan_certificate['weakest_D_to_floor_ratio']:.3e}"
+        f"weakest D={scan_certificate['weakest_nonzero_D']:.6e} | "
+        "zero-gap D floor="
+        f"{scan_certificate['zero_gap_D_floor_report']['display']}"
     )
 
     print("\n" + "=" * 92)
@@ -1102,15 +1176,28 @@ def main() -> None:
         row["shared_fixedH_minimax_D_lower_bound"]
         for row in shared_bound_rows
     )
+    minimum_declared_pair_conservative_bound = min(
+        row["shared_fixedH_conservative_numeric_D_lower_bound"]
+        for row in shared_bound_rows
+    )
+    maximum_declared_pair_conservative_bound = max(
+        row["shared_fixedH_conservative_numeric_D_lower_bound"]
+        for row in shared_bound_rows
+    )
+    scan_obstruction = scan_certificate["shared_fixedH_obstruction"]
     print(
-        "analytic common-endpoint minimax D: "
+        "learning-pair analytic minimax D: "
         f"[{minimum_declared_pair_bound:.6e}, "
         f"{maximum_declared_pair_bound:.6e}] | "
-        f"verification error={maximum_bound_verification_error:.3e}"
+        "scan analytic minimax D: "
+        f"[{scan_obstruction['minimum_minimax_D_lower_bound']:.6e}, "
+        f"{scan_obstruction['maximum_minimax_D_lower_bound']:.6e}] | "
+        "verification error="
+        f"{float64_floor_report(maximum_bound_verification_error)['display']}"
     )
 
     print("\n" + "=" * 92)
-    print("C) FORWARD-TRAINED FIXED-H VS PATH-AWARE LEARNING TEST")
+    print("C) HELD-OUT REPRESENTATION-ADEQUACY AUDIT")
     print("=" * 92)
     dataset = build_dataset()
     starts = deterministic_starts(args.starts, args.seed)
@@ -1169,8 +1256,17 @@ def main() -> None:
     path_orientation_median = summaries["path_aware_piecewise_H"][
         "orientation_reverse"
     ]["median_D"]
-    advantage = avg_orientation_median / max(
+    raw_floor_limited_advantage = avg_orientation_median / max(
         path_orientation_median, 1.0e-16
+    )
+    heldout_error_reduction_lower_bound = (
+        avg_orientation_median / PATH_MAX_TEST_D_TARGET
+    )
+    path_orientation_median_floor_report = float64_floor_report(
+        path_orientation_median
+    )
+    path_orientation_max_floor_report = float64_floor_report(
+        path_orientation_max
     )
 
     target_contrasts = [
@@ -1193,6 +1289,9 @@ def main() -> None:
     ]
     avg_pair_d_max = max(row["predicted_pair_D"] for row in avg_contrasts)
     path_pair_error_max = max(row["pair_D_abs_error"] for row in path_contrasts)
+    path_pair_error_floor_report = float64_floor_report(
+        path_pair_error_max
+    )
 
     zero_control = gap_zero_control()
     if max(zero_control.values()) > 1.0e-12:
@@ -1303,7 +1402,7 @@ def main() -> None:
             "threshold": MIN_RESOLVED_ORDER_D,
             "fail_fast": False,
         },
-        "average_only_erases_order_contrast": {
+        "specified_summary_compression_erases_order_contrast": {
             "status": (
                 "SUPPORTED" if avg_pair_d_max <= 1.0e-12
                 else "NOT_SUPPORTED"
@@ -1339,16 +1438,32 @@ def main() -> None:
             "target": PATH_PARAMETER_RELATIVE_ERROR_TARGET,
             "fail_fast": False,
         },
-        "heldout_path_advantage": {
+        "heldout_path_error_reduction_lower_bound": {
             "status": (
-                "SUPPORTED" if advantage >= MIN_PATH_ADVANTAGE_FACTOR
+                "SUPPORTED"
+                if heldout_error_reduction_lower_bound
+                >= MIN_PATH_ADVANTAGE_FACTOR
                 else "NOT_SUPPORTED"
             ),
-            "median_orientation_D_advantage_factor": advantage,
+            "error_reduction_lower_bound": (
+                heldout_error_reduction_lower_bound
+            ),
+            "numerator_average_only_median_D": avg_orientation_median,
+            "denominator_upper_bound": PATH_MAX_TEST_D_TARGET,
+            "raw_ratio_floor_limited": True,
+            "lower_bound_uses_predeclared_denominator_upper_bound": True,
+            "raw_floor_limited_ratio_not_for_inference": (
+                raw_floor_limited_advantage
+            ),
+            "raw_denominator_float64_epsilon_units": (
+                path_orientation_median_floor_report[
+                    "absolute_float64_epsilon_units"
+                ]
+            ),
             "threshold": MIN_PATH_ADVANTAGE_FACTOR,
             "fail_fast": False,
         },
-        "fixed_H_failure_boundary_localized": {
+        "specified_compression_failure_boundary_localized": {
             "status": (
                 "SUPPORTED"
                 if (
@@ -1359,10 +1474,10 @@ def main() -> None:
                 else "NOT_SUPPORTED"
             ),
             "boundary": (
-                "Failure occurs when two schedules share the fixed-H input "
-                "summary but have resolved distinct target rays. The "
-                "summary-only model must identify them; the ordered model "
-                "retains the missing variable."
+                "Failure occurs when two schedules share the specified "
+                "summary-only input but have resolved distinct target rays. "
+                "That compression must identify them; the ordered model "
+                "retains the omitted variable."
             ),
             "average_model_max_predicted_order_D": avg_pair_d_max,
             "maximum_target_order_D": max_order_d,
@@ -1372,17 +1487,36 @@ def main() -> None:
     }
 
     question_closure = {
-        "Q1_independent_117_exact_state_scan": {
+        "Q1a_independent_117_scan_design": {
+            "status": "BY_CONSTRUCTION",
+            "evidence": (
+                "The declared grid contains 9 gaps x 13 clock-aligned "
+                "fractions and is excluded from learning."
+            ),
+        },
+        "Q1b_independent_117_order_signal": {
             "status": scientific_tests[
                 "N2_117_order_signal_resolved"
             ]["status"],
-            "evidence": "117 exact-state points; 104 nonzero-gap points.",
+            "evidence": (
+                "All 104 nonzero-gap exact-state points exceed the declared "
+                "resolution threshold."
+            ),
         },
-        "Q2_minimal_interacting_N2_adaptation": {
+        "Q2a_minimal_interacting_N2_scope": {
+            "status": "BY_CONSTRUCTION",
+            "evidence": (
+                "The declared model has two interacting atoms and a "
+                "four-dimensional Hilbert space."
+            ),
+        },
+        "Q2b_order_effect_resolved_in_N2": {
             "status": scientific_tests[
                 "minimal_N2_order_signal_resolved"
             ]["status"],
-            "evidence": "Two interacting atoms in a four-dimensional Hilbert space.",
+            "evidence": (
+                "The N=2 target pairs have a resolved nonzero order signal."
+            ),
         },
         "Q3_shared_fixedH_distinguishability": {
             "status": scientific_tests[
@@ -1395,7 +1529,7 @@ def main() -> None:
         },
         "Q4_practical_failure_boundary": {
             "status": scientific_tests[
-                "fixed_H_failure_boundary_localized"
+                "specified_compression_failure_boundary_localized"
             ]["status"],
             "evidence": (
                 "Forward-only training followed by unseen reverses and wholly "
@@ -1412,7 +1546,7 @@ def main() -> None:
             else "INVALID"
         ),
         "scientific_status": (
-            "PATH_INFORMATION_REQUIRED_IN_TESTED_N2_AUDIT"
+            "SPECIFIED_AVERAGE_ONLY_COMPRESSION_INSUFFICIENT_IN_TESTED_N2_AUDIT"
             if all(
                 test["status"] == "SUPPORTED"
                 for test in scientific_tests.values()
@@ -1440,11 +1574,39 @@ def main() -> None:
         "shared_fixedH_pair_bounds": shared_bound_rows,
         "shared_fixedH_pair_bound_summary": {
             "pair_count": len(shared_bound_rows),
-            "minimum_minimax_D_lower_bound": minimum_declared_pair_bound,
-            "maximum_minimax_D_lower_bound": maximum_declared_pair_bound,
+            "learning_pair_analytic_minimax_D_range": [
+                minimum_declared_pair_bound,
+                maximum_declared_pair_bound,
+            ],
+            "learning_pair_conservative_numeric_minimax_D_range": [
+                minimum_declared_pair_conservative_bound,
+                maximum_declared_pair_conservative_bound,
+            ],
             "maximum_constructive_verification_error": (
                 maximum_bound_verification_error
             ),
+        },
+        "minimax_range_separation": {
+            "N2_117_scan_analytic_minimax_D_range": [
+                scan_obstruction["minimum_minimax_D_lower_bound"],
+                scan_obstruction["maximum_minimax_D_lower_bound"],
+            ],
+            "N2_117_scan_conservative_numeric_minimax_D_range": [
+                scan_obstruction[
+                    "minimum_conservative_numeric_D_lower_bound"
+                ],
+                scan_obstruction[
+                    "maximum_conservative_numeric_D_lower_bound"
+                ],
+            ],
+            "learning_pair_analytic_minimax_D_range": [
+                minimum_declared_pair_bound,
+                maximum_declared_pair_bound,
+            ],
+            "learning_pair_conservative_numeric_minimax_D_range": [
+                minimum_declared_pair_conservative_bound,
+                maximum_declared_pair_conservative_bound,
+            ],
         },
         "question_closure": question_closure,
         "true_parameters": dict(zip(PARAMETER_NAMES, TRUE_THETA.tolist())),
@@ -1453,13 +1615,32 @@ def main() -> None:
         "heldout_specs": [asdict(x) for x in HELDOUT_SPECS],
         "fits": fits,
         "summaries": summaries,
-        "orientation_advantage_factor": advantage,
-        "orientation_advantage_denominator_note": (
-            "The path-aware denominator reaches the exact synthetic numerical "
-            "floor because targets and the path-aware learner share the "
-            "declared Hamiltonian family; interpret the factor as a model-"
-            "adequacy diagnostic, not a hardware performance ratio."
-        ),
+        "heldout_error_reduction": {
+            "lower_bound": heldout_error_reduction_lower_bound,
+            "numerator_average_only_median_D": avg_orientation_median,
+            "denominator_upper_bound": PATH_MAX_TEST_D_TARGET,
+            "raw_ratio_floor_limited": True,
+            "lower_bound_uses_predeclared_denominator_upper_bound": True,
+            "raw_ratio_not_for_inference": raw_floor_limited_advantage,
+            "raw_denominator_report": (
+                path_orientation_median_floor_report
+            ),
+            "interpretation": (
+                "Only the tolerance-based lower bound enters the scientific "
+                "test. The raw ratio divides by a float64-floor value and is "
+                "retained solely for audit."
+            ),
+        },
+        "float64_floor_reports": {
+            "path_orientation_median_D": (
+                path_orientation_median_floor_report
+            ),
+            "path_orientation_max_D": path_orientation_max_floor_report,
+            "path_model_max_pair_D_error": path_pair_error_floor_report,
+        },
+        "witness_channel_visibility": scan_certificate[
+            "witness_channel_visibility"
+        ],
         "max_target_order_D": max_order_d,
         "max_hidden_state_ratio_D_over_TVD": max_hidden_ratio,
         "average_model_max_predicted_order_D": avg_pair_d_max,
@@ -1470,8 +1651,9 @@ def main() -> None:
         "claim_boundary": (
             "This is a noiseless exact synthetic two-atom audit. The "
             "117-point scan establishes order sensitivity over a declared "
-            "fixed-summary grid; the separate learning test uses a declared "
-            "two-parameter calibration family with fixed interaction. It is "
+            "fixed-summary grid; the separate held-out representation-"
+            "adequacy audit uses a declared two-parameter calibration family "
+            "with fixed interaction. It is "
             "not QPU evidence, not "
             "a generic variational-circuit benchmark, and not proof that all "
             "Hamiltonian-learning models require this representation. It "
@@ -1524,8 +1706,8 @@ def main() -> None:
         ],
         "N2_117_max_D": scan_certificate["max_D"],
         "N2_117_max_TVD": scan_certificate["max_TVD"],
-        "N2_117_weakest_D_to_floor_ratio": scan_certificate[
-            "weakest_D_to_floor_ratio"
+        "N2_117_zero_gap_D_floor": scan_certificate[
+            "zero_gap_D_floor_report"
         ],
         "N2_117_shared_fixedH_incompatible_points": scan_certificate[
             "shared_fixedH_obstruction"
@@ -1533,23 +1715,40 @@ def main() -> None:
         "N2_117_shared_fixedH_tested_nonzero_points": scan_certificate[
             "shared_fixedH_obstruction"
         ]["tested_nonzero_points"],
-        "shared_fixedH_declared_pair_minimax_D_range": [
+        "N2_117_scan_analytic_minimax_D_range": [
+            scan_obstruction["minimum_minimax_D_lower_bound"],
+            scan_obstruction["maximum_minimax_D_lower_bound"],
+        ],
+        "learning_pair_analytic_minimax_D_range": [
             minimum_declared_pair_bound,
             maximum_declared_pair_bound,
         ],
         "question_closure": question_closure,
         "average_orientation_median_D": avg_orientation_median,
-        "path_orientation_median_D": path_orientation_median,
-        "path_orientation_max_D": path_orientation_max,
-        "orientation_advantage_factor": advantage,
+        "path_orientation_median_D": (
+            path_orientation_median_floor_report
+        ),
+        "path_orientation_max_D": path_orientation_max_floor_report,
+        "heldout_error_reduction_lower_bound": {
+            "value": heldout_error_reduction_lower_bound,
+            "denominator_upper_bound": PATH_MAX_TEST_D_TARGET,
+            "raw_ratio_floor_limited": True,
+            "lower_bound_uses_predeclared_denominator_upper_bound": True,
+        },
         "max_target_order_D": max_order_d,
         "max_hidden_state_ratio_D_over_TVD": max_hidden_ratio,
+        "witness_channel_visibility": scan_certificate[
+            "witness_channel_visibility"
+        ],
         "average_model_max_predicted_order_D": avg_pair_d_max,
-        "path_model_max_pair_D_error": path_pair_error_max,
+        "path_model_max_pair_D_error": path_pair_error_floor_report,
         "path_parameter_max_relative_error": summaries[
             "path_aware_piecewise_H"
         ]["parameter_recovery"]["max_relative_error"],
-        "scientific_tests": scientific_tests,
+        "scientific_test_statuses": {
+            name: test["status"]
+            for name, test in scientific_tests.items()
+        },
         "claim_boundary": result["claim_boundary"],
     }
     print(json.dumps(jsonable(compact), indent=2, ensure_ascii=False))
