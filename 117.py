@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-fixedH_path_order_response_v9.py
+fixedH_path_order_response_v10.py
 
 Fail-fast response-geometry validation for Y.Y.N. Li's two-segment
 neutral-atom pulse-ordering work.
@@ -40,15 +40,27 @@ Major v9 extension
 - Adds the missing exact-reversal direction: fixed detuning multiset,
   fixed total duration, fixed weighted-average detuning, and variable
   three-segment time partitions.
-- Scans three reversal-pair topologies at every partition and compares the two
-  topologies that have exactly identical |A2| but different temporal placement.
-- Separates "A2 is a strong organizer" from the stricter and independently
-  testable statement "A2 is sufficient for reversal pairs."
+- Scans three reversal-pair topologies at every partition. The original v9
+  interpretation of the matched-|A2| P2/P3 split is superseded by the v10
+  correction below.
+
+Major v10 correction
+--------------------
+- Reclassifies the P2/P3 matched-A2 split as an h-odd re-expression:
+  P3(+h) is the same reversal pair as P2(-h). It is retained as a symmetry
+  identity, not counted as an independent time-partition mechanism.
+- Makes within-topology proportionality drift and monotonic-order reversals the
+  decisive A2 tests.
+- Detects population-projection nodes where TVD is strongly suppressed while
+  pure-state distance remains finite.
+- Measures a separate three-segment constant-splitting numerical floor at every
+  time partition.
+- Fixes per-topology elapsed timing.
 
 Colab install:
     !pip install -q -U pulser==1.8.0 pulser-simulation==1.8.0 pandas numpy matplotlib scipy
 Run:
-    python fixedH_path_order_response_v9.py
+    python fixedH_path_order_response_v10.py
 """
 
 import hashlib
@@ -96,7 +108,7 @@ SCHEDULE_MATCH_TOL = 1.0e-12
 
 # ---------- output directory with timestamp ----------
 TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
-OUTDIR = Path(f"fixedH_path_order_response_v9_{TIMESTAMP}")
+OUTDIR = Path(f"fixedH_path_order_response_v10_{TIMESTAMP}")
 OUTDIR.mkdir(exist_ok=True)
 
 # ----------------------------------------------------------------------
@@ -923,15 +935,21 @@ def run_variable_partition_reversal_audit(
 
     The low and high detunings each receive duration a, while the middle
     detuning receives T-2a. Varying a therefore changes only the time partition.
-    At every partition we evaluate three independent exact-reversal topologies:
+    At every partition we evaluate three exact-reversal topologies:
 
       P1: low, mid, high  <-> high, mid, low
       P2: low, high, mid <-> mid, high, low
       P3: mid, low, high <-> high, low, mid
 
-    P2 and P3 have exactly the same |A2| = 2*h*a^2 for every partition. Their
-    witness difference is therefore a direct sufficiency test for scalar A2
-    within the exact-reversal class.
+    P2 and P3 have exactly the same |A2| = 2*h*a^2, but their difference is not
+    an independent time-partition direction: P3(+h) is schedule-identical to
+    P2(-h) after exchanging forward/reverse. Their split is therefore recorded
+    as a repeated measurement of the h-odd response component.
+
+    The independent variable-partition tests are instead:
+      1) drift of witness/|A2| within one fixed topology;
+      2) resolved decreases of a witness while |A2| increases;
+      3) local TVD suppression nodes with finite pure-state distance.
     """
     if numerical_floor is None:
         numerical_floor = {"max_D": 0.0, "max_TVD": 0.0}
@@ -982,10 +1000,10 @@ def run_variable_partition_reversal_audit(
     ]
 
     rows = []
+    partition_floor_rows = []
     for partition_index, endpoint_duration_ns in enumerate(
         endpoint_durations, start=1
     ):
-        point_start = time.perf_counter()
         middle_duration_ns = total_ns - 2 * endpoint_duration_ns
         if middle_duration_ns < MIN_DURATION_NS:
             raise AssertionError("Variable-partition middle segment is too short.")
@@ -996,7 +1014,45 @@ def run_variable_partition_reversal_audit(
         }
         endpoint_fraction_actual = endpoint_duration_ns / total_ns
 
+        # Independent three-segment numerical floor for this exact partition:
+        # one constant pulse versus three identical-detuning pieces carrying
+        # the same durations as low/mid/high roles.
+        constant_single = [(avg_det, total_ns)]
+        constant_split = [
+            (avg_det, endpoint_duration_ns),
+            (avg_det, middle_duration_ns),
+            (avg_det, endpoint_duration_ns),
+        ]
+        psi_constant_single = exact_state_from_segments(
+            n, constant_single, omega
+        )
+        psi_constant_split = exact_state_from_segments(
+            n, constant_split, omega
+        )
+        partition_floor = pair_metrics(
+            psi_constant_single,
+            psi_constant_split,
+            f"partition_{partition_index}_constant_single_vs_split",
+        )
+        partition_floor_rows.append(
+            {
+                "partition_index": partition_index,
+                "endpoint_fraction_actual": endpoint_fraction_actual,
+                "endpoint_duration_ns": endpoint_duration_ns,
+                "middle_duration_ns": middle_duration_ns,
+                "floor_abs_infidelity": abs(
+                    1.0 - partition_floor["fidelity"]
+                ),
+                "floor_D": partition_floor["pure_trace_distance"],
+                "floor_TVD": partition_floor["TVD_distribution"],
+                "floor_phase_gap": partition_floor[
+                    "phase_gap_BC_minus_overlap"
+                ],
+            }
+        )
+
         for topology_name, role_order in topologies:
+            topology_start = time.perf_counter()
             reverse_role_order = tuple(reversed(role_order))
             forward_segments = [
                 (detuning_by_role[role], duration_by_role[role])
@@ -1088,16 +1144,40 @@ def run_variable_partition_reversal_audit(
                 ),
             }
             row.update(metrics)
-            row["elapsed_seconds"] = time.perf_counter() - point_start
+            row["elapsed_seconds"] = time.perf_counter() - topology_start
             rows.append(row)
 
     df = pd.DataFrame(rows)
+    partition_floor_df = pd.DataFrame(partition_floor_rows)
     df.to_csv(
         OUTDIR / "variable_partition_reversal_pairs.csv", index=False
     )
+    partition_floor_df.to_csv(
+        OUTDIR / "variable_partition_three_segment_floors.csv", index=False
+    )
 
-    # P2 and P3 are matched-A2 exact reversal pairs at every partition.
-    matched_rows = []
+    three_segment_D_floor = max(
+        float(partition_floor_df["floor_D"].max()),
+        float(numerical_floor.get("max_D", 0.0)),
+    )
+    three_segment_TVD_floor = max(
+        float(partition_floor_df["floor_TVD"].max()),
+        float(numerical_floor.get("max_TVD", 0.0)),
+    )
+    D_threshold = max(
+        MIN_SIGNAL_TO_FLOOR * three_segment_D_floor,
+        1.0e-10,
+    )
+    TVD_threshold = max(
+        MIN_SIGNAL_TO_FLOOR * three_segment_TVD_floor,
+        1.0e-10,
+    )
+
+    # P2(+h)/P3(+h) is not an independent matched-A2 comparison:
+    # P3(+h) is P2(-h) with forward and reverse exchanged.  Verify that
+    # schedule identity directly and retain the split only as an h-odd
+    # re-expression.
+    h_odd_rows = []
     for partition_index, group in df.groupby("partition_index", sort=True):
         p2 = group[group["topology"] == "P2_edge_first"].iloc[0]
         p3 = group[group["topology"] == "P3_mid_first"].iloc[0]
@@ -1107,15 +1187,56 @@ def run_variable_partition_reversal_audit(
         )
         if a2_error > 1.0e-12:
             raise AssertionError("P2/P3 matched-A2 identity failed.")
-        mean_D = 0.5 * (
-            float(p2["pure_trace_distance"])
-            + float(p3["pure_trace_distance"])
+
+        a_ns = int(p2["endpoint_duration_ns"])
+        b_ns = int(p2["middle_duration_ns"])
+        p2_minus_forward = [
+            (avg_det + detuning_half_gap, a_ns),
+            (avg_det - detuning_half_gap, a_ns),
+            (avg_det, b_ns),
+        ]
+        p2_minus_reverse = list(reversed(p2_minus_forward))
+        p3_plus_forward = [
+            (avg_det, b_ns),
+            (avg_det - detuning_half_gap, a_ns),
+            (avg_det + detuning_half_gap, a_ns),
+        ]
+        p3_plus_reverse = list(reversed(p3_plus_forward))
+
+        schedule_identity_error = 0.0
+        for left, right in [
+            (p3_plus_forward, p2_minus_reverse),
+            (p3_plus_reverse, p2_minus_forward),
+        ]:
+            for (left_det, left_duration), (right_det, right_duration) in zip(
+                left, right
+            ):
+                schedule_identity_error = max(
+                    schedule_identity_error,
+                    abs(left_det - right_det),
+                    abs(left_duration - right_duration),
+                )
+        if schedule_identity_error > SCHEDULE_MATCH_TOL:
+            raise AssertionError("P3(+h) = reversed P2(-h) identity failed.")
+
+        psi_p2_minus_forward = exact_state_from_segments(
+            n, p2_minus_forward, omega
         )
-        mean_TVD = 0.5 * (
-            float(p2["TVD_distribution"])
-            + float(p3["TVD_distribution"])
+        psi_p2_minus_reverse = exact_state_from_segments(
+            n, p2_minus_reverse, omega
         )
-        matched_rows.append(
+        p2_minus_metrics = pair_metrics(
+            psi_p2_minus_forward,
+            psi_p2_minus_reverse,
+            "P2_minus_h_forward_vs_exact_reverse",
+        )
+        p2_plus_D = float(p2["pure_trace_distance"])
+        p2_minus_D = float(p2_minus_metrics["pure_trace_distance"])
+        p3_plus_D = float(p3["pure_trace_distance"])
+        p2_plus_TVD = float(p2["TVD_distribution"])
+        p2_minus_TVD = float(p2_minus_metrics["TVD_distribution"])
+        p3_plus_TVD = float(p3["TVD_distribution"])
+        h_odd_rows.append(
             {
                 "partition_index": int(partition_index),
                 "endpoint_fraction_actual": float(
@@ -1125,44 +1246,53 @@ def run_variable_partition_reversal_audit(
                 "middle_duration_ns": int(p2["middle_duration_ns"]),
                 "A2_abs_matched": float(p2["A2_abs_each_schedule"]),
                 "A2_abs_error": a2_error,
-                "P2_D": float(p2["pure_trace_distance"]),
-                "P3_D": float(p3["pure_trace_distance"]),
-                "D_abs_split": abs(
-                    float(p2["pure_trace_distance"])
-                    - float(p3["pure_trace_distance"])
+                "schedule_identity_error": schedule_identity_error,
+                "P2_plus_h_D": p2_plus_D,
+                "P2_minus_h_D": p2_minus_D,
+                "P3_plus_h_D": p3_plus_D,
+                "P3_equals_P2_minus_h_D_error": abs(
+                    p3_plus_D - p2_minus_D
                 ),
-                "D_relative_split": (
-                    abs(
-                        float(p2["pure_trace_distance"])
-                        - float(p3["pure_trace_distance"])
-                    )
-                    / mean_D
-                    if mean_D > 0
-                    else 0.0
+                "P2_h_odd_D": 0.5 * (p2_plus_D - p2_minus_D),
+                "P2P3_D_split_equals_twice_h_odd": (
+                    p2_plus_D - p3_plus_D
                 ),
-                "P2_TVD": float(p2["TVD_distribution"]),
-                "P3_TVD": float(p3["TVD_distribution"]),
-                "TVD_abs_split": abs(
-                    float(p2["TVD_distribution"])
-                    - float(p3["TVD_distribution"])
+                "P2_plus_h_TVD": p2_plus_TVD,
+                "P2_minus_h_TVD": p2_minus_TVD,
+                "P3_plus_h_TVD": p3_plus_TVD,
+                "P3_equals_P2_minus_h_TVD_error": abs(
+                    p3_plus_TVD - p2_minus_TVD
                 ),
-                "TVD_relative_split": (
-                    abs(
-                        float(p2["TVD_distribution"])
-                        - float(p3["TVD_distribution"])
-                    )
-                    / mean_TVD
-                    if mean_TVD > 0
-                    else 0.0
+                "P2_h_odd_TVD": 0.5 * (
+                    p2_plus_TVD - p2_minus_TVD
+                ),
+                "P2P3_TVD_split_equals_twice_h_odd": (
+                    p2_plus_TVD - p3_plus_TVD
                 ),
             }
         )
-    matched_df = pd.DataFrame(matched_rows)
-    matched_df.to_csv(
-        OUTDIR / "variable_partition_matched_A2_splits.csv", index=False
+    h_odd_df = pd.DataFrame(h_odd_rows)
+    h_odd_df.to_csv(
+        OUTDIR / "variable_partition_P2P3_h_odd_reexpression.csv",
+        index=False,
     )
 
-    # Quantify organizer quality globally and within each topology.
+    max_schedule_identity_error = float(
+        h_odd_df["schedule_identity_error"].max()
+    )
+    max_h_identity_D_error = float(
+        h_odd_df["P3_equals_P2_minus_h_D_error"].max()
+    )
+    max_h_identity_TVD_error = float(
+        h_odd_df["P3_equals_P2_minus_h_TVD_error"].max()
+    )
+    if max_h_identity_D_error > D_threshold:
+        raise AssertionError("P3(+h) = P2(-h) D identity gate failed.")
+    if max_h_identity_TVD_error > TVD_threshold:
+        raise AssertionError("P3(+h) = P2(-h) TVD identity gate failed.")
+
+    # OLS is retained as a descriptive summary only.  It is not used as the
+    # scientific gate because a visibly drifting ratio can still give high R2.
     fit_rows = []
     for subset_name, subset in [
         ("all_reversal_pairs", df),
@@ -1184,23 +1314,282 @@ def run_variable_partition_reversal_audit(
         OUTDIR / "variable_partition_A2_fit_summary.csv", index=False
     )
 
-    D_threshold = max(
-        MIN_SIGNAL_TO_FLOOR * float(numerical_floor.get("max_D", 0.0)),
-        1.0e-10,
+    # Test proportionality within each fixed topology.  The floor-aware span
+    # of witness/|A2| is the gate; a through-origin fit and its residual are
+    # retained as diagnostics.  R2 is never used for this verdict.
+    ratio_rows = []
+    witness_specs = [
+        ("pure_trace_distance", "D_over_A2_abs", D_threshold),
+        ("TVD_distribution", "TVD_over_A2_abs", TVD_threshold),
+    ]
+    for topology_name, _ in topologies:
+        subset = (
+            df[df["topology"] == topology_name]
+            .sort_values("A2_abs_each_schedule")
+            .copy()
+        )
+        x = subset["A2_abs_each_schedule"].to_numpy(dtype=float)
+        for witness, ratio_column, threshold in witness_specs:
+            y = subset[witness].to_numpy(dtype=float)
+            ratios = subset[ratio_column].to_numpy(dtype=float)
+            ratio_min_index = int(np.argmin(ratios))
+            ratio_max_index = int(np.argmax(ratios))
+            through_origin_slope = float(np.dot(x, y) / np.dot(x, x))
+            residuals = y - through_origin_slope * x
+            max_residual_index = int(np.argmax(np.abs(residuals)))
+            max_abs_residual = float(abs(residuals[max_residual_index]))
+            ratio_span_abs = float(
+                ratios[ratio_max_index] - ratios[ratio_min_index]
+            )
+            # Each ratio y/|A2| inherits at most threshold/|A2| from the
+            # floor-aware response threshold.  Comparing the two extrema makes
+            # D/|A2| or TVD/|A2| itself enter the verdict directly.
+            ratio_span_floor_bound = float(
+                threshold / x[ratio_min_index]
+                + threshold / x[ratio_max_index]
+            )
+            proportionality_rejected = (
+                ratio_span_abs > ratio_span_floor_bound
+            )
+            ratio_rows.append(
+                {
+                    "topology": topology_name,
+                    "witness": witness,
+                    "ratio_min": float(ratios[ratio_min_index]),
+                    "ratio_max": float(ratios[ratio_max_index]),
+                    "ratio_dynamic_range": float(
+                        ratios[ratio_max_index] / ratios[ratio_min_index]
+                    ),
+                    "ratio_relative_span": float(
+                        (ratios.max() - ratios.min()) / ratios.mean()
+                    ),
+                    "ratio_span_abs": ratio_span_abs,
+                    "ratio_span_floor_bound": ratio_span_floor_bound,
+                    "ratio_span_to_floor_bound": float(
+                        ratio_span_abs
+                        / max(ratio_span_floor_bound, 1.0e-300)
+                    ),
+                    "ratio_min_endpoint_fraction": float(
+                        subset.iloc[ratio_min_index][
+                            "endpoint_fraction_actual"
+                        ]
+                    ),
+                    "ratio_max_endpoint_fraction": float(
+                        subset.iloc[ratio_max_index][
+                            "endpoint_fraction_actual"
+                        ]
+                    ),
+                    "through_origin_slope": through_origin_slope,
+                    "max_abs_residual": max_abs_residual,
+                    "floor_aware_threshold": threshold,
+                    "max_residual_to_threshold": float(
+                        max_abs_residual / threshold
+                    ),
+                    "max_residual_endpoint_fraction": float(
+                        subset.iloc[max_residual_index][
+                            "endpoint_fraction_actual"
+                        ]
+                    ),
+                    "proportionality_rejected": bool(
+                        proportionality_rejected
+                    ),
+                }
+            )
+    ratio_df = pd.DataFrame(ratio_rows)
+    ratio_df.to_csv(
+        OUTDIR / "variable_partition_A2_ratio_drift.csv", index=False
     )
-    TVD_threshold = max(
-        MIN_SIGNAL_TO_FLOOR * float(numerical_floor.get("max_TVD", 0.0)),
-        1.0e-10,
+
+    # A monotone scalar |A2| law is rejected by any floor-resolved decrease in
+    # the witness as |A2| increases.  Search every ordered pair within one
+    # topology, not only neighboring samples.
+    inversion_rows = []
+    for topology_name, _ in topologies:
+        subset = (
+            df[df["topology"] == topology_name]
+            .sort_values("A2_abs_each_schedule")
+            .reset_index(drop=True)
+        )
+        for witness, _, threshold in witness_specs:
+            for left_index in range(len(subset) - 1):
+                left = subset.iloc[left_index]
+                for right_index in range(left_index + 1, len(subset)):
+                    right = subset.iloc[right_index]
+                    left_response = float(left[witness])
+                    right_response = float(right[witness])
+                    response_drop = left_response - right_response
+                    if response_drop <= threshold:
+                        continue
+                    inversion_rows.append(
+                        {
+                            "topology": topology_name,
+                            "witness": witness,
+                            "low_A2_partition_index": int(
+                                left["partition_index"]
+                            ),
+                            "high_A2_partition_index": int(
+                                right["partition_index"]
+                            ),
+                            "low_A2_endpoint_fraction": float(
+                                left["endpoint_fraction_actual"]
+                            ),
+                            "high_A2_endpoint_fraction": float(
+                                right["endpoint_fraction_actual"]
+                            ),
+                            "A2_low": float(
+                                left["A2_abs_each_schedule"]
+                            ),
+                            "A2_high": float(
+                                right["A2_abs_each_schedule"]
+                            ),
+                            "A2_growth_factor": float(
+                                right["A2_abs_each_schedule"]
+                                / left["A2_abs_each_schedule"]
+                            ),
+                            "response_at_low_A2": left_response,
+                            "response_at_high_A2": right_response,
+                            "response_drop_factor": float(
+                                left_response / right_response
+                            ),
+                            "response_abs_drop": response_drop,
+                            "floor_aware_threshold": threshold,
+                            "drop_to_threshold": float(
+                                response_drop / threshold
+                            ),
+                        }
+                    )
+    inversion_df = pd.DataFrame(inversion_rows)
+    inversion_columns = [
+        "topology",
+        "witness",
+        "low_A2_partition_index",
+        "high_A2_partition_index",
+        "low_A2_endpoint_fraction",
+        "high_A2_endpoint_fraction",
+        "A2_low",
+        "A2_high",
+        "A2_growth_factor",
+        "response_at_low_A2",
+        "response_at_high_A2",
+        "response_drop_factor",
+        "response_abs_drop",
+        "floor_aware_threshold",
+        "drop_to_threshold",
+    ]
+    if inversion_df.empty:
+        inversion_df = pd.DataFrame(columns=inversion_columns)
+    inversion_df.to_csv(
+        OUTDIR / "variable_partition_A2_monotonicity_inversions.csv",
+        index=False,
     )
-    max_D_split = float(matched_df["D_abs_split"].max())
-    max_TVD_split = float(matched_df["TVD_abs_split"].max())
-    TVD_sufficiency_rejected = max_TVD_split > TVD_threshold
-    D_sufficiency_rejected = max_D_split > D_threshold
-    primary_verdict = (
-        "A2_strong_but_not_sufficient_for_exact_reversal_pairs"
-        if TVD_sufficiency_rejected
-        else "A2_sufficiency_not_rejected_for_exact_reversal_pairs"
+
+    # Locate projection nodes: TVD is locally suppressed by at least 2x
+    # relative to both neighboring partitions while D remains resolved.
+    node_rows = []
+    for topology_name, _ in topologies:
+        subset = (
+            df[df["topology"] == topology_name]
+            .sort_values("endpoint_fraction_actual")
+            .reset_index(drop=True)
+        )
+        for index in range(1, len(subset) - 1):
+            left = subset.iloc[index - 1]
+            point = subset.iloc[index]
+            right = subset.iloc[index + 1]
+            point_TVD = float(point["TVD_distribution"])
+            neighbor_TVD_min = min(
+                float(left["TVD_distribution"]),
+                float(right["TVD_distribution"]),
+            )
+            if (
+                point_TVD + TVD_threshold < neighbor_TVD_min
+                and neighbor_TVD_min / point_TVD >= 2.0
+                and float(point["pure_trace_distance"]) > D_threshold
+            ):
+                node_rows.append(
+                    {
+                        "topology": topology_name,
+                        "partition_index": int(point["partition_index"]),
+                        "endpoint_fraction_actual": float(
+                            point["endpoint_fraction_actual"]
+                        ),
+                        "A2_abs": float(point["A2_abs_each_schedule"]),
+                        "pure_trace_distance": float(
+                            point["pure_trace_distance"]
+                        ),
+                        "TVD_distribution": point_TVD,
+                        "TVD_over_D": float(
+                            point_TVD / point["pure_trace_distance"]
+                        ),
+                        "left_neighbor_TVD": float(
+                            left["TVD_distribution"]
+                        ),
+                        "right_neighbor_TVD": float(
+                            right["TVD_distribution"]
+                        ),
+                        "TVD_suppression_factor": float(
+                            neighbor_TVD_min / point_TVD
+                        ),
+                        "D_relative_to_neighbor_mean": float(
+                            point["pure_trace_distance"]
+                            / (
+                                0.5
+                                * (
+                                    left["pure_trace_distance"]
+                                    + right["pure_trace_distance"]
+                                )
+                            )
+                        ),
+                        "TVD_to_floor": float(
+                            point_TVD / max(three_segment_TVD_floor, 1.0e-300)
+                        ),
+                        "D_to_floor": float(
+                            point["pure_trace_distance"]
+                            / max(three_segment_D_floor, 1.0e-300)
+                        ),
+                    }
+                )
+    node_df = pd.DataFrame(node_rows)
+    node_columns = [
+        "topology",
+        "partition_index",
+        "endpoint_fraction_actual",
+        "A2_abs",
+        "pure_trace_distance",
+        "TVD_distribution",
+        "TVD_over_D",
+        "left_neighbor_TVD",
+        "right_neighbor_TVD",
+        "TVD_suppression_factor",
+        "D_relative_to_neighbor_mean",
+        "TVD_to_floor",
+        "D_to_floor",
+    ]
+    if node_df.empty:
+        node_df = pd.DataFrame(columns=node_columns)
+    node_df.to_csv(
+        OUTDIR / "variable_partition_TVD_projection_nodes.csv", index=False
     )
+
+    TVD_proportionality_rejected = bool(
+        ratio_df[
+            ratio_df["witness"] == "TVD_distribution"
+        ]["proportionality_rejected"].any()
+    )
+    D_proportionality_rejected = bool(
+        ratio_df[
+            ratio_df["witness"] == "pure_trace_distance"
+        ]["proportionality_rejected"].any()
+    )
+    TVD_inversions = inversion_df[
+        inversion_df["witness"] == "TVD_distribution"
+    ]
+    D_inversions = inversion_df[
+        inversion_df["witness"] == "pure_trace_distance"
+    ]
+    TVD_monotonicity_rejected = not TVD_inversions.empty
+    D_monotonicity_rejected = not D_inversions.empty
+    population_node_resolved = not node_df.empty
 
     all_tvd_fit = fit_df[
         (fit_df["subset"] == "all_reversal_pairs")
@@ -1223,30 +1612,81 @@ def run_variable_partition_reversal_audit(
         "detuning_multiset": list(detuning_by_role.values()),
         "partitions": int(len(endpoint_durations)),
         "reversal_pairs": int(len(df)),
-        "matched_A2_P2_P3_pairs": int(len(matched_df)),
+        "P2P3_h_odd_reexpression_rows": int(len(h_odd_df)),
+        "max_P2P3_schedule_identity_error": max_schedule_identity_error,
+        "max_P3_equals_P2_minus_h_D_error": max_h_identity_D_error,
+        "max_P3_equals_P2_minus_h_TVD_error": max_h_identity_TVD_error,
+        "three_segment_constant_split_floor": {
+            "max_D": three_segment_D_floor,
+            "max_TVD": three_segment_TVD_floor,
+            "rows": int(len(partition_floor_df)),
+        },
         "D_floor_threshold": D_threshold,
         "TVD_floor_threshold": TVD_threshold,
-        "max_matched_A2_D_split": max_D_split,
-        "max_matched_A2_TVD_split": max_TVD_split,
-        "max_matched_A2_D_relative_split": float(
-            matched_df["D_relative_split"].max()
+        "max_within_topology_D_over_A2_dynamic_range": float(
+            ratio_df[
+                ratio_df["witness"] == "pure_trace_distance"
+            ]["ratio_dynamic_range"].max()
         ),
-        "max_matched_A2_TVD_relative_split": float(
-            matched_df["TVD_relative_split"].max()
+        "max_within_topology_TVD_over_A2_dynamic_range": float(
+            ratio_df[
+                ratio_df["witness"] == "TVD_distribution"
+            ]["ratio_dynamic_range"].max()
+        ),
+        "D_proportionality_verdict": (
+            "A2_proportionality_law_rejected_under_variable_partition"
+            if D_proportionality_rejected
+            else "A2_proportionality_law_not_rejected_on_sampled_partitions"
+        ),
+        "TVD_proportionality_verdict": (
+            "A2_proportionality_law_rejected_under_variable_partition"
+            if TVD_proportionality_rejected
+            else "A2_proportionality_law_not_rejected_on_sampled_partitions"
+        ),
+        "D_monotonicity_verdict": (
+            "monotone_scalar_A2_law_rejected_within_fixed_topology"
+            if D_monotonicity_rejected
+            else "monotone_scalar_A2_law_not_rejected_on_sampled_partitions"
+        ),
+        "TVD_monotonicity_verdict": (
+            "monotone_scalar_A2_law_rejected_within_fixed_topology"
+            if TVD_monotonicity_rejected
+            else "monotone_scalar_A2_law_not_rejected_on_sampled_partitions"
+        ),
+        "population_projection_verdict": (
+            "resolved_TVD_projection_node_with_finite_state_distance"
+            if population_node_resolved
+            else "no_resolved_TVD_projection_node_on_sampled_partitions"
+        ),
+        "TVD_monotonicity_inversion_count": int(len(TVD_inversions)),
+        "D_monotonicity_inversion_count": int(len(D_inversions)),
+        "TVD_projection_node_count": int(len(node_df)),
+        "strongest_TVD_inversion": (
+            TVD_inversions.sort_values(
+                "response_drop_factor", ascending=False
+            ).iloc[0].to_dict()
+            if not TVD_inversions.empty
+            else None
+        ),
+        "strongest_D_inversion": (
+            D_inversions.sort_values(
+                "response_drop_factor", ascending=False
+            ).iloc[0].to_dict()
+            if not D_inversions.empty
+            else None
         ),
         "all_pair_D_A2_R2": float(all_D_fit["ols_R2"]),
         "all_pair_TVD_A2_R2": float(all_tvd_fit["ols_R2"]),
-        "primary_TVD_verdict": primary_verdict,
-        "secondary_D_verdict": (
-            "A2_strong_but_not_sufficient_for_exact_reversal_pairs"
-            if D_sufficiency_rejected
-            else "A2_sufficiency_not_rejected_for_exact_reversal_pairs"
-        ),
         "interpretation_boundary": (
-            "A high A2 correlation can coexist with resolved matched-A2 splits. "
-            "Organizer quality and scalar sufficiency are distinct claims. "
-            "This audit fixes the detuning multiset, total time, pulse area, "
-            "weighted-average detuning, geometry, N, and Omega."
+            "P2(+h)-P3(+h) is exactly twice the P2 h-odd component and is "
+            "not an independent time-partition test. High global R2 is "
+            "descriptive only. The decisive gates here reject proportional "
+            "or monotone |A2| laws within a fixed topology; because sampled "
+            "|A2| values are unique within each topology, they do not by "
+            "themselves disprove every possible topology-conditioned, "
+            "nonmonotone function of |A2|. The audit fixes the detuning "
+            "multiset, total time, pulse area, weighted-average detuning, "
+            "geometry, N, and Omega."
         ),
     }
     with open(
@@ -1271,9 +1711,21 @@ def run_variable_partition_reversal_audit(
             ]
         ].to_string(index=False)
     )
-    print("\nMATCHED-A2 P2/P3 SPLITS")
-    print(matched_df.to_string(index=False))
-    print("\nA2 FIT SUMMARY")
+    print("\nP2/P3 H-ODD REEXPRESSION (NOT AN INDEPENDENT A2 TEST)")
+    print(h_odd_df.to_string(index=False))
+    print("\nWITHIN-TOPOLOGY A2 RATIO DRIFT AND PROPORTIONALITY GATE")
+    print(ratio_df.to_string(index=False))
+    print("\nRESOLVED MONOTONICITY INVERSIONS")
+    if inversion_df.empty:
+        print("none")
+    else:
+        print(inversion_df.to_string(index=False))
+    print("\nRESOLVED TVD PROJECTION NODES WITH FINITE D")
+    if node_df.empty:
+        print("none")
+    else:
+        print(node_df.to_string(index=False))
+    print("\nA2 FIT SUMMARY (DESCRIPTIVE ONLY; NOT A VERDICT)")
     print(
         fit_df[
             [
@@ -1288,9 +1740,22 @@ def run_variable_partition_reversal_audit(
             ]
         ].to_string(index=False)
     )
-    print("PRIMARY TVD REVERSAL VERDICT:", primary_verdict)
-    print("SECONDARY D REVERSAL VERDICT:", diagnostic["secondary_D_verdict"])
-    return df, matched_df, fit_df, diagnostic
+    print("TVD PROPORTIONALITY VERDICT:", diagnostic[
+        "TVD_proportionality_verdict"
+    ])
+    print("TVD MONOTONICITY VERDICT:", diagnostic[
+        "TVD_monotonicity_verdict"
+    ])
+    print("D PROPORTIONALITY VERDICT:", diagnostic[
+        "D_proportionality_verdict"
+    ])
+    print("D MONOTONICITY VERDICT:", diagnostic[
+        "D_monotonicity_verdict"
+    ])
+    print("POPULATION-PROJECTION VERDICT:", diagnostic[
+        "population_projection_verdict"
+    ])
+    return df, h_odd_df, fit_df, diagnostic
 
 
 # ----------------------------------------------------------------------
@@ -1865,14 +2330,17 @@ def write_provenance():
 # Main
 # ----------------------------------------------------------------------
 def main():
-    print("\n" + "="*80 + "\nFIXED-H SIGNED-RESPONSE VALIDATION v9\n" + "="*80)
+    print("\n" + "="*80 + "\nFIXED-H SIGNED-RESPONSE VALIDATION v10\n" + "="*80)
     print("OUTDIR:", OUTDIR)
     print("This script includes:\n"
           " - N=2 fixed-H certificate (clarified)\n"
           " - expm-primary 117-point two-proxy scan\n"
           " - signed-gap identity and f-reflection even/odd split\n"
           " - equal-A2 three-segment insufficiency diagnostic\n"
-          " - fixed-multiset variable-partition exact-reversal audit\n"
+          " - fixed-multiset variable-partition proportionality and "
+          "monotonicity gates\n"
+          " - P2/P3 h-odd identity and three-segment numerical floors\n"
+          " - resolved TVD projection-node diagnostic\n"
           " - 12-case forward/reverse Pulser cross-validation\n"
           " - fail-fast numerical-floor and schedule gates\n"
           " - SHA256, pip-freeze, versions, and per-point timing\n")
@@ -1897,7 +2365,7 @@ def main():
     )
     (
         variable_partition_df,
-        variable_partition_matched_df,
+        variable_partition_h_odd_df,
         variable_partition_fit_df,
         variable_partition,
     ) = run_variable_partition_reversal_audit(
@@ -1924,14 +2392,23 @@ def main():
             "nonmid_to_mid_mean_TVD_ratio"
         ],
         "variable_partition_reversal_rows": int(len(variable_partition_df)),
-        "variable_partition_matched_A2_rows": int(
-            len(variable_partition_matched_df)
+        "variable_partition_P2P3_h_odd_reexpression_rows": int(
+            len(variable_partition_h_odd_df)
         ),
-        "variable_partition_primary_TVD_verdict": variable_partition[
-            "primary_TVD_verdict"
+        "variable_partition_TVD_proportionality_verdict": variable_partition[
+            "TVD_proportionality_verdict"
         ],
-        "variable_partition_secondary_D_verdict": variable_partition[
-            "secondary_D_verdict"
+        "variable_partition_TVD_monotonicity_verdict": variable_partition[
+            "TVD_monotonicity_verdict"
+        ],
+        "variable_partition_D_proportionality_verdict": variable_partition[
+            "D_proportionality_verdict"
+        ],
+        "variable_partition_D_monotonicity_verdict": variable_partition[
+            "D_monotonicity_verdict"
+        ],
+        "variable_partition_population_projection_verdict": variable_partition[
+            "population_projection_verdict"
         ],
         "variable_partition_all_pair_D_A2_R2": variable_partition[
             "all_pair_D_A2_R2"
@@ -1939,11 +2416,24 @@ def main():
         "variable_partition_all_pair_TVD_A2_R2": variable_partition[
             "all_pair_TVD_A2_R2"
         ],
-        "variable_partition_max_matched_A2_D_split": variable_partition[
-            "max_matched_A2_D_split"
-        ],
-        "variable_partition_max_matched_A2_TVD_split": variable_partition[
-            "max_matched_A2_TVD_split"
+        "variable_partition_max_within_topology_D_over_A2_dynamic_range": (
+            variable_partition[
+                "max_within_topology_D_over_A2_dynamic_range"
+            ]
+        ),
+        "variable_partition_max_within_topology_TVD_over_A2_dynamic_range": (
+            variable_partition[
+                "max_within_topology_TVD_over_A2_dynamic_range"
+            ]
+        ),
+        "variable_partition_TVD_monotonicity_inversion_count": (
+            variable_partition["TVD_monotonicity_inversion_count"]
+        ),
+        "variable_partition_D_monotonicity_inversion_count": (
+            variable_partition["D_monotonicity_inversion_count"]
+        ),
+        "variable_partition_TVD_projection_node_count": variable_partition[
+            "TVD_projection_node_count"
         ],
         "scan_points": int(len(df)),
         "primary_proxy_verdict": cert["proxy_comparison"],
