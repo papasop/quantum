@@ -1,44 +1,60 @@
 # -*- coding: utf-8 -*-
 """
-fixedH_plus_117_path_area_v6.py
+fixedH_path_area_v7_fixed.py
 
-Single-file extension for Y.Y.N. Li's neutral-atom pulse path-ordering work.
+Fail-fast, reproducible validation for Y.Y.N. Li's two-segment neutral-atom
+pulse path-ordering work.
 
-Fixes applied (v6):
-- Fixed KeyError 'subset' in run_117_scan by adding the column before passing to fit_summary_for_witness.
-- fit_summary_for_witness now accepts subset_name as argument and uses it directly.
-- Added missing import for plt.
+Scientific scope
+----------------
+- Exact local Pulser/Qutip statevector simulation, not a QPU result.
+- Two-segment forward/reverse schedules have exactly matched total duration,
+  integrated Rabi area, and weighted-average detuning.
+- C_nc_simple = |Delta_2-Delta_1| f(1-f) is used only because total time,
+  geometry, N, and Omega are fixed. The full BCH proxy differs by a constant.
+- Correlations describe a deterministic parameter scan. No iid significance
+  p-values are reported.
+- The three-segment extension is a matched-control Magnus diagnostic, not a
+  claimed counterexample to the two-segment law.
 
-Backend: local Pulser/Qutip exact-state simulation + expm reference.
-Not PASQAL QPU. Not tomography. Not direct detG signature switching.
+Major v7 repairs
+----------------
+- Removes the old subset-column KeyError and records OLS slope/intercept/R^2.
+- Makes every scientific gate fail-fast; the program cannot print PASS/DONE
+  after a failed core module.
+- Replaces the invalid three-segment permutations (which had unequal weighted
+  averages) with all six equal-duration permutations and an explicit signed
+  second-order Magnus coefficient.
+- Renames and documents the Pulser basis conversion; audits it at several
+  Pulser-vs-expm points with a hard infidelity threshold.
+- Records the actual pulse area Phi = integral Omega dt.
+- Reports both all-117 and nonzero-gap-only correlations and avoids the word
+  "strictly monotonic" unless an explicit monotonicity gate is satisfied.
 
 Colab install:
     !pip install -q -U pulser==1.8.0 pulser-simulation==1.8.0 pandas numpy matplotlib scipy
 Run:
-    python fixedH_plus_117_path_area_v6.py
+    python fixedH_path_area_v7_fixed.py
 """
 
+import itertools
 import math
 import json
 import time
 import sys
 import platform
+from importlib import metadata
 from pathlib import Path
-import warnings
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-
 # ---------- scipy ----------
 try:
-    from scipy import stats
     from scipy.linalg import expm
-    from scipy.stats import spearmanr, pearsonr
+    from scipy.stats import spearmanr
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
-    stats = None
     expm = None
 
 # ---------- Pulser ----------
@@ -53,12 +69,14 @@ MIN_DURATION_NS = 16
 MAX_DURATION_NS = 10000
 OMEGA = 1.22
 SPACING_UM = 8.0
-RNG_SEED = 20260722
-PERM_N = 1000  # only for diagnostics; p-values deprecated
+AVG_DETUNING = -0.31
+CROSS_VALIDATION_MAX_INFIDELITY = 1.0e-5
+ZERO_GAP_ABS_TOL = 5.0e-12
+SCHEDULE_MATCH_TOL = 1.0e-12
 
 # ---------- output directory with timestamp ----------
 TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
-OUTDIR = Path(f"fixedH_plus_117_path_area_v6_{TIMESTAMP}")
+OUTDIR = Path(f"fixedH_path_area_v7_fixed_{TIMESTAMP}")
 OUTDIR.mkdir(exist_ok=True)
 
 # ----------------------------------------------------------------------
@@ -82,6 +100,14 @@ def json_sanitize(obj):
     if isinstance(obj, (np.bool_,)):
         return bool(obj)
     return obj
+
+
+def package_version(distribution_name):
+    """Return installed distribution version without making metadata nonfatal."""
+    try:
+        return metadata.version(distribution_name)
+    except metadata.PackageNotFoundError:
+        return "unknown"
 
 
 # ----------------------------------------------------------------------
@@ -213,12 +239,12 @@ def exact_state_from_segments(n, segments, omega=OMEGA, coords=None):
     return normalize_state(psi)
 
 
-def cross_validate_pulser_vs_exact(n, segments, omega=OMEGA, coords=None, tol=1e-10):
-    """Return fidelity between Pulser and exact expm."""
+def cross_validate_pulser_vs_exact(n, segments, omega=OMEGA, coords=None):
+    """Return fidelity between Pulser and independent scipy expm evolution."""
     psi_pulser, _ = final_statevector_from_segments(n, segments, omega, coords)
     psi_exact = exact_state_from_segments(n, segments, omega, coords)
-    ov = abs(state_overlap(psi_pulser, psi_exact))
-    return ov, psi_pulser, psi_exact
+    fidelity = state_fidelity(psi_pulser, psi_exact)
+    return fidelity, psi_pulser, psi_exact
 
 
 # ----------------------------------------------------------------------
@@ -236,8 +262,10 @@ def make_register(n, coords=None):
 
 def add_constant_pulse(seq, omega, detuning, duration_ns, phase=0.0):
     duration_ns = int(duration_ns)
-    if duration_ns <= 0:
-        raise ValueError("duration_ns must be positive")
+    if duration_ns < MIN_DURATION_NS:
+        raise ValueError(
+            f"duration_ns={duration_ns} is below device minimum {MIN_DURATION_NS} ns"
+        )
     if duration_ns % CLOCK_NS != 0:
         raise ValueError(f"duration_ns={duration_ns} not aligned to {CLOCK_NS} ns")
     omega_wf = ConstantWaveform(duration_ns, float(omega))
@@ -289,15 +317,20 @@ def final_statevector_from_segments(n, segments, omega=OMEGA, coords=None):
     arr = normalize_state(arr)
     if len(arr) != 2 ** n:
         raise RuntimeError(f"Final state dimension {len(arr)} != 2^N={2**n}")
-    # corrected_statevector: we keep it but note it is a permutation.
-    # For all rotationally invariant metrics (fidelity, TVD) this is an identity,
-    # but we record the convention.
-    arr_corrected = corrected_statevector(arr, n)
-    return arr_corrected, branch
+    arr_standard = pulser_to_standard_basis(arr, n)
+    return arr_standard, branch
 
 
-def corrected_statevector(psi, n):
-    """Permutation of basis labels; leaves all rotational invariants unchanged."""
+def pulser_to_standard_basis(psi, n):
+    """
+    Convert Pulser's local |r>,|g> index convention to the standard bit labels
+    used by exact_hamiltonian_for_segments, where 0=|g> and 1=|r>.
+
+    This is a bitwise-complement permutation, not a bit-order reversal. Applying
+    it to both members of a pair preserves overlap and full-distribution TVD.
+    In Pulser-vs-expm validation it is a required basis conversion and is
+    therefore audited explicitly at several parameter points.
+    """
     psi = normalize_state(psi)
     dim = 2 ** n
     if len(psi) != dim:
@@ -323,13 +356,20 @@ def duration_from_loop_ns(n, omega=OMEGA, loop=2.22):
 def split_duration_clock(total_ns, frac):
     total_ns = int(round(total_ns / CLOCK_NS) * CLOCK_NS)
     d1 = int(round(total_ns * frac / CLOCK_NS) * CLOCK_NS)
-    d1 = max(CLOCK_NS, min(total_ns - CLOCK_NS, d1))
+    d1 = max(MIN_DURATION_NS, min(total_ns - MIN_DURATION_NS, d1))
     d2 = total_ns - d1
+    if d2 < MIN_DURATION_NS:
+        raise ValueError("Second segment is below the minimum duration.")
     return int(d1), int(d2), int(total_ns)
 
 
 def weighted_avg(det1, det2, d1_ns, d2_ns):
     return float((det1 * d1_ns + det2 * d2_ns) / (d1_ns + d2_ns))
+
+
+def integrated_rabi_area(segments, omega=OMEGA):
+    """Dimensionless pulse area Phi = integral Omega dt, with dt in microseconds."""
+    return float(omega * sum(dur_ns for _, dur_ns in segments) / 1000.0)
 
 
 def commutator_norm_proxy(n):
@@ -412,61 +452,117 @@ def run_n2_fixedH():
 
 
 # ----------------------------------------------------------------------
-# 3-segment counterexample family
+# Matched three-segment Magnus diagnostic
 # ----------------------------------------------------------------------
-def generate_3segment_counterexamples(n=8, omega=OMEGA, avg_det=-0.31, T_ns=None):
+def signed_second_order_detuning_area(segments):
     """
-    Generate a set of 3-segment schedules that all have the same C_nc proxy
-    (same gap product) but different internal structures, to test if they
-    collapse to the same witness values.
+    Coefficient multiplying [H_X,N] in the pairwise second-order Magnus sum,
+    up to the conventional overall factor/sign:
+
+        A2 = sum_{i>j} (Delta_i - Delta_j) t_i t_j.
+
+    Times are expressed in microseconds, so A2 has the corresponding squared
+    time factor. Its sign changes under exact schedule reversal.
     """
-    if T_ns is None:
-        T_ns = duration_from_loop_ns(n)
-    # We'll fix two gaps: g1 = 0.12, g2 = 0.24 and choose fractions to keep product constant.
-    base_gap = 0.12
-    # For a 3-segment schedule, the path area proxy is more complex.
-    # We'll define a simple family: (Δ1, t1), (Δ2, t2), (Δ3, t3) with t1+t2+t3 = T.
-    # We want same total duration, same weighted average, same sum of products?
-    # To keep it simple, we'll fix t1 = t3 = T/4, t2 = T/2, and vary Δ1, Δ2, Δ3
-    # such that Δ2 is the average, and (Δ3-Δ1) is fixed, but we can vary the order.
-    # Actually we need two distinct paths with same integrated area but different order.
-    # We'll generate two 3-segment paths:
-    # Path A: (Δ1, t1), (Δ2, t2), (Δ1, t3)
-    # Path B: (Δ2, t1), (Δ1, t2), (Δ2, t3) ? Not good.
-    # We'll just generate a few random 3-segment schedules with same Δ1, Δ2, Δ3 set
-    # but permute the order. This is a simple test.
-    # However, the path-area proxy for 3 segments is not simply |Δa-Δb|*t1*t2.
-    # We'll simply generate a set of schedules with same total duration and same
-    # set of detunings but different permutations, and see if witnesses are identical.
-    # If they are not, the law is schedule-dependent.
-    dets = [-0.43, -0.31, -0.19]  # three detunings with gaps 0.12
-    t1 = int(0.25 * T_ns); t2 = int(0.5 * T_ns); t3 = int(0.25 * T_ns)
-    # Ensure clock alignment
-    t1 = int(round(t1/CLOCK_NS)*CLOCK_NS)
-    t2 = int(round(t2/CLOCK_NS)*CLOCK_NS)
-    t3 = T_ns - t1 - t2
-    t3 = int(round(t3/CLOCK_NS)*CLOCK_NS)
-    if t1 <=0 or t2 <=0 or t3 <=0:
-        raise ValueError("Invalid durations")
-    schedules = [
-        ([(dets[0], t1), (dets[1], t2), (dets[2], t3)], "perm1"),
-        ([(dets[1], t1), (dets[0], t2), (dets[2], t3)], "perm2"),
-        ([(dets[0], t1), (dets[2], t2), (dets[1], t3)], "perm3"),
-        ([(dets[2], t1), (dets[1], t2), (dets[0], t3)], "perm4"),
-    ]
+    area = 0.0
+    for i in range(len(segments)):
+        delta_i, duration_i_ns = segments[i]
+        for j in range(i):
+            delta_j, duration_j_ns = segments[j]
+            area += (
+                (delta_i - delta_j)
+                * (duration_i_ns / 1000.0)
+                * (duration_j_ns / 1000.0)
+            )
+    return float(area)
+
+
+def run_3segment_magnus_diagnostic(
+    n=8, omega=OMEGA, avg_det=AVG_DETUNING, nominal_total_ns=None
+):
+    """
+    Compare all six temporal permutations of three detunings.
+
+    Every segment has exactly the same clock-aligned duration, so every
+    permutation has identical total duration, integrated Rabi area, weighted
+    average detuning, and detuning multiset. The only changed variable is order.
+    States are compared with the constant-average schedule to test how much the
+    signed second-order Magnus coefficient organizes the response. This is a
+    diagnostic beyond the paper's two-segment claim, not a proof of a universal
+    three-segment law.
+    """
+    if nominal_total_ns is None:
+        nominal_total_ns = duration_from_loop_ns(n)
+    duration_each_ns = int(
+        round((nominal_total_ns / 3.0) / CLOCK_NS) * CLOCK_NS
+    )
+    if duration_each_ns < MIN_DURATION_NS:
+        raise ValueError("Clock-aligned three-segment duration is too short.")
+
+    total_ns = 3 * duration_each_ns
+    detunings = (avg_det - 0.12, avg_det, avg_det + 0.12)
+    constant_segments = [(avg_det, total_ns)]
+    psi_constant, constant_branch = final_statevector_from_segments(
+        n, constant_segments, omega=omega
+    )
+
+    reference_total = total_ns
+    reference_area = integrated_rabi_area(constant_segments, omega)
     rows = []
-    psi_ref = None
-    for segs, label in schedules:
-        psi, _ = final_statevector_from_segments(n, segs, omega=omega)
-        if psi_ref is None:
-            psi_ref = psi
-        else:
-            # compare to ref
-            m = pair_metrics(psi_ref, psi, f"ref_vs_{label}")
-            rows.append(m)
-            print(f"{label}: D_pure={m['pure_trace_distance']:.6f}, TVD={m['TVD_distribution']:.6f}")
-    df = pd.DataFrame(rows)
-    df.to_csv(OUTDIR / "3segment_counterexample.csv", index=False)
+    for permutation_index, permutation in enumerate(
+        itertools.permutations(detunings), start=1
+    ):
+        segments = [(delta, duration_each_ns) for delta in permutation]
+        total = sum(duration for _, duration in segments)
+        avg = sum(delta * duration for delta, duration in segments) / total
+        area = integrated_rabi_area(segments, omega)
+        assert total == reference_total
+        assert abs(avg - avg_det) <= SCHEDULE_MATCH_TOL
+        assert abs(area - reference_area) <= SCHEDULE_MATCH_TOL
+
+        psi, branch = final_statevector_from_segments(n, segments, omega=omega)
+        metrics = pair_metrics(
+            psi, psi_constant, f"permutation_{permutation_index}_vs_constant"
+        )
+        a2 = signed_second_order_detuning_area(segments)
+        row = {
+            "permutation_index": permutation_index,
+            "detuning_order": "|".join(f"{x:.8f}" for x in permutation),
+            "duration_each_ns": duration_each_ns,
+            "total_duration_ns": total,
+            "pulse_area": area,
+            "weighted_avg_detuning": avg,
+            "A2_signed": a2,
+            "A2_abs": abs(a2),
+            "pulser_state_branch": branch,
+            "constant_state_branch": constant_branch,
+        }
+        row.update(metrics)
+        rows.append(row)
+
+    df = pd.DataFrame(rows).sort_values("permutation_index")
+    max_avg_error = float(np.max(np.abs(df["weighted_avg_detuning"] - avg_det)))
+    max_area_error = float(np.max(np.abs(df["pulse_area"] - reference_area)))
+    if max_avg_error > SCHEDULE_MATCH_TOL or max_area_error > SCHEDULE_MATCH_TOL:
+        raise AssertionError("Three-segment integrated-content matching failed.")
+
+    df.to_csv(OUTDIR / "three_segment_magnus_diagnostic.csv", index=False)
+    print("\nTHREE-SEGMENT MATCHED MAGNUS DIAGNOSTIC")
+    print(
+        df[
+            [
+                "permutation_index",
+                "detuning_order",
+                "A2_signed",
+                "pure_trace_distance",
+                "TVD_distribution",
+            ]
+        ].to_string(index=False)
+    )
+    print(
+        f"Matched total={total_ns} ns, pulse_area={reference_area:.9f}, "
+        f"max_avg_error={max_avg_error:.3e}"
+    )
     return df
 
 
@@ -474,38 +570,26 @@ def generate_3segment_counterexamples(n=8, omega=OMEGA, avg_det=-0.31, T_ns=None
 # 117-point scan
 # ----------------------------------------------------------------------
 def spearman_corr_tiesafe(x, y):
-    """Use scipy if available, else implement tie-aware."""
+    """Tie-aware Spearman rank correlation."""
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     if SCIPY_AVAILABLE:
         rho, _ = spearmanr(x, y)
         return float(rho)
-    else:
-        # Use rankdata if available
-        try:
-            from scipy.stats import rankdata
-            rx = rankdata(x, method='average')
-            ry = rankdata(y, method='average')
-            rho = np.corrcoef(rx, ry)[0,1]
-            return float(rho)
-        except:
-            rx = np.argsort(np.argsort(x)).astype(float)
-            ry = np.argsort(np.argsort(y)).astype(float)
-            rho = np.corrcoef(rx, ry)[0,1]
-            return float(rho)
+    raise RuntimeError("SciPy is required for tie-aware Spearman correlation.")
 
 
-def pearson_r2_safe(x, y):
+def ols_fit_with_intercept(x, y):
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     if np.std(x) <= 1e-15 or np.std(y) <= 1e-15:
-        return float("nan")
-    if SCIPY_AVAILABLE:
-        r, _ = pearsonr(x, y)
-        return float(r**2)
-    else:
-        r = np.corrcoef(x, y)[0,1]
-        return float(r**2)
+        return float("nan"), float("nan"), float("nan")
+    slope, intercept = np.polyfit(x, y, 1)
+    prediction = slope * x + intercept
+    ss_res = float(np.sum((y - prediction) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot
+    return float(slope), float(intercept), float(r2)
 
 
 def fit_summary_for_witness(sub_df, xcol, ycol, subset_name):
@@ -513,14 +597,16 @@ def fit_summary_for_witness(sub_df, xcol, ycol, subset_name):
     x = sub_df[xcol].values.astype(float)
     y = sub_df[ycol].values.astype(float)
     rho = spearman_corr_tiesafe(x, y)
-    r2 = pearson_r2_safe(x, y)
+    slope, intercept, r2 = ols_fit_with_intercept(x, y)
     return {
         "subset": subset_name,
         "x": xcol,
         "y": ycol,
         "n": int(len(sub_df)),
         "spearman_rho": rho,
-        "pearson_R2": r2,
+        "ols_slope": slope,
+        "ols_intercept": intercept,
+        "ols_R2": r2,
     }
 
 
@@ -530,7 +616,7 @@ def run_117_scan():
     total_ns = duration_from_loop_ns(n)
     comm_norm = commutator_norm_proxy(n)
     print(f"N={n}, total_ns={total_ns}, comm_norm={comm_norm:.6f}")
-    print("Grid: gaps={0..0.24}, fracs={0.10..0.90}")
+    print("Grid: 9 gaps in [0, 0.24], 13 fractions in [0.10, 0.90]")
     # generate points
     rows = []
     idx = 0
@@ -546,18 +632,19 @@ def run_117_scan():
             # Hard assert schedule matching
             fwd_total = sum(d for _, d in forward_segments)
             rev_total = sum(d for _, d in reverse_segments)
-            fwd_area = OMEGA * (fwd_total / 1000.0)
-            rev_area = OMEGA * (rev_total / 1000.0)
+            fwd_area = integrated_rabi_area(forward_segments)
+            rev_area = integrated_rabi_area(reverse_segments)
             fwd_avg = weighted_avg(forward_segments[0][0], forward_segments[1][0],
                                    forward_segments[0][1], forward_segments[1][1])
             rev_avg = weighted_avg(reverse_segments[0][0], reverse_segments[1][0],
                                    reverse_segments[0][1], reverse_segments[1][1])
             assert fwd_total == rev_total, "Total duration mismatch"
-            assert abs(fwd_area - rev_area) < 1e-12, "Area mismatch"
-            assert abs(fwd_avg - rev_avg) < 1e-12, "Avg detuning mismatch"
+            assert abs(fwd_area - rev_area) <= SCHEDULE_MATCH_TOL, "Area mismatch"
+            assert abs(fwd_avg - rev_avg) <= SCHEDULE_MATCH_TOL, "Avg detuning mismatch"
+            assert abs(fwd_avg - AVG_DETUNING) <= SCHEDULE_MATCH_TOL
             # compute states
-            psi_f, _ = final_statevector_from_segments(n, forward_segments)
-            psi_r, _ = final_statevector_from_segments(n, reverse_segments)
+            psi_f, branch_f = final_statevector_from_segments(n, forward_segments)
+            psi_r, branch_r = final_statevector_from_segments(n, reverse_segments)
             m = pair_metrics(psi_f, psi_r, "forward_vs_reverse")
             Cnc_simple = abs(delta2 - delta1) * f_actual * (1.0 - f_actual)
             row = {
@@ -571,9 +658,12 @@ def run_117_scan():
                 "duration1_ns": d1,
                 "duration2_ns": d2,
                 "T_ns": T,
+                "pulse_area": fwd_area,
                 "weighted_avg_detuning": weighted_avg(delta1, delta2, d1, d2),
                 "C_nc_simple": Cnc_simple,
                 "commutator_norm_proxy": comm_norm,
+                "pulser_branch_forward": branch_f,
+                "pulser_branch_reverse": branch_r,
             }
             row.update(m)
             rows.append(row)
@@ -582,6 +672,19 @@ def run_117_scan():
                   f"Γ={m['phase_gap_BC_minus_overlap']:.6f} "
                   f"TVD={m['TVD_distribution']:.6f}")
     df = pd.DataFrame(rows)
+
+    zero = df[df["gap"] == 0.0]
+    zero_maxima = {
+        witness: float(np.max(np.abs(zero[witness].to_numpy(dtype=float))))
+        for witness in [
+            "pure_trace_distance",
+            "phase_gap_BC_minus_overlap",
+            "TVD_distribution",
+        ]
+    }
+    if any(value > ZERO_GAP_ABS_TOL for value in zero_maxima.values()):
+        raise AssertionError(f"Zero-gap witness gate failed: {zero_maxima}")
+
     df.to_csv(OUTDIR / "scan117_statevector_metrics.csv", index=False)
 
     # compute correlations
@@ -609,16 +712,34 @@ def run_117_scan():
         "nonzero_gap_points": int((df["gap"]>0).sum()),
         "total_duration_ns": total_ns,
         "Omega": OMEGA,
-        "avg_detuning_target": -0.31,
+        "pulse_area": float(df["pulse_area"].iloc[0]),
+        "avg_detuning_target": AVG_DETUNING,
         "commutator_norm_proxy": comm_norm,
+        "zero_gap_max_abs_witnesses": zero_maxima,
         "correlations": summary_df.to_dict(orient="records"),
         "note": "Only C_nc_simple is used; C_nc is proportional with constant factor T^2/1e6 * comm_norm.",
-        "witness_relation": "Γ ~ D^2 (Pearson R² ~0.83), TVD is most sensitive to f-dependence.",
+        "interpretation_boundary": (
+            "These are strong rank/linear associations on a deterministic grid, "
+            "not proof of strict monotonicity and not iid significance tests."
+        ),
     }
     with open(OUTDIR / "scan117_certificate.json", "w") as f:
         json.dump(json_sanitize(cert), f, indent=2, allow_nan=False)
     print("\nCORRELATION SUMMARY (Spearman ρ)")
-    print(summary_df[["subset","y","spearman_rho","pearson_R2"]].to_string(index=False))
+    print(
+        summary_df[
+            [
+                "subset",
+                "y",
+                "n",
+                "spearman_rho",
+                "ols_slope",
+                "ols_intercept",
+                "ols_R2",
+            ]
+        ].to_string(index=False)
+    )
+    print("Zero-gap max absolute witnesses:", zero_maxima)
     print("\nSaved outputs under", OUTDIR)
     return df, summary_df, cert
 
@@ -627,77 +748,119 @@ def run_117_scan():
 # Cross-validation with expm
 # ----------------------------------------------------------------------
 def run_cross_validation():
-    print("\n" + "="*80 + "\nC) CROSS-VALIDATION: Pulser vs expm\n" + "="*80)
-    # Test on a random point from the scan
-    n = 8
-    total_ns = duration_from_loop_ns(n)
-    d1, d2, T = split_duration_clock(total_ns, 0.5)
-    gap = 0.12
-    delta1 = -0.31 - 0.5*gap
-    delta2 = -0.31 + 0.5*gap
-    segments = [(delta1, d1), (delta2, d2)]
-    # Pulser
-    psi_p, branch = final_statevector_from_segments(n, segments)
-    # expm
-    psi_e = exact_state_from_segments(n, segments)
-    fid = state_fidelity(psi_p, psi_e)
-    print(f"Pulser vs expm fidelity: {fid:.12f} (branch={branch})")
-    # Also test corrected_statevector vs uncorrected? We'll just note.
-    # Record in certificate
+    print("\n" + "="*80 + "\nC) MULTI-POINT CROSS-VALIDATION: Pulser vs expm\n" + "="*80)
+    test_specs = [
+        (2, 0.35, 0.13),
+        (5, 0.50, 0.18),
+        (8, 0.20, 0.12),
+        (8, 0.50, 0.12),
+        (8, 0.80, 0.24),
+    ]
+    rows = []
+    for n, fraction, gap in test_specs:
+        total_ns = duration_from_loop_ns(n)
+        d1, d2, _ = split_duration_clock(total_ns, fraction)
+        f_actual = d1 / total_ns
+        delta1 = AVG_DETUNING - (1.0 - f_actual) * gap
+        delta2 = AVG_DETUNING + f_actual * gap
+        segments = [(delta1, d1), (delta2, d2)]
+        psi_p, branch = final_statevector_from_segments(n, segments)
+        psi_e = exact_state_from_segments(n, segments)
+        fidelity = state_fidelity(psi_p, psi_e)
+        infidelity = 1.0 - fidelity
+        rows.append(
+            {
+                "N": n,
+                "frac_actual": f_actual,
+                "gap": gap,
+                "segments": repr(segments),
+                "fidelity": fidelity,
+                "infidelity": infidelity,
+                "pulser_branch": branch,
+            }
+        )
+        print(
+            f"N={n} f={f_actual:.6f} gap={gap:.3f} "
+            f"fidelity={fidelity:.12f} infidelity={infidelity:.3e}"
+        )
+
+    cv_df = pd.DataFrame(rows)
+    max_infidelity = float(cv_df["infidelity"].max())
+    if max_infidelity > CROSS_VALIDATION_MAX_INFIDELITY:
+        raise AssertionError(
+            f"Pulser/expm cross-validation failed: max infidelity "
+            f"{max_infidelity:.3e} > {CROSS_VALIDATION_MAX_INFIDELITY:.3e}"
+        )
+
+    probe = np.arange(16, dtype=np.complex128) + 1j * np.arange(16)[::-1]
+    probe = normalize_state(probe)
+    roundtrip = pulser_to_standard_basis(
+        pulser_to_standard_basis(probe, 4), 4
+    )
+    basis_roundtrip_error = float(np.linalg.norm(probe - roundtrip))
+    if basis_roundtrip_error > 1.0e-14:
+        raise AssertionError("Pulser basis conversion is not involutive.")
+
+    cv_df.to_csv(OUTDIR / "cross_validation_points.csv", index=False)
     cv_cert = {
-        "test_point": {"segments": segments, "fidelity": fid, "branch": branch},
-        "message": "If fidelity < 1, check sign convention in exact Hamiltonian.",
-        "version": {"platform": platform.platform(), "numpy": np.__version__,
-                    "scipy": getattr(stats, "__version__", "unknown"),
-                    "pulser": getattr(Pulse, "__module__", "unknown")}
+        "points": cv_df.to_dict(orient="records"),
+        "max_infidelity": max_infidelity,
+        "max_allowed_infidelity": CROSS_VALIDATION_MAX_INFIDELITY,
+        "basis_roundtrip_error": basis_roundtrip_error,
+        "versions": {
+            "platform": platform.platform(),
+            "python": sys.version,
+            "numpy": np.__version__,
+            "scipy": package_version("scipy"),
+            "pulser": package_version("pulser"),
+            "pulser_simulation": package_version("pulser-simulation"),
+        },
     }
     with open(OUTDIR / "cross_validation.json", "w") as f:
         json.dump(json_sanitize(cv_cert), f, indent=2, allow_nan=False)
-    return fid
+    print(
+        f"CROSS-VALIDATION PASS: max infidelity={max_infidelity:.3e}; "
+        f"basis roundtrip={basis_roundtrip_error:.3e}"
+    )
+    return cv_df, cv_cert
 
 
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
 def main():
-    print("\n" + "="*80 + "\nFIXED-H + 117-POINT PATH-AREA EXTENSION v6\n" + "="*80)
+    print("\n" + "="*80 + "\nFIXED-H + 117-POINT PATH-AREA VALIDATION v7\n" + "="*80)
     print("OUTDIR:", OUTDIR)
     print("This script includes:\n"
           " - N=2 fixed-H certificate (clarified)\n"
           " - 117-point scan with only C_nc_simple\n"
-          " - 3-segment counterexample family\n"
-          " - expm cross-validation\n"
+          " - matched 3-segment Magnus diagnostic\n"
+          " - multi-point fail-fast expm cross-validation\n"
           " - Hard assertions on schedule matching\n"
           " - Version tracking\n"
           " - Tie-aware correlation\n")
     t0 = time.time()
 
-    # 1) Cross-validation
-    try:
-        fid = run_cross_validation()
-    except Exception as e:
-        print("Cross-validation failed:", e)
-        fid = None
+    if not SCIPY_AVAILABLE:
+        raise RuntimeError("SciPy is required; install the declared dependencies.")
 
-    # 2) N=2
-    try:
-        run_n2_fixedH()
-    except Exception as e:
-        print("N=2 failed:", e)
+    # Every stage is fail-fast. No broad exception handler is used here.
+    cv_df, cv_cert = run_cross_validation()
+    run_n2_fixedH()
+    df3 = run_3segment_magnus_diagnostic()
+    df, summary_df, cert = run_117_scan()
 
-    # 3) 3-segment counterexample
-    try:
-        df3 = generate_3segment_counterexamples()
-    except Exception as e:
-        print("3-segment failed:", e)
+    run_summary = {
+        "status": "PASS",
+        "cross_validation_max_infidelity": cv_cert["max_infidelity"],
+        "three_segment_rows": int(len(df3)),
+        "scan_points": int(len(df)),
+        "output_directory": str(OUTDIR),
+    }
+    with open(OUTDIR / "run_summary.json", "w") as f:
+        json.dump(json_sanitize(run_summary), f, indent=2, allow_nan=False)
 
-    # 4) 117-point scan
-    try:
-        df, summary_df, cert = run_117_scan()
-    except Exception as e:
-        print("117-scan failed:", e)
-
-    print("\n" + "="*80 + "\nDONE\n" + "="*80)
+    print("\n" + "="*80 + "\nALL SCIENTIFIC GATES PASS\n" + "="*80)
     print(f"Elapsed: {time.time()-t0:.2f} s")
     print(f"Outputs in {OUTDIR}")
 
