@@ -1,9 +1,62 @@
 # -*- coding: utf-8 -*-
 """
-paper117_path_order_validation.py  (v3)
+paper117_path_order_validation_v5.py  (v5)
 
 Frozen paper-only validation for Y.Y.N. Li's neutral-atom pulse-ordering
 manuscript.
+
+Changes from v4 (all of them are audit-discipline fixes; none changes the
+physics of the scan):
+
+  F1. Resolvability is no longer fail-fast.  In v4 the weakest-signal-to-floor
+      check raised an AssertionError inside run_117_scan, so the Layer-1
+      scientific test could never actually report NOT_RESOLVED and no
+      certificate was written when it failed.  That contradicted the stated
+      discipline that a negative result is a result, not a broken run.  The
+      check is now recorded and feeds Layer 1 directly.  The same applies to
+      the optional Pulser cross-validation, whose FAIL branches were
+      unreachable in v4 because the routine raised first.
+
+  F2. Layer 2 now reports the DIRECT pairwise witness between equal-A2
+      schedules, D(perm_i, perm_j) and TVD(perm_i, perm_j), as primary.  The
+      v4 statistic was a difference of distances to a common baseline, which
+      is only a sufficient condition for the states differing (its null is
+      uninformative) and which understates the effect by more than an order
+      of magnitude on this grid.  The baseline-referenced numbers are kept as
+      a secondary column.
+
+  F3. Equal-A2 groups are found by single-linkage clustering on the sorted
+      coefficient instead of by np.rint(A2/tol) bucketing, which was
+      bin-boundary sensitive: two analytically equal values could straddle a
+      bucket edge and split the group.  The expected {(2,3),(4,5)} grouping is
+      now a RECORDED regression flag rather than a hard-coded assertion, so
+      the "discovered, not hard-coded" description is accurate.
+
+  F4. make_two_segment_schedules computes both segment fractions as d/T
+      instead of using (1 - f).  This makes the signed-gap relabelling
+      S_f(1-f,+g) = S_r(f,-g) hold BITWISE, so the audit column no longer
+      reports 85% instead of 100% for a purely floating-point reassociation
+      reason.  The tolerance gate is retained.
+
+  F5. floor_improvement_factor is renamed and re-documented.  The legacy
+      sqrt(1-F) estimator clips to exactly 0.0 at the floor; the quantity in
+      the denominator is its CANCELLATION SCALE sqrt(|1-F|), i.e. a bound on
+      its error, not its reading.
+
+  F6. The perturbative term-size note is generated from the computed boolean
+      instead of asserting "exceeds unity" in hard-coded prose.
+
+  F7. propagator_cache_report tracks the true dimension of each cached
+      propagator instead of assuming 2^8.
+
+  F8. fixed_commutator_norm takes omega explicitly.
+
+  F9. Per-gap proxy RMSE is additionally reported normalised by that gap's
+      observed D range, because the raw per-gap RMSE scales with |g| and is
+      therefore not comparable across gaps.  Note also that with an intercept
+      in the fit the |g| prefactor is fully absorbed by the slope, so the
+      per-gap comparison is exactly a test of the f-shape f(1-f) versus
+      min(f,1-f).
 
 Scientific scope
 ----------------
@@ -34,9 +87,15 @@ Scientific scope
 - The one-pulse versus three-identical-pulse Pulser comparison is an
   implementation sanity check, not independent physical evidence: both
   schedules define the same sampled control waveform.
+- The final certificate separates two scientific layers:
+    L1: matched integrated controls do not determine the ordered output.
+    L2: even the single second-order coefficient A2 is insufficient for the
+        declared finite-time three-segment comparison.
+  Equal-A2 groups are discovered from the computed coefficient rather than
+  inferred from hard-coded permutation indices.
 
-Numerical discipline (v3)
--------------------------
+Numerical discipline
+--------------------
 - The pure-state trace distance is computed from the phase-aligned projective
   residual r via D = r*sqrt(1 - r^2/4), which is algebraically identical to
   sqrt(1-F) but free of the catastrophic cancellation in 1-F. Both estimators
@@ -47,6 +106,9 @@ Numerical discipline (v3)
   instead of being relied upon as a rounding accident.
 - Cross-validation is reported at the WITNESS level (D, TVD) in addition to
   the state level, because the paper's claims are about the witnesses.
+- The zero-gap floor compares two schedules whose Hamiltonians are IDENTICAL,
+  so it bounds matrix-product roundoff only. It is not a bound on the expm
+  truncation error at nonzero gap, and the certificate says so.
 - The selected second-order term size max|A2|*||[H_X,N]|| is recorded as a
   TERM-SIZE DIAGNOSTIC. It says whether the particular commutator term that
   motivates C_BCH is uniformly small on this grid. It is not a Magnus
@@ -55,7 +117,7 @@ Numerical discipline (v3)
 Colab install:
     !pip install -q -U pulser==1.8.0 pulser-simulation==1.8.0 pandas numpy scipy
 Run:
-    python paper117_path_order_validation.py
+    python paper117_path_order_validation_v5.py
 """
 
 import hashlib
@@ -66,6 +128,7 @@ import subprocess
 import time
 import sys
 import platform
+from collections import Counter
 from importlib import metadata
 from functools import lru_cache
 from pathlib import Path
@@ -82,12 +145,21 @@ except ImportError:
     SCIPY_AVAILABLE = False
     expm = None
 
-# ---------- Pulser ----------
-from pulser import Pulse, Sequence, Register
-from pulser.devices import DigitalAnalogDevice
-from pulser.waveforms import ConstantWaveform
-from pulser.sampler import sample as sample_sequence
-from pulser_simulation import QutipEmulator
+# ---------- Pulser (optional independent cross-validation layer) ----------
+try:
+    from pulser import Pulse, Sequence, Register
+    from pulser.devices import DigitalAnalogDevice
+    from pulser.waveforms import ConstantWaveform
+    from pulser.sampler import sample as sample_sequence
+    from pulser_simulation import QutipEmulator
+    PULSER_AVAILABLE = True
+    PULSER_IMPORT_ERROR = None
+except ImportError as exc:
+    Pulse = Sequence = Register = None
+    DigitalAnalogDevice = ConstantWaveform = None
+    sample_sequence = QutipEmulator = None
+    PULSER_AVAILABLE = False
+    PULSER_IMPORT_ERROR = repr(exc)
 
 # ---------- constants ----------
 CLOCK_NS = 4
@@ -96,6 +168,21 @@ MAX_DURATION_NS = 10000
 OMEGA = 1.22
 SPACING_UM = 8.0
 AVG_DETUNING = -0.31
+# Frozen Pulser DigitalAnalogDevice value used by the independent dense
+# Hamiltonian.  When Pulser is installed, equality with the live device object
+# is checked at import time.  This keeps the SciPy-primary paper audit runnable
+# without turning the optional cross-validation package into a model input.
+DIGITAL_ANALOG_INTERACTION_COEFF = 5_420_158.53
+if PULSER_AVAILABLE and not math.isclose(
+    float(DigitalAnalogDevice.interaction_coeff),
+    DIGITAL_ANALOG_INTERACTION_COEFF,
+    rel_tol=0.0,
+    abs_tol=1.0e-9,
+):
+    raise RuntimeError(
+        "Installed Pulser DigitalAnalogDevice.interaction_coeff differs from "
+        "the frozen paper value."
+    )
 
 # Frozen common duration for every N=8 paper diagnostic.
 #
@@ -103,8 +190,9 @@ AVG_DETUNING = -0.31
 #   * % 12 == 0 (= 3*CLOCK_NS) gives a clock-aligned equal three-way split.
 #   * %  8 == 0 gives a clock-aligned f = 1/2 two-way split, which is what
 #     makes the fraction grid closed under f -> 1-f.
-# 4044 satisfies only the first and silently drops the f=1/2 reflection pair;
-# 4032 and 4056 satisfy both. 4032 is used here.
+# 4044 satisfies only the first and silently drops the f=1/2 reflection pair
+# (its orphan durations are 2020 and 2024); 4032 and 4056 satisfy both.
+# 4032 is used here.
 PAPER_TOTAL_NS = 4032
 DURATION_QUANTUM_NS = 24
 
@@ -141,6 +229,9 @@ D_ESTIMATOR_MAX_REL_DISAGREEMENT = 1.0e-9
 # The differential-schedule support quantities are exact constructions, so
 # they are gated at floating-point level rather than merely recorded.
 DIFFERENTIAL_SUPPORT_TOL = 1.0e-12
+# Single-linkage merge distance for equal-A2 clustering. Analytically equal
+# coefficients differ here by O(1e-17); the nearest distinct value is O(1e-1).
+A2_CLUSTER_TOL = 1.0e-12
 
 GRID_CLOSURE_NOTE = (
     "The f-reflection decomposition requires the clock-aligned duration grid "
@@ -257,7 +348,13 @@ def pure_trace_distance(psi, phi):
 
 
 def pure_trace_distance_naive(psi, phi):
-    """Legacy sqrt(1-F) estimator, kept only to audit the stable one."""
+    """
+    Legacy sqrt(1-F) estimator, kept only to audit the stable one.
+
+    Note that the clip to [0,1] means this estimator READS exactly 0.0 at the
+    numerical floor; it does not read the cancellation scale. See
+    fidelity_roundoff_scale.
+    """
     fidelity = float(np.clip(state_fidelity(psi, phi), 0.0, 1.0))
     return float(math.sqrt(1.0 - fidelity))
 
@@ -266,9 +363,10 @@ def fidelity_roundoff_scale(psi, phi):
     """
     Cancellation scale of the naive estimator: sqrt(|1-F|) with raw F.
 
-    This is a numerical diagnostic of the LEGACY estimator, not a physical
-    distance. It is retained so that the improvement from the stable formula
-    is quantified rather than asserted.
+    This is a numerical diagnostic of the LEGACY estimator, and specifically a
+    BOUND ON ITS ERROR, not its reading and not a physical distance. It is
+    retained so that the improvement from the stable formula is quantified
+    rather than asserted.
     """
     return float(math.sqrt(abs(1.0 - state_fidelity(psi, phi))))
 
@@ -334,7 +432,7 @@ def exact_hamiltonian_for_segments(n, segments, omega=OMEGA, coords=None):
     dim = 2 ** n
     # Pulser convention: angular-frequency interaction coefficient,
     # in rad * micrometer^6 / microsecond.
-    C6 = DigitalAnalogDevice.interaction_coeff
+    C6 = DIGITAL_ANALOG_INTERACTION_COEFF
     nq = [np.zeros(dim, dtype=float) for _ in range(n)]
     for idx in range(dim):
         b = format(idx, f"0{n}b")
@@ -375,12 +473,18 @@ def exact_state_from_segments(n, segments, omega=OMEGA, coords=None):
     return normalize_state(psi)
 
 
+# F7: record the true dimension of every cached propagator, because the cache
+# holds N=2, N=5 and N=8 entries once cross-validation runs.
+_PROPAGATOR_DIMENSIONS = Counter()
+
+
 @lru_cache(maxsize=None)
 def default_geometry_propagator(n, detuning, duration_ns, omega):
     """Cached dense propagator for the declared default geometry."""
     H, dt = exact_hamiltonian_for_segments(
         n, [(detuning, duration_ns)], omega=omega, coords=None
     )[0]
+    _PROPAGATOR_DIMENSIONS[int(n)] += 1
     return expm(-1j * H * dt)
 
 
@@ -398,11 +502,22 @@ def exact_state_from_segments_cached(n, segments_tuple, omega):
 
 def propagator_cache_report():
     info = default_geometry_propagator.cache_info()
+    total_bytes = sum(
+        count * (2 ** n) ** 2 * 16
+        for n, count in _PROPAGATOR_DIMENSIONS.items()
+    )
     return {
         "hits": int(info.hits),
         "misses": int(info.misses),
         "entries": int(info.currsize),
-        "approx_megabytes": float(info.currsize * (2 ** 8) ** 2 * 16 / 1.0e6),
+        "entries_by_N": {int(k): int(v) for k, v in sorted(
+            _PROPAGATOR_DIMENSIONS.items()
+        )},
+        "megabytes": float(total_bytes / 1.0e6),
+        "note": (
+            "Memory is summed over the actual cached dimensions; the cache "
+            "holds propagators for every N used in the run, not only N=8."
+        ),
     }
 
 
@@ -691,17 +806,24 @@ def make_two_segment_schedules(
 
     signed_gap = Delta_2 - Delta_1 may be positive or negative. Both schedules
     have weighted-average detuning center_detuning exactly.
+
+    F4: both fractions are formed as d/T rather than one of them as (1 - f).
+    Algebraically identical, but it makes the signed-gap relabelling
+        S_f(1-f, +g) = S_r(f, -g)
+    hold BITWISE, because x*(-g) is exactly -(x*g) in IEEE arithmetic whereas
+    (1 - d2/T) is not bitwise equal to d1/T.
     """
     duration1_ns = int(duration1_ns)
     duration2_ns = int(total_ns - duration1_ns)
     if min(duration1_ns, duration2_ns) < MIN_DURATION_NS:
         raise ValueError("Two-segment schedule contains an undersized segment.")
-    f_actual = duration1_ns / total_ns
-    delta1 = center_detuning - (1.0 - f_actual) * signed_gap
-    delta2 = center_detuning + f_actual * signed_gap
+    fraction1 = duration1_ns / total_ns
+    fraction2 = duration2_ns / total_ns
+    delta1 = center_detuning - fraction2 * signed_gap
+    delta2 = center_detuning + fraction1 * signed_gap
     forward = [(delta1, duration1_ns), (delta2, duration2_ns)]
     reverse = [(delta2, duration2_ns), (delta1, duration1_ns)]
-    return forward, reverse, f_actual
+    return forward, reverse, fraction1
 
 
 def differential_schedule_support_us(total_ns, duration1_ns):
@@ -786,15 +908,15 @@ def measure_differential_support(forward, reverse, total_ns, signed_gap):
     }
 
 
-def fixed_commutator_norm(n):
-    """Fixed metadata value ||[H_X,N]|| for the declared N and Omega."""
+def fixed_commutator_norm(n, omega=OMEGA):
+    """Metadata value ||[H_X,N]|| for the declared N and the given Omega."""
     dim = 2 ** n
     HX = np.zeros((dim, dim), dtype=np.complex128)
     Nop = np.zeros((dim, dim), dtype=np.complex128)
     for x in range(dim):
         Nop[x, x] = bin(x).count("1")
         for q in range(n):
-            HX[x ^ (1 << q), x] += OMEGA / 2.0
+            HX[x ^ (1 << q), x] += omega / 2.0
     return float(np.linalg.norm(HX @ Nop - Nop @ HX, ord=2))
 
 
@@ -823,6 +945,24 @@ def signed_second_order_detuning_area(segments):
     return float(area)
 
 
+def cluster_equal_values(values, tol):
+    """
+    F3: single-linkage clustering on the sorted values.
+
+    Returns a list of index lists. Unlike np.rint(value/tol) bucketing this has
+    no bin edges, so two analytically equal values cannot be split by landing
+    on opposite sides of a boundary.
+    """
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    clusters = [[order[0]]]
+    for previous, current in zip(order[:-1], order[1:]):
+        if abs(values[current] - values[previous]) <= tol:
+            clusters[-1].append(current)
+        else:
+            clusters.append([current])
+    return clusters
+
+
 def run_3segment_magnus_diagnostic(
     n=8,
     omega=OMEGA,
@@ -839,6 +979,15 @@ def run_3segment_magnus_diagnostic(
     average detuning, and detuning multiset. The only changed variable is
     order. This is a diagnostic beyond the paper's two-segment claim, not a
     proof of a universal three-segment law.
+
+    F2: the primary equal-A2 witness is the DIRECT pairwise distance between
+    the two schedules in a group. The v4 statistic, the difference of their
+    distances to a common constant-detuning baseline, is retained as a
+    secondary column; it is only a sufficient condition for the states
+    differing, so its null is uninformative, and it understates the effect.
+    Both understatement ratios are measured and reported below rather than
+    asserted here (they are not equal: the D statistic is affected far more
+    than the TVD statistic).
     """
     if nominal_total_ns is None:
         nominal_total_ns = paper_total_ns(n)
@@ -874,40 +1023,62 @@ def run_3segment_magnus_diagnostic(
         segmentation_exact["projective_residual"]
     )
 
-    psi_constant_pulser, branch_single = final_statevector_from_segments(
-        n, constant_single, omega=omega
-    )
-    psi_constant_three_pulser, branch_three = final_statevector_from_segments(
-        n, constant_three, omega=omega
-    )
-    segmentation_pulser = pair_metrics(
-        psi_constant_pulser,
-        psi_constant_three_pulser,
-        "constant_one_pulse_vs_three_identical_pulser",
-    )
-    waveform_comparison = compare_sampled_waveforms(
-        n, constant_single, constant_three, omega=omega
-    )
-    pulser_segmentation_check = {
-        "structurally_non_independent": bool(
-            waveform_comparison["waveforms_identical"]
-        ),
-        "sampled_waveform_comparison": waveform_comparison,
-        "single_branch": branch_single,
-        "three_branch": branch_three,
-        "interpretation": (
-            "Implementation sanity check only, and carries no gate. The "
-            "sampled control waveforms of the one-pulse and three-pulse "
-            "constant schedules are compared directly above; when they are "
-            "identical, Pulser agreement between the two is a statement about "
-            "the sampler, not independent physical evidence."
-        ),
-    }
+    if PULSER_AVAILABLE:
+        psi_constant_pulser, branch_single = final_statevector_from_segments(
+            n, constant_single, omega=omega
+        )
+        psi_constant_three_pulser, branch_three = (
+            final_statevector_from_segments(
+                n, constant_three, omega=omega
+            )
+        )
+        segmentation_pulser = pair_metrics(
+            psi_constant_pulser,
+            psi_constant_three_pulser,
+            "constant_one_pulse_vs_three_identical_pulser",
+        )
+        waveform_comparison = compare_sampled_waveforms(
+            n, constant_single, constant_three, omega=omega
+        )
+        pulser_segmentation_check = {
+            "status": "RECORDED",
+            "structurally_non_independent": bool(
+                waveform_comparison["waveforms_identical"]
+            ),
+            "sampled_waveform_comparison": waveform_comparison,
+            "single_branch": branch_single,
+            "three_branch": branch_three,
+            "interpretation": (
+                "Implementation sanity check only, and carries no gate. The "
+                "sampled control waveforms of the one-pulse and three-pulse "
+                "constant schedules are compared directly above; when they "
+                "are identical, Pulser agreement between the two is a "
+                "statement about the sampler, not independent physical "
+                "evidence."
+            ),
+        }
+    else:
+        segmentation_pulser = None
+        pulser_segmentation_check = {
+            "status": "NOT_RUN",
+            "reason": PULSER_IMPORT_ERROR,
+            "interpretation": (
+                "The independent SciPy-expm two-layer result can run without "
+                "Pulser. Install pulser and pulser-simulation to add the "
+                "sampled-waveform cross-validation layer."
+            ),
+        }
 
     reference_total = total_ns
     reference_area = integrated_rabi_area(constant_single, omega)
     rows = []
+    permutation_states = {}
     low_detuning, middle_detuning, high_detuning = detunings
+    detuning_role = {
+        low_detuning: "lo",
+        middle_detuning: "mid",
+        high_detuning: "hi",
+    }
     for permutation_index, permutation in enumerate(
         itertools.permutations(detunings), start=1
     ):
@@ -923,12 +1094,14 @@ def run_3segment_magnus_diagnostic(
             raise AssertionError("Permutation changed integrated Rabi area.")
 
         psi = exact_state_from_segments(n, segments, omega=omega)
+        permutation_states[permutation_index] = psi
         metrics = pair_metrics(
             psi, psi_constant, f"permutation_{permutation_index}_vs_constant"
         )
         row = {
             "permutation_index": permutation_index,
             "detuning_order": "|".join(repr(float(x)) for x in permutation),
+            "order_label": "-".join(detuning_role[x] for x in permutation),
             "first_segment_role": (
                 "low"
                 if permutation[0] == low_detuning
@@ -971,21 +1144,119 @@ def run_3segment_magnus_diagnostic(
     if a2_closed_form_error > 1.0e-12:
         raise AssertionError("Equal-duration A2 closed-form identity failed.")
 
-    def witness_at(index, column="pure_trace_distance"):
-        return float(df.loc[df["permutation_index"] == index, column].iloc[0])
+    # F3: discover equal-A2 groups by single-linkage clustering.
+    a2_values = df["A2_signed"].to_numpy(dtype=float)
+    permutation_indices = df["permutation_index"].to_numpy(dtype=int)
+    order_labels = df["order_label"].tolist()
+    d_baseline = df["pure_trace_distance"].to_numpy(dtype=float)
+    tvd_baseline = df["TVD_distribution"].to_numpy(dtype=float)
 
-    equal_a2_differences = {
-        "D_perm2_minus_perm3_abs": abs(witness_at(2) - witness_at(3)),
-        "D_perm4_minus_perm5_abs": abs(witness_at(4) - witness_at(5)),
-        "TVD_perm2_minus_perm3_abs": abs(
-            witness_at(2, "TVD_distribution")
-            - witness_at(3, "TVD_distribution")
-        ),
-        "TVD_perm4_minus_perm5_abs": abs(
-            witness_at(4, "TVD_distribution")
-            - witness_at(5, "TVD_distribution")
-        ),
-    }
+    equal_a2_groups = []
+    for cluster in cluster_equal_values(list(a2_values), A2_CLUSTER_TOL):
+        if len(cluster) < 2:
+            continue
+        cluster = sorted(cluster, key=lambda i: permutation_indices[i])
+        cluster_a2 = a2_values[cluster]
+        if float(np.ptp(cluster_a2)) > A2_CLUSTER_TOL:
+            raise AssertionError("A2 clustering admitted unequal values.")
+        pairwise = []
+        for left, right in itertools.combinations(cluster, 2):
+            index_left = int(permutation_indices[left])
+            index_right = int(permutation_indices[right])
+            metrics = pair_metrics(
+                permutation_states[index_left],
+                permutation_states[index_right],
+                f"permutation_{index_left}_vs_permutation_{index_right}",
+            )
+            pairwise.append(
+                {
+                    "permutation_pair": [index_left, index_right],
+                    "orders": [
+                        order_labels[left],
+                        order_labels[right],
+                    ],
+                    "direct_D": metrics["pure_trace_distance"],
+                    "direct_TVD": metrics["TVD_distribution"],
+                    "direct_projective_residual": metrics[
+                        "projective_residual"
+                    ],
+                    "baseline_referenced_D_difference": float(
+                        abs(d_baseline[left] - d_baseline[right])
+                    ),
+                    "baseline_referenced_TVD_difference": float(
+                        abs(tvd_baseline[left] - tvd_baseline[right])
+                    ),
+                }
+            )
+        equal_a2_groups.append(
+            {
+                "permutation_indices": [
+                    int(permutation_indices[i]) for i in cluster
+                ],
+                "orders": [order_labels[i] for i in cluster],
+                "A2_signed": float(np.mean(cluster_a2)),
+                "A2_within_group_spread": float(np.ptp(cluster_a2)),
+                "pairwise_primary": pairwise,
+                "min_direct_D": float(
+                    min(p["direct_D"] for p in pairwise)
+                ),
+                "min_direct_TVD": float(
+                    min(p["direct_TVD"] for p in pairwise)
+                ),
+                "baseline_referenced_secondary": {
+                    "D_values": [float(d_baseline[i]) for i in cluster],
+                    "D_absolute_spread": float(np.ptp(d_baseline[cluster])),
+                    "TVD_values": [float(tvd_baseline[i]) for i in cluster],
+                    "TVD_absolute_spread": float(
+                        np.ptp(tvd_baseline[cluster])
+                    ),
+                    "TVD_max_to_min_ratio": (
+                        float(
+                            np.max(tvd_baseline[cluster])
+                            / np.min(tvd_baseline[cluster])
+                        )
+                        if np.min(tvd_baseline[cluster]) > 0.0
+                        else None
+                    ),
+                    "D_max_to_min_ratio": (
+                        float(
+                            np.max(d_baseline[cluster])
+                            / np.min(d_baseline[cluster])
+                        )
+                        if np.min(d_baseline[cluster]) > 0.0
+                        else None
+                    ),
+                    "status": "SECONDARY_ONLY",
+                    "why_secondary": (
+                        "A difference of distances to a common baseline is "
+                        "only a sufficient condition for the two states "
+                        "differing; equality of the two distances would not "
+                        "imply equality of the states, so its null carries no "
+                        "information."
+                    ),
+                },
+            }
+        )
+    if len(equal_a2_groups) != 2:
+        raise AssertionError(
+            f"Expected two nontrivial equal-A2 groups, found "
+            f"{len(equal_a2_groups)}."
+        )
+
+    # F3: the historical {(2,3),(4,5)} labelling is now a RECORDED regression
+    # flag, not an assertion, so the grouping really is discovered.
+    discovered_index_sets = sorted(
+        tuple(group["permutation_indices"]) for group in equal_a2_groups
+    )
+    reference_grouping_matches = discovered_index_sets == [(2, 3), (4, 5)]
+
+    pairwise_records = [
+        dict(pair, group_A2=group["A2_signed"])
+        for group in equal_a2_groups
+        for pair in group["pairwise_primary"]
+    ]
+    pairwise_df = pd.DataFrame(pairwise_records)
+
     decision_threshold_D = max(
         MIN_SIGNAL_TO_FLOOR * float(numerical_floor_D),
         MIN_SIGNAL_TO_FLOOR * segmentation_expm_state_floor,
@@ -996,13 +1267,28 @@ def run_3segment_magnus_diagnostic(
         MIN_SIGNAL_TO_FLOOR * float(segmentation_exact["TVD_distribution"]),
         1.0e-12,
     )
-    max_equal_a2_D_difference = max(
-        equal_a2_differences["D_perm2_minus_perm3_abs"],
-        equal_a2_differences["D_perm4_minus_perm5_abs"],
+    # Primary: the weakest DIRECT witness across all equal-A2 pairs.
+    min_direct_D = float(pairwise_df["direct_D"].min())
+    min_direct_TVD = float(pairwise_df["direct_TVD"].min())
+    # Secondary: the v4 baseline-referenced statistic.
+    max_baseline_D_difference = float(
+        pairwise_df["baseline_referenced_D_difference"].max()
     )
-    max_equal_a2_TVD_difference = max(
-        equal_a2_differences["TVD_perm2_minus_perm3_abs"],
-        equal_a2_differences["TVD_perm4_minus_perm5_abs"],
+    max_baseline_TVD_difference = float(
+        pairwise_df["baseline_referenced_TVD_difference"].max()
+    )
+    direct_to_baseline_TVD_ratio = (
+        float(min_direct_TVD / max_baseline_TVD_difference)
+        if max_baseline_TVD_difference > 0.0
+        else None
+    )
+    direct_to_baseline_D_ratio = (
+        float(min_direct_D / max_baseline_D_difference)
+        if max_baseline_D_difference > 0.0
+        else None
+    )
+    all_permutation_TVD_ratio = float(
+        df["TVD_distribution"].max() / df["TVD_distribution"].min()
     )
 
     first_segment_summary = (
@@ -1035,6 +1321,20 @@ def run_3segment_magnus_diagnostic(
         "matched_pulse_area": reference_area,
         "max_weighted_average_error": max_avg_error,
         "A2_closed_form_max_error": a2_closed_form_error,
+        "A2_clustering": {
+            "method": "single_linkage_on_sorted_A2",
+            "tolerance": A2_CLUSTER_TOL,
+            "discovered_index_sets": [
+                list(x) for x in discovered_index_sets
+            ],
+            "matches_historical_reference_grouping": bool(
+                reference_grouping_matches
+            ),
+            "note": (
+                "Recorded regression flag only. The grouping is computed from "
+                "A2; it is not asserted against hard-coded indices."
+            ),
+        },
         "segmentation_artifact_expm": segmentation_exact,
         "segmentation_expm_state_floor": segmentation_expm_state_floor,
         "segmentation_artifact_pulser": segmentation_pulser,
@@ -1043,16 +1343,37 @@ def run_3segment_magnus_diagnostic(
             "zero_gap_D": float(numerical_floor_D),
             "zero_gap_TVD": float(numerical_floor_TVD),
         },
-        "equal_A2_differences": equal_a2_differences,
-        "max_equal_A2_D_difference": max_equal_a2_D_difference,
-        "max_equal_A2_TVD_difference": max_equal_a2_TVD_difference,
+        "equal_A2_groups": equal_a2_groups,
+        "primary_witness": "direct_pairwise_between_equal_A2_schedules",
+        "min_equal_A2_direct_D": min_direct_D,
+        "min_equal_A2_direct_TVD": min_direct_TVD,
+        "max_equal_A2_baseline_referenced_D_difference": (
+            max_baseline_D_difference
+        ),
+        "max_equal_A2_baseline_referenced_TVD_difference": (
+            max_baseline_TVD_difference
+        ),
+        "direct_to_baseline_referenced_TVD_ratio": (
+            direct_to_baseline_TVD_ratio
+        ),
+        "direct_to_baseline_referenced_D_ratio": direct_to_baseline_D_ratio,
+        "understatement_note": (
+            "Ratio of the weakest DIRECT pairwise witness to the largest "
+            "baseline-referenced difference. Values above one quantify how "
+            "much the v4 statistic understated the effect. The two witnesses "
+            "are affected by different amounts, so both ratios are reported."
+        ),
+        "all_permutation_TVD_max_to_min_ratio": all_permutation_TVD_ratio,
         "D_decision_threshold": decision_threshold_D,
         "TVD_decision_threshold": decision_threshold_TVD,
         "TVD_resolved_above_threshold": bool(
-            max_equal_a2_TVD_difference > decision_threshold_TVD
+            min_direct_TVD > decision_threshold_TVD
         ),
         "D_resolved_above_threshold": bool(
-            max_equal_a2_D_difference > decision_threshold_D
+            min_direct_D > decision_threshold_D
+        ),
+        "baseline_referenced_TVD_resolved_above_threshold": bool(
+            max_baseline_TVD_difference > decision_threshold_TVD
         ),
         "first_segment_group_summary": first_segment_summary.to_dict(
             orient="records"
@@ -1068,6 +1389,9 @@ def run_3segment_magnus_diagnostic(
     }
 
     df.to_csv(OUTDIR / "three_segment_magnus_diagnostic.csv", index=False)
+    pairwise_df.to_csv(
+        OUTDIR / "three_segment_equal_A2_pairwise.csv", index=False
+    )
     first_segment_summary.to_csv(
         OUTDIR / "three_segment_first_segment_groups.csv", index=False
     )
@@ -1079,6 +1403,7 @@ def run_3segment_magnus_diagnostic(
         df[
             [
                 "permutation_index",
+                "order_label",
                 "A2_signed",
                 "pure_trace_distance",
                 "TVD_distribution",
@@ -1092,9 +1417,30 @@ def run_3segment_magnus_diagnostic(
     print(
         "expm segmentation state floor:",
         f"{segmentation_expm_state_floor:.3e}",
-        "| Pulser segmentation check is structurally non-independent",
+        "| Pulser segmentation check:",
+        pulser_segmentation_check["status"],
     )
-    print("Equal-A2 differences:", equal_a2_differences)
+    print("Equal-A2 groups (primary = direct pairwise):")
+    for group in equal_a2_groups:
+        for pair in group["pairwise_primary"]:
+            print(
+                f"  paths={pair['permutation_pair']} "
+                f"orders={pair['orders']} A2={group['A2_signed']:+.9f} "
+                f"direct D={pair['direct_D']:.6f} "
+                f"direct TVD={pair['direct_TVD']:.6f} "
+                f"| secondary |dTVD_baseline|="
+                f"{pair['baseline_referenced_TVD_difference']:.6f}"
+            )
+    print(
+        f"Weakest direct equal-A2 TVD={min_direct_TVD:.6f} vs largest "
+        f"baseline-referenced |dTVD|={max_baseline_TVD_difference:.6f} "
+        f"-> understated x{direct_to_baseline_TVD_ratio:.2f}"
+    )
+    print(
+        f"Weakest direct equal-A2 D  ={min_direct_D:.6f} vs largest "
+        f"baseline-referenced |dD|  ={max_baseline_D_difference:.6f} "
+        f"-> understated x{direct_to_baseline_D_ratio:.2f}"
+    )
     print(
         "Thresholds  D:",
         f"{decision_threshold_D:.3e}",
@@ -1103,7 +1449,7 @@ def run_3segment_magnus_diagnostic(
     )
     print("\nFIRST-SEGMENT GROUP SUMMARY")
     print(first_segment_summary.to_string(index=False))
-    return df, diagnostic
+    return df, pairwise_df, diagnostic
 
 
 # ----------------------------------------------------------------------
@@ -1174,34 +1520,50 @@ WITNESS_COLUMNS = [
     "TVD_distribution",
 ]
 
+PER_GAP_FIT_NOTE = (
+    "With an intercept in the fit, the |g| prefactor common to every proxy is "
+    "absorbed entirely by the slope. The per-gap comparison is therefore "
+    "exactly a test of the f-shape, f(1-f) versus min(f,1-f). Raw per-gap "
+    "RMSE grows with |g| and is not comparable across gaps; use the "
+    "range-normalised column for that."
+)
+
 
 def run_117_scan():
     print("\n" + "=" * 80 + "\nB) 117-POINT SIGNED-RESPONSE SCAN\n" + "=" * 80)
     n = 8
     total_ns = paper_total_ns(n)
     grid_report = assert_reflection_closed_grid(total_ns)
-    comm_norm = fixed_commutator_norm(n)
+    comm_norm = fixed_commutator_norm(n, OMEGA)
     total_us = total_ns / 1000.0
     max_a2 = float(np.max(GAP_GRID)) * total_us ** 2 * 0.25
     second_order_scale = float(max_a2 * comm_norm)
+    scale_below_one = bool(second_order_scale < 1.0)
     perturbative_validity = {
         "max_abs_A2_rad_us": max_a2,
         "commutator_norm_rad_per_us": comm_norm,
         "max_selected_second_order_scale": second_order_scale,
-        "selected_second_order_scale_below_one": bool(
-            second_order_scale < 1.0
-        ),
+        "selected_second_order_scale_below_one": scale_below_one,
         "diagnostic_role": (
             "Term-size diagnostic only; not a Magnus-convergence or "
             "truncation-validity criterion."
         ),
+        # F6: generated from the computed boolean, not hard-coded prose.
         "note": (
             "C_BCH is motivated by the selected second-order commutator term. "
-            "The maximum dimensionless scale "
-            "|A2|*||[H_X,N]|| exceeds unity, showing that this selected "
-            "second-order contribution is not uniformly small over the full "
-            "grid. This does not determine convergence of the Magnus series "
-            "and does not falsify a possible small-partition asymptotic role."
+            f"The maximum dimensionless scale |A2|*||[H_X,N]|| = "
+            f"{second_order_scale:.4f} "
+            + (
+                "stays below unity on this grid, so this selected "
+                "second-order contribution is uniformly small here. That is "
+                "still not a statement about convergence of the Magnus "
+                "series."
+                if scale_below_one
+                else "exceeds unity, showing that this selected second-order "
+                "contribution is not uniformly small over the full grid. This "
+                "does not determine convergence of the Magnus series and does "
+                "not falsify a possible small-partition asymptotic role."
+            )
         ),
     }
     print(
@@ -1305,9 +1667,11 @@ def run_117_scan():
             np.max(np.abs(1.0 - zero["fidelity"].to_numpy(dtype=float)))
         ),
         "max_D_stable": float(np.max(zero["pure_trace_distance"])),
-        "max_D_naive_legacy": float(np.max(zero["pure_trace_distance_naive"])),
+        "max_D_naive_legacy_reading": float(
+            np.max(zero["pure_trace_distance_naive"])
+        ),
         "max_projective_residual": float(np.max(zero["projective_residual"])),
-        "max_fidelity_roundoff_scale_legacy": float(
+        "legacy_cancellation_scale": float(
             np.max(zero["fidelity_roundoff_scale"])
         ),
         "max_TVD": float(np.max(zero["TVD_distribution"])),
@@ -1316,9 +1680,18 @@ def run_117_scan():
         ),
         "note": (
             "max_D_stable is the floor of the estimator actually used for the "
-            "reported witness. The legacy sqrt(1-F) values are retained only "
-            "to quantify how much the old estimator was inflated by "
-            "cancellation."
+            "reported witness. max_D_naive_legacy_reading is what the legacy "
+            "sqrt(1-F) estimator READS at the floor; because 1-F is clipped "
+            "at zero this is typically exactly 0.0 and is NOT a measure of "
+            "its accuracy. legacy_cancellation_scale = sqrt(|1-F|) is the "
+            "BOUND ON THE ERROR of that legacy estimator."
+        ),
+        "scope_note": (
+            "Both zero-gap schedules have IDENTICAL Hamiltonians and differ "
+            "only in the order of two commuting propagators, so this floor "
+            "bounds matrix-product roundoff. It is not a bound on the expm "
+            "truncation error at nonzero gap, and it is not a systematic "
+            "error budget for the reported witnesses."
         ),
     }
     if numerical_floor["max_abs_infidelity"] > ZERO_GAP_INFIDELITY_TOL:
@@ -1374,15 +1747,20 @@ def run_117_scan():
         1.0e-16,
     )
     signal_to_floor = min_signal_D / effective_D_floor
-    legacy_effective_D_floor = max(
-        numerical_floor["max_D_naive_legacy"],
-        numerical_floor["max_fidelity_roundoff_scale_legacy"],
+    legacy_cancellation_floor = max(
+        numerical_floor["legacy_cancellation_scale"],
         1.0e-16,
     )
-    if signal_to_floor < MIN_SIGNAL_TO_FLOOR:
-        raise AssertionError(
-            f"Weakest signal is too close to numerical floor: "
-            f"ratio={signal_to_floor:.3e}, floor={numerical_floor}"
+    # F1: recorded, not raised. Layer 1 consumes this directly, so a genuinely
+    # unresolved scan produces a NOT_RESOLVED certificate instead of a crash.
+    weakest_signal_above_floor = bool(signal_to_floor >= MIN_SIGNAL_TO_FLOOR)
+    if not weakest_signal_above_floor:
+        print(
+            "\nRESOLVABILITY WARNING: weakest nonzero D is only "
+            f"{signal_to_floor:.3e} times the numerical floor "
+            f"(required {MIN_SIGNAL_TO_FLOOR}). Layer 1 will be reported as "
+            "NOT_RESOLVED; this is a recorded scientific outcome, not a "
+            "failed run."
         )
 
     df.to_csv(OUTDIR / "scan117_statevector_metrics.csv", index=False)
@@ -1504,10 +1882,10 @@ def run_117_scan():
                 "gap_positive": float(row.gap),
                 "f_original": float(row.frac_actual),
                 "f_reflected": float(1.0 - row.frac_actual),
-                "forward_reflected_equals_reverse_negative_exactly": (
+                "forward_reflected_bitwise_identical_to_reverse_negative": (
                     f_pos_reflected == r_negative
                 ),
-                "reverse_reflected_equals_forward_negative_exactly": (
+                "reverse_reflected_bitwise_identical_to_forward_negative": (
                     r_pos_reflected == f_negative
                 ),
                 "schedule_parameter_error": schedule_error,
@@ -1515,10 +1893,14 @@ def run_117_scan():
         )
     symmetry_df = pd.DataFrame(symmetry_rows)
     symmetry_df.to_csv(OUTDIR / "signed_gap_symmetry_audit.csv", index=False)
-    exact_schedule_identity_fraction = float(
+    bitwise_schedule_identity_fraction = float(
         (
-            symmetry_df["forward_reflected_equals_reverse_negative_exactly"]
-            & symmetry_df["reverse_reflected_equals_forward_negative_exactly"]
+            symmetry_df[
+                "forward_reflected_bitwise_identical_to_reverse_negative"
+            ]
+            & symmetry_df[
+                "reverse_reflected_bitwise_identical_to_forward_negative"
+            ]
         ).mean()
     )
     if max_schedule_parameter_error > SCHEDULE_MATCH_TOL:
@@ -1539,12 +1921,21 @@ def run_117_scan():
     # primary and the pooled fit is reported only as a sensitivity.
     per_gap_rows = []
     for gap_value, group in nonzero.groupby("gap", sort=True):
-        entry = {"gap": float(gap_value), "n": int(len(group))}
+        d_range = float(np.ptp(group["pure_trace_distance"].to_numpy(float)))
+        entry = {
+            "gap": float(gap_value),
+            "n": int(len(group)),
+            "D_range_at_this_gap": d_range,
+        }
         for proxy in ALL_SHAPE_COLUMNS:
             fit = fit_summary_for_witness(
                 group, proxy, "pure_trace_distance", f"gap={gap_value:.4f}"
             )
             entry[f"rmse_{proxy}"] = fit["rmse"]
+            # F9: comparable across gaps, unlike the raw RMSE.
+            entry[f"nrmse_{proxy}"] = (
+                float(fit["rmse"] / d_range) if d_range > 0 else float("nan")
+            )
             entry[f"R2_{proxy}"] = fit["ols_R2"]
         entry["winner"] = min(
             SPECIFIED_PROXY_COLUMNS, key=lambda p: entry[f"rmse_{p}"]
@@ -1617,6 +2008,7 @@ def run_117_scan():
             REFERENCE_SHAPE_COLUMNS
         ),
         "primary_test": "per_gap_fixed_g_f_shape",
+        "per_gap_fit_note": PER_GAP_FIT_NOTE,
         "per_gap": {
             "rows": per_gap_df.to_dict(orient="records"),
             "winners": per_gap_winners,
@@ -1733,13 +2125,21 @@ def run_117_scan():
         },
         "zero_gap_numerical_floor": numerical_floor,
         "effective_D_floor": effective_D_floor,
-        "legacy_effective_D_floor": legacy_effective_D_floor,
-        "floor_improvement_factor": float(
-            legacy_effective_D_floor / effective_D_floor
+        "legacy_cancellation_floor": legacy_cancellation_floor,
+        "stable_vs_legacy_cancellation_scale_ratio": float(
+            legacy_cancellation_floor / effective_D_floor
+        ),
+        "stable_vs_legacy_ratio_note": (
+            "Ratio of the stable estimator's measured floor to the legacy "
+            "estimator's CANCELLATION SCALE sqrt(|1-F|). The legacy estimator "
+            "itself reads 0.0 at the floor because 1-F is clipped, so this is "
+            "an error-bound comparison, not a comparison of two readings."
         ),
         "D_estimator_max_relative_disagreement": estimator_rel_disagreement,
         "weakest_nonzero_D": min_signal_D,
         "weakest_D_to_floor_ratio": signal_to_floor,
+        "weakest_signal_above_floor": weakest_signal_above_floor,
+        "min_signal_to_floor_requirement": MIN_SIGNAL_TO_FLOOR,
         "rough_shot_scale": {
             "minimum_best_case": float(
                 nonzero["rough_shot_scale_1_over_TVD2"].min()
@@ -1762,7 +2162,14 @@ def run_117_scan():
             "implied_witness_identity": "D(1-f,+g)=D(f,-g)",
             "max_schedule_parameter_error": max_schedule_parameter_error,
             "schedule_match_tolerance": SCHEDULE_MATCH_TOL,
-            "exact_tuple_identity_fraction": exact_schedule_identity_fraction,
+            "bitwise_identity_fraction": bitwise_schedule_identity_fraction,
+            "bitwise_note": (
+                "Both segment fractions are formed as d/T, so the relabelling "
+                "is exact in IEEE arithmetic and this fraction is expected to "
+                "be 1.0. Any value below 1.0 indicates a floating-point "
+                "reassociation, not a physics failure; the tolerance gate on "
+                "max_schedule_parameter_error is the binding check."
+            ),
             "evidence_class": (
                 "Algebraic schedule identity and software regression check. "
                 "The implied D/TVD equality cannot fail independently of the "
@@ -1790,10 +2197,12 @@ def run_117_scan():
         json.dump(json_sanitize(cert), handle, indent=2, allow_nan=False)
 
     print("\nPROXY COMPARISON, PRIMARY: per-gap fixed-g f-shape RMSE")
+    print(PER_GAP_FIT_NOTE)
     print(
         per_gap_df[
             ["gap"]
             + [f"rmse_{p}" for p in ALL_SHAPE_COLUMNS]
+            + [f"nrmse_{p}" for p in SPECIFIED_PROXY_COLUMNS]
             + ["winner", "reference_to_specified_winner_rmse_ratio"]
         ].to_string(index=False)
     )
@@ -1832,14 +2241,24 @@ def run_117_scan():
     )
     print("\nZero-gap floor (stable):", f"{effective_D_floor:.3e}")
     print(
-        "Zero-gap floor (legacy sqrt(1-F)):",
-        f"{legacy_effective_D_floor:.3e}",
-        f"-> improvement x{cert['floor_improvement_factor']:.3g}",
+        "Legacy sqrt(1-F) cancellation scale:",
+        f"{legacy_cancellation_floor:.3e}",
+        f"-> ratio x{cert['stable_vs_legacy_cancellation_scale_ratio']:.3g} "
+        "(error bound vs measured floor, not two readings)",
     )
-    print("Weakest D / effective floor:", f"{signal_to_floor:.3e}")
+    print(
+        "Weakest D / effective floor:",
+        f"{signal_to_floor:.3e}",
+        f"(requirement {MIN_SIGNAL_TO_FLOOR}, above floor="
+        f"{weakest_signal_above_floor})",
+    )
     print(
         "D estimator max relative disagreement:",
         f"{estimator_rel_disagreement:.3e}",
+    )
+    print(
+        "Signed-gap bitwise identity fraction:",
+        f"{bitwise_schedule_identity_fraction:.3f}",
     )
     print(
         "f-reflection rows:",
@@ -1855,6 +2274,11 @@ def run_117_scan():
 # Cross-validation with Pulser: state level AND witness level
 # ----------------------------------------------------------------------
 def run_cross_validation():
+    """
+    F1: this routine no longer raises on disagreement. It records PASS/FAIL so
+    that the optional-check FAIL branch in main() is reachable and so that a
+    backend disagreement does not destroy the SciPy-primary certificate.
+    """
     print(
         "\n" + "=" * 80
         + "\nC) CROSS-VALIDATION: Pulser vs expm (state and witness level)\n"
@@ -1967,6 +2391,7 @@ def run_cross_validation():
     all_witness_points_pass = bool(
         witness_df["D_pass"].all() and witness_df["TVD_pass"].all()
     )
+    state_level_pass = bool(max_infidelity <= CROSS_VALIDATION_MAX_INFIDELITY)
     # The witness magnitude above which the two backends agree to 1 percent,
     # implied directly by the measured absolute agreement. This is the number
     # the manuscript should quote when claiming backend independence.
@@ -1996,25 +2421,32 @@ def run_cross_validation():
         else float("nan")
     )
 
-    if max_infidelity > CROSS_VALIDATION_MAX_INFIDELITY:
-        raise AssertionError(
-            f"State-level cross-validation failed: max infidelity "
-            f"{max_infidelity:.3e} > {CROSS_VALIDATION_MAX_INFIDELITY:.3e}"
+    if not state_level_pass:
+        print(
+            f"CROSS-VALIDATION WARNING: state max infidelity "
+            f"{max_infidelity:.3e} exceeds "
+            f"{CROSS_VALIDATION_MAX_INFIDELITY:.3e}. Recorded as FAIL; the "
+            "SciPy-primary result is still written."
         )
     if not all_witness_points_pass:
         failures = witness_df[~(witness_df["D_pass"] & witness_df["TVD_pass"])]
-        raise AssertionError(
-            "Witness-level cross-validation failed on:\n"
+        print(
+            "CROSS-VALIDATION WARNING: witness-level disagreement on:\n"
             + failures.to_string(index=False)
         )
 
     state_df.to_csv(OUTDIR / "cross_validation_states.csv", index=False)
     witness_df.to_csv(OUTDIR / "cross_validation_witnesses.csv", index=False)
     cv_cert = {
+        "status": (
+            "PASS" if (state_level_pass and all_witness_points_pass) else "FAIL"
+        ),
+        "fail_fast": False,
         "state_level": {
             "points": state_df.to_dict(orient="records"),
             "max_infidelity": max_infidelity,
             "max_allowed_infidelity": CROSS_VALIDATION_MAX_INFIDELITY,
+            "pass": state_level_pass,
         },
         "witness_level": {
             "points": witness_df.to_dict(orient="records"),
@@ -2054,6 +2486,11 @@ def run_cross_validation():
                 "noise-scale quantities and carries no information. The "
                 "listed values are measured, not assumed."
             ),
+            "sample_size_note": (
+                "Six schedule specifications. The quoted absolute agreement "
+                "is a measured maximum over those six, not a bound proved "
+                "over the whole grid."
+            ),
             "why_this_matters": (
                 "The manuscript's claims are stated in terms of D and TVD, "
                 "not in terms of state fidelity. State-level infidelity of "
@@ -2080,8 +2517,8 @@ def run_cross_validation():
     with open(OUTDIR / "cross_validation.json", "w") as handle:
         json.dump(json_sanitize(cv_cert), handle, indent=2, allow_nan=False)
     print(
-        f"CROSS-VALIDATION PASS: state max infidelity={max_infidelity:.3e}, "
-        f"witness max abs error={max_witness_abs:.3e}, "
+        f"CROSS-VALIDATION {cv_cert['status']}: state max infidelity="
+        f"{max_infidelity:.3e}, witness max abs error={max_witness_abs:.3e}, "
         f"1%-agreement witness scale={witness_scale_for_one_percent:.3e}"
     )
     print(
@@ -2173,7 +2610,7 @@ def write_provenance():
 def main():
     print(
         "\n" + "=" * 88
-        + "\nPAPER117 NEUTRAL-ATOM PULSE-ORDER VALIDATION (v3)\n"
+        + "\nPAPER117 NEUTRAL-ATOM PULSE-ORDER VALIDATION (v5)\n"
         + "=" * 88
     )
     print("output:", OUTDIR)
@@ -2191,7 +2628,25 @@ def main():
         )
 
     provenance = write_provenance()
-    _, _, cv_cert = run_cross_validation()
+    if PULSER_AVAILABLE:
+        _, _, cv_cert = run_cross_validation()
+    else:
+        print(
+            "\nC) CROSS-VALIDATION: NOT RUN — Pulser unavailable\n"
+            f"   import error: {PULSER_IMPORT_ERROR}"
+        )
+        cv_cert = {
+            "status": "NOT_RUN",
+            "reason": PULSER_IMPORT_ERROR,
+            "state_level": {"max_infidelity": None, "pass": None},
+            "witness_level": {
+                "all_points_pass": None,
+                "max_absolute_error": None,
+                "max_relative_error_all_rows": None,
+                "max_nondegenerate_relative_error": None,
+                "witness_magnitude_for_one_percent_agreement": None,
+            },
+        }
     (
         scan_df,
         _,
@@ -2200,20 +2655,20 @@ def main():
         symmetry_df,
         scan_cert,
     ) = run_117_scan()
-    permutation_df, three_segment = run_3segment_magnus_diagnostic(
+    permutation_df, pairwise_df, three_segment = run_3segment_magnus_diagnostic(
         nominal_total_ns=scan_cert["total_duration_ns"],
         numerical_floor_D=scan_cert["effective_D_floor"],
         numerical_floor_TVD=scan_cert["zero_gap_numerical_floor"]["max_TVD"],
     )
 
     segmentation_expm = three_segment["segmentation_artifact_expm"]
-    equal_a2 = three_segment["equal_A2_differences"]
+    nonzero_scan = scan_df.loc[scan_df["gap"] > 0.0].copy()
     expected_points = len(GAP_GRID) * len(FRACTION_GRID)
     expected_nonzero = int((GAP_GRID > 0).sum()) * len(FRACTION_GRID)
     elapsed = time.perf_counter() - started
 
     # Numerical validity only. These may fail-fast; they encode no physics
-    # conclusion.
+    # conclusion. NOTE (F1): resolvability is deliberately NOT in this dict.
     validation_gates = {
         "scan_point_count": len(scan_df) == expected_points,
         "scan_nonzero_gap_count": (
@@ -2247,54 +2702,127 @@ def main():
             scan_cert["D_estimator_max_relative_disagreement"]
             <= D_ESTIMATOR_MAX_REL_DISAGREEMENT
         ),
-        "weakest_signal_above_floor": (
-            scan_cert["weakest_D_to_floor_ratio"] >= MIN_SIGNAL_TO_FLOOR
-        ),
-        "pulser_state_cross_validation": (
-            cv_cert["state_level"]["max_infidelity"]
-            <= CROSS_VALIDATION_MAX_INFIDELITY
-        ),
-        "pulser_witness_cross_validation": bool(
-            cv_cert["witness_level"]["all_points_pass"]
-        ),
         "six_permutations_present": len(permutation_df) == 6,
         "expm_segmentation_floor_below_signal": bool(
             three_segment["segmentation_expm_state_floor"]
             < float(min(permutation_df["pure_trace_distance"])) / 1.0e5
             and segmentation_expm["TVD_distribution"]
-            < min(
-                equal_a2["TVD_perm2_minus_perm3_abs"],
-                equal_a2["TVD_perm4_minus_perm5_abs"],
-            )
-            / 1.0e5
+            < three_segment["min_equal_A2_direct_TVD"] / 1.0e5
+        ),
+    }
+    optional_validation_checks = {
+        "pulser_state_cross_validation": {
+            "status": (
+                "NOT_RUN"
+                if not PULSER_AVAILABLE
+                else "PASS"
+                if bool(cv_cert["state_level"]["pass"])
+                else "FAIL"
+            ),
+            "value": cv_cert["state_level"]["max_infidelity"],
+        },
+        "pulser_witness_cross_validation": {
+            "status": (
+                "NOT_RUN"
+                if not PULSER_AVAILABLE
+                else "PASS"
+                if bool(cv_cert["witness_level"]["all_points_pass"])
+                else "FAIL"
+            ),
+            "value": cv_cert["witness_level"]["all_points_pass"],
+        },
+        "note": (
+            "Optional checks never abort the run and never enter the VALID / "
+            "INVALID status; a FAIL here means the Pulser backend disagreed "
+            "and must be reported, not that the SciPy-primary scan is void."
         ),
     }
 
     # Physics findings. Recorded, never fail-fast: a negative result is a
     # result, not a broken run.
     scientific_tests = {
-        "equal_A2_TVD_insufficiency": {
+        "layer_1_matched_integrated_summaries_insufficient": {
+            "status": (
+                "SUPPORTED"
+                if (
+                    len(nonzero_scan) == expected_nonzero
+                    and bool(scan_cert["weakest_signal_above_floor"])
+                )
+                else "NOT_RESOLVED"
+            ),
+            "matched_quantities": [
+                "total_duration",
+                "integrated_Rabi_area",
+                "weighted_average_detuning",
+                "detuning_multiset_within_each_forward_reverse_pair",
+            ],
+            "nonzero_gap_pairs": int(len(nonzero_scan)),
+            "minimum_pure_state_trace_distance": float(
+                nonzero_scan["pure_trace_distance"].min()
+            ),
+            "maximum_pure_state_trace_distance": float(
+                nonzero_scan["pure_trace_distance"].max()
+            ),
+            "maximum_computational_basis_TVD": float(
+                nonzero_scan["TVD_distribution"].max()
+            ),
+            "weakest_D_to_floor_ratio": scan_cert["weakest_D_to_floor_ratio"],
+            "required_signal_to_floor": MIN_SIGNAL_TO_FLOOR,
+            "interpretation": (
+                "This is an operational finite-grid witness of the standard "
+                "noncommuting time-order effect; it is not presented as a "
+                "discovery of BCH/Magnus ordering."
+            ),
+            "fail_fast": False,
+        },
+        "equal_A2_direct_TVD_insufficiency": {
             "status": (
                 "SUPPORTED"
                 if three_segment["TVD_resolved_above_threshold"]
                 else "NOT_RESOLVED"
             ),
-            "max_observed_difference": three_segment[
-                "max_equal_A2_TVD_difference"
-            ],
+            "witness": "direct pairwise TVD between equal-A2 schedules",
+            "weakest_observed": three_segment["min_equal_A2_direct_TVD"],
             "decision_threshold": three_segment["TVD_decision_threshold"],
             "fail_fast": False,
         },
-        "equal_A2_D_insufficiency": {
+        "equal_A2_direct_D_insufficiency": {
             "status": (
                 "SUPPORTED"
                 if three_segment["D_resolved_above_threshold"]
                 else "NOT_RESOLVED"
             ),
-            "max_observed_difference": three_segment[
-                "max_equal_A2_D_difference"
-            ],
+            "witness": "direct pairwise D between equal-A2 schedules",
+            "weakest_observed": three_segment["min_equal_A2_direct_D"],
             "decision_threshold": three_segment["D_decision_threshold"],
+            "fail_fast": False,
+        },
+        "equal_A2_baseline_referenced_secondary": {
+            "status": (
+                "SUPPORTED"
+                if three_segment[
+                    "baseline_referenced_TVD_resolved_above_threshold"
+                ]
+                else "NOT_RESOLVED"
+            ),
+            "witness": (
+                "difference of distances to the constant-detuning baseline "
+                "(v4 statistic, retained for continuity)"
+            ),
+            "max_observed_difference": three_segment[
+                "max_equal_A2_baseline_referenced_TVD_difference"
+            ],
+            "direct_to_baseline_TVD_ratio": three_segment[
+                "direct_to_baseline_referenced_TVD_ratio"
+            ],
+            "direct_to_baseline_D_ratio": three_segment[
+                "direct_to_baseline_referenced_D_ratio"
+            ],
+            "why_secondary": (
+                "Only a sufficient condition for the two ordered states "
+                "differing; its null is uninformative, and it understates the "
+                "effect by the ratio reported above."
+            ),
             "fail_fast": False,
         },
         "proxy_selection_within_specified_set": {
@@ -2317,6 +2845,9 @@ def main():
             "ranking_stability_warning": scan_cert["proxy_comparison"][
                 "ranking_stability_warning"
             ],
+            "per_gap_fit_note": scan_cert["proxy_comparison"][
+                "per_gap_fit_note"
+            ],
             "residual_structure_diagnostic": scan_cert["proxy_comparison"][
                 "residual_structure_diagnostic"
             ],
@@ -2327,6 +2858,73 @@ def main():
             "status": "RECORDED",
             "detail": scan_cert["perturbative_validity"],
             "fail_fast": False,
+        },
+    }
+
+    layer_1_status = scientific_tests[
+        "layer_1_matched_integrated_summaries_insufficient"
+    ]["status"]
+    layer_2_status = scientific_tests["equal_A2_direct_TVD_insufficiency"][
+        "status"
+    ]
+    two_layer_certificate = {
+        "status": (
+            "SUPPORTED"
+            if layer_1_status == "SUPPORTED" and layer_2_status == "SUPPORTED"
+            else "NOT_FULLY_RESOLVED"
+        ),
+        "scientific_status": (
+            "ORDER_EFFECT_AND_EQUAL_A2_INSUFFICIENCY_SUPPORTED"
+            if layer_1_status == "SUPPORTED" and layer_2_status == "SUPPORTED"
+            else "TWO_LAYER_CLAIM_NOT_FULLY_RESOLVED"
+        ),
+        "layer_1": scientific_tests[
+            "layer_1_matched_integrated_summaries_insufficient"
+        ],
+        "layer_2": {
+            "status": layer_2_status,
+            "claim": (
+                "For the declared finite-time three-segment comparison, the "
+                "single second-order coefficient A2 is not a sufficient "
+                "output statistic."
+            ),
+            "primary_witness": (
+                "direct pairwise D and TVD between schedules with equal A2"
+            ),
+            "matched_quantities": [
+                "total_duration",
+                "integrated_Rabi_area",
+                "weighted_average_detuning",
+                "detuning_multiset",
+                "A2_within_each_reported_equal_A2_group",
+            ],
+            "equal_A2_groups": three_segment["equal_A2_groups"],
+            "A2_clustering": three_segment["A2_clustering"],
+            "weakest_equal_A2_direct_TVD": three_segment[
+                "min_equal_A2_direct_TVD"
+            ],
+            "weakest_equal_A2_direct_D": three_segment[
+                "min_equal_A2_direct_D"
+            ],
+            "secondary_baseline_referenced_TVD_difference": three_segment[
+                "max_equal_A2_baseline_referenced_TVD_difference"
+            ],
+            "direct_to_baseline_referenced_TVD_ratio": three_segment[
+                "direct_to_baseline_referenced_TVD_ratio"
+            ],
+            "direct_to_baseline_referenced_D_ratio": three_segment[
+                "direct_to_baseline_referenced_D_ratio"
+            ],
+            "all_six_permutation_TVD_ratio": three_segment[
+                "all_permutation_TVD_max_to_min_ratio"
+            ],
+            "decision_threshold": three_segment["TVD_decision_threshold"],
+            "segmentation_TVD_floor": segmentation_expm["TVD_distribution"],
+            "boundary": (
+                "This does not show that the Magnus expansion fails, and it "
+                "does not establish A2 insufficiency for every exact-reversal "
+                "or asymptotically small-partition problem."
+            ),
         },
     }
 
@@ -2341,25 +2939,43 @@ def main():
     status = "VALID" if all(validation_gates.values()) else "INVALID"
     summary = {
         "status": status,
+        "status_meaning": (
+            "VALID / INVALID refers to NUMERICAL VALIDITY only. The physics "
+            "verdict lives in two_layer_certificate and can be "
+            "NOT_FULLY_RESOLVED while the run is VALID."
+        ),
         "paper_scope": (
             "Fixed-T multi-proxy comparison over a declared proxy set and a "
             "six-permutation equal-A2 diagnostic. No N=2 shared-generator or "
             "variable-partition claim is included."
         ),
         "primary_backend": "scipy_expm",
+        "execution_mode": (
+            "SCIPY_PRIMARY_PLUS_PULSER_CROSSCHECK"
+            if PULSER_AVAILABLE
+            else "SCIPY_PRIMARY_ONLY"
+        ),
+        "cross_validation_status": cv_cert.get("status", "RECORDED"),
         "total_duration_ns": scan_cert["total_duration_ns"],
         "scan_points": int(len(scan_df)),
         "nonzero_gap_points": int((scan_df["gap"] > 0).sum()),
         "even_odd_rows": int(len(even_odd_df)),
         "signed_gap_identity_rows": int(len(symmetry_df)),
+        "signed_gap_bitwise_identity_fraction": scan_cert[
+            "signed_gap_schedule_identity"
+        ]["bitwise_identity_fraction"],
         "permutation_rows": int(len(permutation_df)),
+        "equal_A2_pairwise_rows": int(len(pairwise_df)),
         "proxy_comparison": scan_cert["proxy_comparison"],
         "perturbative_validity": scan_cert["perturbative_validity"],
         "zero_gap_numerical_floor": scan_cert["zero_gap_numerical_floor"],
         "effective_D_floor": scan_cert["effective_D_floor"],
-        "legacy_effective_D_floor": scan_cert["legacy_effective_D_floor"],
-        "floor_improvement_factor": scan_cert["floor_improvement_factor"],
+        "legacy_cancellation_floor": scan_cert["legacy_cancellation_floor"],
+        "stable_vs_legacy_cancellation_scale_ratio": scan_cert[
+            "stable_vs_legacy_cancellation_scale_ratio"
+        ],
         "weakest_D_to_floor_ratio": scan_cert["weakest_D_to_floor_ratio"],
+        "weakest_signal_above_floor": scan_cert["weakest_signal_above_floor"],
         "cross_validation_state_max_infidelity": cv_cert["state_level"][
             "max_infidelity"
         ],
@@ -2375,9 +2991,22 @@ def main():
         "witness_magnitude_for_one_percent_backend_agreement": cv_cert[
             "witness_level"
         ]["witness_magnitude_for_one_percent_agreement"],
-        "equal_A2_differences": equal_a2,
+        "equal_A2_primary_witness": {
+            "min_direct_D": three_segment["min_equal_A2_direct_D"],
+            "min_direct_TVD": three_segment["min_equal_A2_direct_TVD"],
+        },
+        "equal_A2_secondary_baseline_referenced": {
+            "max_D_difference": three_segment[
+                "max_equal_A2_baseline_referenced_D_difference"
+            ],
+            "max_TVD_difference": three_segment[
+                "max_equal_A2_baseline_referenced_TVD_difference"
+            ],
+        },
         "validation_gates": validation_gates,
+        "optional_validation_checks": optional_validation_checks,
         "scientific_tests": scientific_tests,
+        "two_layer_certificate": two_layer_certificate,
         "implementation_checks": implementation_checks,
         "source_sha256": provenance["source_sha256"],
         "assertions_enabled": __debug__,
@@ -2392,7 +3021,22 @@ def main():
     }
     with open(OUTDIR / "run_summary.json", "w", encoding="utf-8") as handle:
         json.dump(json_sanitize(summary), handle, indent=2, allow_nan=False)
+    with open(
+        OUTDIR / "two_layer_scientific_certificate.json",
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(
+            json_sanitize(two_layer_certificate),
+            handle,
+            indent=2,
+            allow_nan=False,
+        )
 
+    print("\n" + "=" * 88)
+    print("TWO-LAYER SCIENTIFIC VERDICT")
+    print("=" * 88)
+    print(json.dumps(json_sanitize(two_layer_certificate), indent=2))
     print("\n" + "=" * 88)
     print("GLOBAL VERDICT")
     print("=" * 88)
