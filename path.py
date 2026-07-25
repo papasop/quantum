@@ -1,1158 +1,1536 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-M2 FOUR-STEP PATH-RESOLVED NOISE CLOSURE
+EP-OBS-v1.0  --  Observable-level executed-path diagnostic on a PASQAL/Pulser local emulator.
 
-One minimal, falsifiable proposition:
+PURPOSE
+-------
+The manuscript "Ideal Executed Paths Predict Weak-Noise Differences between
+Full-Unitary-Equivalent Rydberg Controls" establishes a *model-level* result:
+two controls z and z0 with the same complete ideal unitary have different
+interaction-picture dissipative response operators K_z, and the Frobenius channel
+distance D_E(gamma) = ||E_z - E_z0||_F / 16 is predicted parameter-free by
+gamma * ||K_z - K_0||_F / 16.
 
-    Full-unitary-equivalent controls can have different weak-noise channels,
-    and their leading channel difference is predicted without target fitting
-    from the ideal executed paths.
+D_E is not measurable. This script closes the remaining step listed in the
+manuscript's Discussion by moving to an *observable-level* quantity that a
+neutral-atom machine can actually produce:
 
-The four closed steps are
+    DeltaP(gamma) = Tr[ M ( E_z(T;gamma) - E_z0(T;gamma) )(rho) ]
+                  = gamma * chi_{M,rho}[DeltaK] + O(gamma^2),
 
-    1. SAME ENDPOINT:
-       construct two transported six-segment controls and verify that each
-       implements the same complete ideal two-qubit unitary as the reference,
-       up to global phase;
-    2. DIFFERENT PATH RESPONSE:
-       compute the interaction-picture dissipative response
-           K_z = integral U_z(t)^(-1) D U_z(t) dt
-       by exact segmentwise Frechet derivatives;
-    3. DIFFERENT NOISY CHANNEL:
-       solve the complete piecewise-constant Lindblad channel at frozen
-       dephasing rates;
-    4. NO-FIT PREDICTION:
-       compare the complete channel distance with
-           gamma * ||U_0(T) (K_z-K_0)||_F / 16
-       and test linear signal scaling plus quadratic prediction residual.
+    chi_{M,rho}[DeltaK] = Tr[ M * unvec( (G_z - G_0) vec(rho) ) ],
+    G_z = d/dgamma E_z(T;gamma) |_{gamma=0}  (= U_z(T) K_z).
 
-Model and endpoint-fiber lift are the physical-z part of M2:
-exact two-atom Rydberg dynamics, six global piecewise-constant controls,
-18 physical control coordinates, and a Euclidean minimum-norm endpoint lift.
+CONSTRAINTS TAKEN SERIOUSLY (this is the whole point of the script)
+-------------------------------------------------------------------
+  * rho is NOT optimized over all states. On an analog neutral-atom device the
+    only preparable input is |gg>. rho = |gg><gg| is hard-wired.
+  * M is NOT an arbitrary Hermitian operator. Readout projects each atom onto
+    {|g>, |r>}. Admissible M are therefore diagonal in the computational basis.
+  * Basis rotation is obtained by APPENDING A REAL PULSE (a 7th segment, global,
+    identical for both controls), simulated with the full interaction Hamiltonian
+    AND with the same noise. Nothing is applied "by hand" as a perfect rotation.
+  * A shot budget is computed from the exact binomial/multinomial variance.
+    If the required shot count is absurd, the script says so. It does not hide it.
 
-This is a model-level numerical test.  It is not hardware evidence and it does
-not imply that all quantum computation is geometric flow.
+SIX STEPS REQUESTED
+-------------------
+  (1) freeze two full-unitary-equivalent controls              -> Sec. 3 (M2 lift)
+  (2) re-verify the ideal endpoint AFTER compilation           -> Sec. 4 (resample gate)
+  (3) choose rho and M maximizing |DeltaP|                      -> Sec. 6 (readout scan)
+  (4) sweep the controllable noise strength gamma               -> Sec. 7
+  (5) predict the slope in advance, no fitting                  -> Sec. 6/7
+  (6) observe the linear split                                  -> Sec. 7 + Sec. 9 (feasibility)
 
-Colab / Jupyter:
-    !pip install -q -U numpy scipy matplotlib
-    # Paste this complete file into one cell, or save it and run:
-    !python m2_four_step_path_noise_closure.py
+HAMILTONIAN CONVENTION
+----------------------
+Not assumed. Extracted from Pulser at runtime and asserted (Gate H0). Pulser uses
+the ordered eigenbasis (|r>, |g>) and
 
-The parser safely ignores Jupyter's ``-f kernel.json`` argument.
+    H = (Omega/2) ( cos(phi) X - sin(phi) Y ) - Delta * N + (C6/a^6) n1 n2 ,
+
+i.e. the manuscript's +sin(phi) Y corresponds to phi -> -phi here.
+
+That relabeling is NOT a symmetry of the result. It is true that
+H(-phi) = conj(H(phi)) elementwise (X, N, n1n2 real; Y imaginary), and Gate H1
+verifies exactly that. It is false that this makes U(-phi) a simple function of
+U(phi): conjugating each factor transposes it, and transposition reverses the
+order of a time-ordered product. So the same numerical phase table read under the
+two conventions gives genuinely different unitaries and different numerical values
+of ||K_z - K_0||, chi and DeltaP. What is convention independent is the structure
+(existence of the fiber, its rank, the exponents, the first-order law), not the
+numbers. Gate H1 reports |U(-phi) - conj(U(phi))| explicitly BECAUSE it does not
+vanish. Select the convention with --phase-sign; it is applied globally through
+MODEL["phase_sign"].
+
+USAGE
+-----
+    python pasqal_local_observable_path_split.py                 # full run
+    python pasqal_local_observable_path_split.py --quick         # coarse, ~1 min
+    python pasqal_local_observable_path_split.py --eps-sweep     # add design sweep
+
+Author: script prepared for Y. Y. N. Li.
 """
+
 from __future__ import annotations
 
 import argparse
 import csv
 import hashlib
-import importlib.metadata
 import json
-import math
 import os
 import platform
-import subprocess
 import sys
 import time
-import traceback
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 
 import numpy as np
 from scipy.linalg import expm, expm_frechet
-from scipy.optimize import least_squares
+
+# ----------------------------------------------------------------------------
+# 0. PROVENANCE
+# ----------------------------------------------------------------------------
+
+VERSION = "EP-OBS-v1.0"
 
 
-VERSION = "M2-P4-v1.1"
-C6 = 5_420_158.53  # rad um^6 / us
-FLOOR = 1e-14
+_SOURCE_PATH_OVERRIDE = None
 
 
-@dataclass(frozen=True)
-class Cfg:
-    # Exact M2 physical model.
-    spacing_um: float = 6.0
-    segments: int = 6
-    segment_duration_us: float = 0.120
+def self_sha256() -> str:
+    """SHA-256 of the executed source.
 
-    # Endpoint-fiber construction.
-    loop_epsilon: float = 0.040
-    transport_step: float = 0.002
-    control_fd: float = 0.002
-    task_fd: float = 0.0005
-    endpoint_infidelity_tol: float = 1e-11
-    endpoint_residual_tol: float = 2e-9
-    reachability_tol: float = 2e-4
-    lift_tol: float = 1e-7
-    path_rank_relative_cut: float = 1e-6
-    path_spectral_gap_min: float = 1e4
-    transport_convergence_tol: float = 0.02
-
-    # Frozen local-dephasing scan, in 1/us.  gamma=0 is the numerical null.
-    gammas: tuple[float, ...] = (
-        0.0, 0.001875, 0.003750, 0.007500, 0.015000, 0.030000
-    )
-
-    # Independent verification of the exact Frechet derivative.  Negative
-    # gamma is used only in this centered numerical derivative diagnostic.
-    derivative_fd_gamma: float = 3e-4
-    derivative_fd_relative_tol: float = 1e-6
-
-    # Predeclared physics gates.
-    response_to_endpoint_floor_min: float = 1e5
-    signal_to_zero_noise_floor_min: float = 1e5
-    signal_gamma_exponent_range: tuple[float, float] = (0.94, 1.06)
-    residual_gamma_exponent_range: tuple[float, float] = (1.85, 2.15)
-    maximum_prediction_relative_error: float = 0.03
-
-
-def clean(x: Any) -> Any:
-    if isinstance(x, dict):
-        return {str(k): clean(v) for k, v in x.items()}
-    if isinstance(x, (list, tuple)):
-        return [clean(v) for v in x]
-    if isinstance(x, np.ndarray):
-        return clean(x.tolist())
-    if isinstance(x, np.integer):
-        return int(x)
-    if isinstance(x, np.floating):
-        x = float(x)
-    if isinstance(x, float):
-        return x if math.isfinite(x) else None
-    if isinstance(x, np.bool_):
-        return bool(x)
-    return x
-
-
-def save_json(path: Path, value: Any) -> None:
-    path.write_text(
-        json.dumps(clean(value), indent=2, ensure_ascii=False, allow_nan=False),
-        encoding="utf-8",
-    )
-
-
-def sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1 << 20), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
-def package_version(name: str) -> str | None:
+    A notebook cell does not expose __file__, so the digest is unavailable unless
+    the caller points at the archived file explicitly (--source-path, or
+    run(source_path=...)). Reporting 'unavailable' is deliberate: a digest of a
+    file that may differ from what was actually executed is worse than none.
+    """
+    path = _SOURCE_PATH_OVERRIDE
+    if path is None:
+        try:
+            path = os.path.abspath(__file__)
+        except NameError:
+            return "unavailable (no source path exposed)"
     try:
-        return importlib.metadata.version(name)
-    except importlib.metadata.PackageNotFoundError:
-        return None
-
-
-def relative_difference(a: np.ndarray, b: np.ndarray) -> float:
-    den = max(0.5 * (np.linalg.norm(a) + np.linalg.norm(b)), FLOOR)
-    return float(np.linalg.norm(a - b) / den)
-
-
-def loglog_slope(x: np.ndarray, y: np.ndarray) -> float:
-    keep = (x > 0.0) & (y > FLOOR)
-    if np.count_nonzero(keep) < 3:
-        return math.nan
-    return float(np.polyfit(np.log(x[keep]), np.log(y[keep]), 1)[0])
-
-
-class Model:
-    """Exact two-atom, six-segment M2 Hamiltonian."""
-
-    def __init__(self, cfg: Cfg):
-        self.cfg = cfg
-        self.d = 4
-        self.liouville_d = self.d**2
-        self.p = 3 * cfg.segments
-
-        i2 = np.eye(2, dtype=complex)
-        x = np.array([[0, 1], [1, 0]], dtype=complex)
-        y = np.array([[0, -1j], [1j, 0]], dtype=complex)
-        n = np.array([[0, 0], [0, 1]], dtype=complex)
-
-        def embed(a: np.ndarray, site: int) -> np.ndarray:
-            return np.kron(a, i2) if site == 0 else np.kron(i2, a)
-
-        self.xs = [embed(x, k) for k in range(2)]
-        self.ys = [embed(y, k) for k in range(2)]
-        self.ns = [embed(n, k) for k in range(2)]
-        self.X = sum(self.xs)
-        self.Y = sum(self.ys)
-        self.N = sum(self.ns)
-        self.V = (
-            C6 / cfg.spacing_um**6 * (self.ns[0] @ self.ns[1])
-        )
-
-        twopi = 2.0 * np.pi
-        self.omega0 = twopi * np.array(
-            [2.0, 1.7, 2.3, 1.5, 2.1, 1.8]
-        )
-        self.delta0 = twopi * np.array(
-            [-2.3, -1.2, 0.4, 1.4, 2.0, 0.8]
-        )
-        self.phase0 = np.array([0.0, 0.4, 1.1, 2.0, 2.7, -2.4])
-
-        self.I = np.eye(self.d, dtype=complex)
-        self.IL = np.eye(self.liouville_d, dtype=complex)
-        self.z0 = np.zeros(self.p)
-        self._unitary_cache: dict[tuple[float, ...], np.ndarray] = {}
-        self.U0 = self.unitary(self.z0)
-
-        # Unit-rate local dephasing generator.  The physical generator is
-        # gamma*D, where gamma has units 1/us.
-        self.D = np.zeros(
-            (self.liouville_d, self.liouville_d), dtype=complex
-        )
-        for op in self.ns:
-            ada = op.conj().T @ op
-            self.D += np.kron(op.conj(), op)
-            self.D -= 0.5 * np.kron(self.I, ada)
-            self.D -= 0.5 * np.kron(ada.T, self.I)
-
-    @staticmethod
-    def key(z: np.ndarray) -> tuple[float, ...]:
-        return tuple(np.round(np.asarray(z, dtype=float), 13))
-
-    def H(self, z: np.ndarray, segment: int) -> np.ndarray:
-        omega = self.omega0[segment] * (1.0 + z[3 * segment])
-        if omega <= 0:
-            raise ValueError("transport produced non-positive Omega")
-        delta = self.delta0[segment] + 2.0 * np.pi * z[3 * segment + 1]
-        phase = self.phase0[segment] + z[3 * segment + 2]
-        return (
-            0.5 * omega
-            * (math.cos(phase) * self.X + math.sin(phase) * self.Y)
-            - delta * self.N
-            + self.V
-        )
-
-    def unitary(self, z: np.ndarray) -> np.ndarray:
-        key = self.key(z)
-        if key in self._unitary_cache:
-            return self._unitary_cache[key].copy()
-        u = self.I.copy()
-        for segment in range(self.cfg.segments):
-            u = (
-                expm(
-                    -1j
-                    * self.H(z, segment)
-                    * self.cfg.segment_duration_us
-                )
-                @ u
-            )
-        self._unitary_cache[key] = u.copy()
-        return u
-
-    def target(self, task: np.ndarray) -> np.ndarray:
-        return (
-            expm(-0.25j * (task[0] * self.X + task[1] * self.Y))
-            @ self.U0
-        )
-
-    def endpoint_residual_vector(
-        self, z: np.ndarray, task: np.ndarray
-    ) -> np.ndarray:
-        u = self.unitary(z)
-        target = self.target(task)
-        # Remove the best global phase before forming a Euclidean residual.
-        u = u * np.exp(-1j * np.angle(np.vdot(target, u)))
-        return np.r_[u.real.ravel(), u.imag.ravel()] - np.r_[
-            target.real.ravel(), target.imag.ravel()
-        ]
-
-    def endpoint_infidelity(
-        self, z: np.ndarray, task: np.ndarray
-    ) -> float:
-        overlap = np.trace(
-            self.target(task).conj().T @ self.unitary(z)
-        )
-        fidelity = abs(overlap) ** 2 / self.d**2
-        return float(max(0.0, 1.0 - min(1.0, fidelity.real)))
-
-    def coherent_liouvillian(self, h: np.ndarray) -> np.ndarray:
-        # Column-major vectorization:
-        # vec(U rho U^dagger) = (U* kron U) vec(rho).
-        return -1j * (
-            np.kron(self.I, h) - np.kron(h.T, self.I)
-        )
-
-    def ideal_channel(self, z: np.ndarray) -> np.ndarray:
-        u = self.unitary(z)
-        return np.kron(u.conj(), u)
-
-    def noisy_channel(self, z: np.ndarray, gamma: float) -> np.ndarray:
-        channel = self.IL.copy()
-        dt = self.cfg.segment_duration_us
-        for segment in range(self.cfg.segments):
-            generator = (
-                self.coherent_liouvillian(self.H(z, segment))
-                + gamma * self.D
-            )
-            channel = expm(generator * dt) @ channel
-        return channel
-
-    def ideal_response(
-        self, z: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Return (ideal channel S, dE/dgamma at zero, K=S^{-1}dE/dgamma).
-
-        scipy.linalg.expm_frechet gives the exact derivative of every
-        piecewise-constant segment exponential.  The product rule then gives
-        the derivative of the complete channel without a time quadrature.
-        """
-        channel = self.IL.copy()
-        derivative = np.zeros_like(channel)
-        dt = self.cfg.segment_duration_us
-        for segment in range(self.cfg.segments):
-            a = self.coherent_liouvillian(self.H(z, segment)) * dt
-            b = self.D * dt
-            propagator, dpropagator = expm_frechet(
-                a, b, compute_expm=True
-            )
-            derivative = dpropagator @ channel + propagator @ derivative
-            channel = propagator @ channel
-        response = np.linalg.solve(channel, derivative)
-        return channel, derivative, response
-
-
-def jacobian_control(
-    model: Model, z: np.ndarray, task: np.ndarray, h: float
-) -> np.ndarray:
-    columns = []
-    for k in range(model.p):
-        dz = np.zeros(model.p)
-        dz[k] = h
-        columns.append(
-            (
-                model.endpoint_residual_vector(z + dz, task)
-                - model.endpoint_residual_vector(z - dz, task)
-            )
-            / (2.0 * h)
-        )
-    return np.column_stack(columns)
-
-
-def jacobian_task(
-    model: Model, z: np.ndarray, task: np.ndarray, h: float
-) -> np.ndarray:
-    columns = []
-    for k in range(2):
-        ds = np.zeros(2)
-        ds[k] = h
-        columns.append(
-            (
-                model.endpoint_residual_vector(z, task + ds)
-                - model.endpoint_residual_vector(z, task - ds)
-            )
-            / (2.0 * h)
-        )
-    return np.column_stack(columns)
-
-
-def endpoint_geometry(
-    q_h: np.ndarray, q_half: np.ndarray
-) -> dict[str, Any]:
-    uncertainty = np.linalg.norm(q_h - q_half, 2)
-
-    def one(q: np.ndarray) -> tuple[int, np.ndarray, np.ndarray]:
-        _, singular, vh = np.linalg.svd(q, full_matrices=True)
-        cut = max(1e-7 * singular[0], 5.0 * uncertainty, FLOOR)
-        rank = int(np.count_nonzero(singular > cut))
-        vertical = vh[rank:].T
-        projector = vertical @ vertical.T
-        return rank, singular, 0.5 * (projector + projector.T)
-
-    rank_h, singular_h, projector_h = one(q_h)
-    rank_half, singular_half, projector_half = one(q_half)
-    projector_change = float(
-        np.linalg.norm(projector_h - projector_half, 2)
-    )
-    stable = bool(
-        rank_h == rank_half
-        and rank_half < q_h.shape[1]
-        and projector_change < 0.02
-    )
-    return {
-        "rank_h": rank_h,
-        "rank_half": rank_half,
-        "singular_values_h": singular_h,
-        "singular_values_half": singular_half,
-        "fiber_dimension": q_h.shape[1] - rank_half,
-        "projector": projector_half,
-        "projector_change": projector_change,
-        "stable": stable,
-    }
-
-
-def rank_diagnostic(
-    q: np.ndarray, expected_rank: int, relative_cut: float
-) -> dict[str, Any]:
-    singular = np.linalg.svd(q, compute_uv=False)
-    cut = max(relative_cut * singular[0], FLOOR)
-    numerical_rank = int(np.count_nonzero(singular > cut))
-    retained = float(singular[expected_rank - 1])
-    discarded = (
-        float(singular[expected_rank])
-        if expected_rank < len(singular)
-        else 0.0
-    )
-    return {
-        "numerical_rank": numerical_rank,
-        "relative_cut_value": cut,
-        "smallest_retained_singular_value": retained,
-        "largest_discarded_singular_value": discarded,
-        "retained_to_discarded_gap": float(
-            retained / max(discarded, FLOOR)
-        ),
-    }
-
-
-def lift_and_correct(
-    cfg: Cfg,
-    model: Model,
-    z: np.ndarray,
-    task: np.ndarray,
-    d_task: np.ndarray,
-    rank: int,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    q = jacobian_control(model, z, task, cfg.control_fd)
-    b = jacobian_task(model, z, task, cfg.task_fd)
-    rank_info = rank_diagnostic(
-        q, rank, cfg.path_rank_relative_cut
-    )
-
-    u, _, _ = np.linalg.svd(q, full_matrices=True)
-    image = u[:, :rank]
-    reduced_q = image.T @ q
-    reduced_b = image.T @ b
-    reachability = np.linalg.norm(b - image @ reduced_b) / max(
-        np.linalg.norm(b), FLOOR
-    )
-
-    rhs = -(reduced_b @ d_task)
-    dz = reduced_q.T @ np.linalg.pinv(
-        reduced_q @ reduced_q.T, rcond=1e-12
-    ) @ rhs
-    lift_error = np.linalg.norm(reduced_q @ dz - rhs) / max(
-        np.linalg.norm(rhs), FLOOR
-    )
-
-    # The correction span is the Euclidean metric-normal space range(Q^T).
-    normal, _ = np.linalg.qr(reduced_q.T)
-    normal = normal[:, :rank]
-    next_task = task + d_task
-    predictor = z + dz
-    fit = least_squares(
-        lambda a: model.endpoint_residual_vector(
-            predictor + normal @ a, next_task
-        ),
-        np.zeros(rank),
-        ftol=1e-12,
-        xtol=1e-12,
-        gtol=1e-12,
-        max_nfev=80,
-    )
-    next_z = predictor + normal @ fit.x
-    return next_z, {
-        "reachability": float(reachability),
-        "lift_error": float(lift_error),
-        "residual": float(
-            np.linalg.norm(
-                model.endpoint_residual_vector(next_z, next_task)
-            )
-        ),
-        "infidelity": model.endpoint_infidelity(next_z, next_task),
-        "rank": rank_info,
-    }
-
-
-def task_vertices(kind: str, epsilon: float) -> list[np.ndarray]:
-    origin = np.zeros(2)
-    x = np.array([epsilon, 0.0])
-    y = np.array([0.0, epsilon])
-    xy = np.array([epsilon, epsilon])
-    if kind == "CW":
-        return [origin, x, xy, y, origin]
-    if kind == "CCW":
-        return [origin, y, xy, x, origin]
-    raise ValueError(f"unknown loop kind: {kind}")
-
-
-def transport_loop(
-    cfg: Cfg,
-    model: Model,
-    rank: int,
-    kind: str,
-    step: float,
-) -> dict[str, Any]:
-    z = model.z0.copy()
-    task = np.zeros(2)
-    worst = {
-        "reachability": 0.0,
-        "lift_error": 0.0,
-        "residual": 0.0,
-        "infidelity": 0.0,
-    }
-    rank_rows: list[dict[str, Any]] = []
-    steps = 0
-
-    vertices = task_vertices(kind, cfg.loop_epsilon)
-    for start, end in zip(vertices[:-1], vertices[1:]):
-        edge = end - start
-        count = max(1, math.ceil(np.linalg.norm(edge) / step))
-        d_task = edge / count
-        for _ in range(count):
-            z, diagnostics = lift_and_correct(
-                cfg, model, z, task, d_task, rank
-            )
-            task += d_task
-            for key in worst:
-                worst[key] = max(worst[key], diagnostics[key])
-            rank_rows.append(diagnostics["rank"])
-            steps += 1
-
-    final_q = jacobian_control(
-        model, z, np.zeros(2), cfg.control_fd
-    )
-    rank_rows.append(
-        rank_diagnostic(final_q, rank, cfg.path_rank_relative_cut)
-    )
-
-    rank_summary = {
-        "audited_point_count": len(rank_rows),
-        "observed_numerical_ranks": sorted(
-            {int(row["numerical_rank"]) for row in rank_rows}
-        ),
-        "minimum_retained_singular_value": min(
-            row["smallest_retained_singular_value"]
-            for row in rank_rows
-        ),
-        "maximum_discarded_singular_value": max(
-            row["largest_discarded_singular_value"]
-            for row in rank_rows
-        ),
-        "minimum_retained_to_discarded_gap": min(
-            row["retained_to_discarded_gap"] for row in rank_rows
-        ),
-    }
-    rank_summary["stable"] = bool(
-        rank_summary["observed_numerical_ranks"] == [rank]
-        and rank_summary["minimum_retained_to_discarded_gap"]
-        >= cfg.path_spectral_gap_min
-    )
-
-    residual = float(
-        np.linalg.norm(
-            model.endpoint_residual_vector(z, np.zeros(2))
-        )
-    )
-    infidelity = model.endpoint_infidelity(z, np.zeros(2))
-    numerical_pass = bool(
-        residual <= cfg.endpoint_residual_tol
-        and infidelity <= cfg.endpoint_infidelity_tol
-        and worst["residual"] <= cfg.endpoint_residual_tol
-        and worst["infidelity"] <= cfg.endpoint_infidelity_tol
-        and worst["reachability"] <= cfg.reachability_tol
-        and worst["lift_error"] <= cfg.lift_tol
-        and rank_summary["stable"]
-    )
-    return {
-        "kind": kind,
-        "z": z,
-        "steps": steps,
-        "endpoint_residual": residual,
-        "endpoint_infidelity": infidelity,
-        "worst": worst,
-        "path_rank": rank_summary,
-        "numerical_pass": numerical_pass,
-    }
-
-
-def unitary_endpoint_metrics(
-    model: Model, z: np.ndarray
-) -> dict[str, float]:
-    u0 = model.U0
-    u = model.unitary(z)
-    overlap = np.trace(u0.conj().T @ u)
-    fidelity = float(abs(overlap) ** 2 / model.d**2)
-    phase = float(np.angle(overlap))
-    phase_aligned = u * np.exp(-1j * phase)
-    return {
-        "full_unitary_fidelity": fidelity,
-        "full_unitary_infidelity": max(0.0, 1.0 - fidelity),
-        "global_phase_rad": phase,
-        "phase_aligned_frobenius_residual": float(
-            np.linalg.norm(phase_aligned - u0)
-        ),
-    }
-
-
-def derivative_difference_fd(
-    cfg: Cfg,
-    model: Model,
-    z: np.ndarray,
-) -> np.ndarray:
-    h = cfg.derivative_fd_gamma
-    positive = (
-        model.noisy_channel(z, h)
-        - model.noisy_channel(model.z0, h)
-    )
-    negative = (
-        model.noisy_channel(z, -h)
-        - model.noisy_channel(model.z0, -h)
-    )
-    return (positive - negative) / (2.0 * h)
-
-
-def analyze_direction(
-    cfg: Cfg,
-    model: Model,
-    run: dict[str, Any],
-    base_response: tuple[np.ndarray, np.ndarray, np.ndarray],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    z = run["z"]
-    s0, derivative0, k0 = base_response
-    s, derivative, k = model.ideal_response(z)
-
-    delta_k = k - k0
-    # The paper prediction uses the common reference endpoint.
-    predicted_derivative = s0 @ delta_k
-    # Product-rule derivative is an independent exact implementation check.
-    direct_derivative = derivative - derivative0
-    common_endpoint_relative_difference = relative_difference(
-        predicted_derivative, direct_derivative
-    )
-
-    fd_derivative = derivative_difference_fd(cfg, model, z)
-    derivative_fd_relative_error = relative_difference(
-        fd_derivative, direct_derivative
-    )
-
-    response_norm = float(
-        np.linalg.norm(delta_k) / math.sqrt(delta_k.size)
-    )
-    endpoint_channel_floor = float(
-        np.linalg.norm(s - s0) / math.sqrt(s.size)
-    )
-    response_to_endpoint_floor = float(
-        response_norm / max(endpoint_channel_floor, FLOOR)
-    )
-
-    base_channels = {
-        gamma: model.noisy_channel(model.z0, gamma)
-        for gamma in cfg.gammas
-    }
-    rows: list[dict[str, Any]] = []
-    for gamma in cfg.gammas:
-        exact = model.noisy_channel(z, gamma)
-        actual = float(
-            np.linalg.norm(exact - base_channels[gamma])
-            / math.sqrt(exact.size)
-        )
-        predicted = float(
-            gamma
-            * np.linalg.norm(predicted_derivative)
-            / math.sqrt(predicted_derivative.size)
-        )
-        absolute_residual = abs(actual - predicted)
-        relative_error = (
-            absolute_residual / actual if actual > FLOOR else math.nan
-        )
-        rows.append({
-            "direction": run["kind"],
-            "gamma_per_us": gamma,
-            "actual_channel_distance": actual,
-            "first_order_prediction": predicted,
-            "absolute_prediction_residual": absolute_residual,
-            "relative_prediction_error": relative_error,
-        })
-
-    gamma_values = np.array([row["gamma_per_us"] for row in rows])
-    actual_values = np.array(
-        [row["actual_channel_distance"] for row in rows]
-    )
-    residual_values = np.array(
-        [row["absolute_prediction_residual"] for row in rows]
-    )
-    nonzero_rows = [row for row in rows if row["gamma_per_us"] > 0.0]
-    zero_floor = rows[0]["actual_channel_distance"]
-    weakest_signal = min(
-        row["actual_channel_distance"] for row in nonzero_rows
-    )
-    maximum_relative_error = max(
-        row["relative_prediction_error"] for row in nonzero_rows
-    )
-
-    signal_exponent = loglog_slope(gamma_values, actual_values)
-    residual_exponent = loglog_slope(gamma_values, residual_values)
-    signal_range = cfg.signal_gamma_exponent_range
-    residual_range = cfg.residual_gamma_exponent_range
-    endpoint = unitary_endpoint_metrics(model, z)
-
-    gates = {
-        "transport_numerical_validity": bool(run["numerical_pass"]),
-        "same_full_unitary_endpoint": bool(
-            endpoint["full_unitary_infidelity"]
-            <= cfg.endpoint_infidelity_tol
-        ),
-        "path_response_above_endpoint_floor": bool(
-            response_to_endpoint_floor
-            >= cfg.response_to_endpoint_floor_min
-        ),
-        "frechet_derivative_verified": bool(
-            derivative_fd_relative_error
-            <= cfg.derivative_fd_relative_tol
-        ),
-        "common_endpoint_formula_verified": bool(
-            common_endpoint_relative_difference <= 1e-8
-        ),
-        "noisy_signal_above_zero_noise_floor": bool(
-            weakest_signal / max(zero_floor, FLOOR)
-            >= cfg.signal_to_zero_noise_floor_min
-        ),
-        "linear_noise_scaling": bool(
-            signal_range[0] <= signal_exponent <= signal_range[1]
-        ),
-        "quadratic_prediction_residual": bool(
-            residual_range[0]
-            <= residual_exponent
-            <= residual_range[1]
-        ),
-        "first_order_prediction_accuracy": bool(
-            maximum_relative_error
-            <= cfg.maximum_prediction_relative_error
-        ),
-    }
-
-    summary = {
-        "direction": run["kind"],
-        "endpoint": endpoint,
-        "transport": {
-            key: value for key, value in run.items() if key != "z"
-        },
-        "path_response": {
-            "normalized_delta_K_frobenius": response_norm,
-            "ideal_endpoint_channel_floor": endpoint_channel_floor,
-            "response_to_endpoint_floor_ratio":
-                response_to_endpoint_floor,
-            "common_endpoint_vs_direct_derivative_relative_difference":
-                common_endpoint_relative_difference,
-            "frechet_vs_centered_fd_relative_difference":
-                derivative_fd_relative_error,
-        },
-        "noise_scan": {
-            "zero_noise_floor": zero_floor,
-            "weakest_nonzero_signal": weakest_signal,
-            "weakest_signal_to_zero_floor_ratio":
-                weakest_signal / max(zero_floor, FLOOR),
-            "signal_exponent_vs_gamma": signal_exponent,
-            "prediction_residual_exponent_vs_gamma":
-                residual_exponent,
-            "maximum_prediction_relative_error":
-                maximum_relative_error,
-        },
-        "gates": gates,
-        "supported": bool(all(gates.values())),
-    }
-    return summary, rows
-
-
-def save_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        raise ValueError("cannot save an empty CSV")
-    with path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(clean(rows))
-
-
-def save_controls(
-    path: Path, model: Model, runs: dict[str, dict[str, Any]]
-) -> None:
-    rows = []
-    controls = {"REFERENCE": model.z0}
-    controls.update({kind: run["z"] for kind, run in runs.items()})
-    for name, z in controls.items():
-        for segment in range(model.cfg.segments):
-            rows.append({
-                "control": name,
-                "segment_zero_based": segment,
-                "omega_fractional_change": z[3 * segment],
-                "detuning_addition_cycles_per_us": z[3 * segment + 1],
-                "phase_addition_rad": z[3 * segment + 2],
-                "omega_rad_per_us":
-                    model.omega0[segment] * (1.0 + z[3 * segment]),
-                "detuning_rad_per_us":
-                    model.delta0[segment]
-                    + 2.0 * np.pi * z[3 * segment + 1],
-                "phase_rad":
-                    model.phase0[segment] + z[3 * segment + 2],
-                "duration_us": model.cfg.segment_duration_us,
-            })
-    save_csv(path, rows)
-
-
-def save_plot(
-    path: Path, rows: list[dict[str, Any]]
-) -> str | None:
-    # Avoid read-only HOME configuration warnings in managed notebooks.
-    cache = Path("/tmp") / "m2_p4_matplotlib_cache"
-    cache.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(cache))
-    try:
-        import matplotlib.pyplot as plt
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
     except Exception:
-        return None
-
-    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
-    for direction, marker in (("CW", "o"), ("CCW", "s")):
-        selected = [
-            row for row in rows
-            if row["direction"] == direction
-            and row["gamma_per_us"] > 0.0
-        ]
-        gamma = np.array([row["gamma_per_us"] for row in selected])
-        actual = np.array(
-            [row["actual_channel_distance"] for row in selected]
-        )
-        predicted = np.array(
-            [row["first_order_prediction"] for row in selected]
-        )
-        residual = np.array(
-            [row["absolute_prediction_residual"] for row in selected]
-        )
-        axes[0].loglog(
-            gamma, actual, marker + "-", label=f"{direction} exact"
-        )
-        axes[0].loglog(
-            gamma, predicted, marker + "--", label=f"{direction} first order"
-        )
-        axes[1].loglog(
-            gamma, residual, marker + "-", label=direction
-        )
-
-    axes[0].set_xlabel(r"dephasing rate $\gamma$ ($\mu$s$^{-1}$)")
-    axes[0].set_ylabel("normalized channel distance")
-    axes[0].legend(fontsize=8)
-    axes[0].grid(True, which="both", alpha=0.25)
-    axes[1].set_xlabel(r"dephasing rate $\gamma$ ($\mu$s$^{-1}$)")
-    axes[1].set_ylabel("absolute first-order residual")
-    axes[1].legend(fontsize=8)
-    axes[1].grid(True, which="both", alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-    return str(path.name)
+        return "unavailable (no source path exposed)"
 
 
-def latex_float(value: float) -> str:
-    return f"{value:.8g}"
+def package_versions() -> dict:
+    out = {"python": sys.version.split()[0], "platform": platform.platform()}
+    for mod in ("numpy", "scipy", "pulser", "pulser_simulation", "qutip", "matplotlib"):
+        try:
+            m = __import__(mod)
+            out[mod] = getattr(m, "__version__", "unknown")
+        except Exception:
+            out[mod] = "not installed"
+    return out
 
 
-def save_latex_macros(
-    path: Path, result: dict[str, Any]
-) -> None:
-    directions = {item["direction"]: item for item in result["directions"]}
-    cw = directions["CW"]
-    ccw = directions["CCW"]
-    # Keep the backslash outside an f-string expression.  Python <=3.11
-    # rejects backslashes inside {...}, even when they belong to a raw string.
-    status_tex = result["status"].replace("_", r"\_")
-    text = "\n".join([
-        "% Auto-generated by m2_four_step_path_noise_closure.py",
-        rf"\newcommand{{\MtwoPfourStatus}}{{{status_tex}}}",
-        rf"\newcommand{{\MtwoEndpointRank}}{{{result['endpoint_geometry']['rank_half']}}}",
-        rf"\newcommand{{\MtwoFiberDimension}}{{{result['endpoint_geometry']['fiber_dimension']}}}",
-        rf"\newcommand{{\MtwoCWEndpointInfidelity}}{{{latex_float(cw['endpoint']['full_unitary_infidelity'])}}}",
-        rf"\newcommand{{\MtwoCCWEndpointInfidelity}}{{{latex_float(ccw['endpoint']['full_unitary_infidelity'])}}}",
-        rf"\newcommand{{\MtwoCWSignalExponent}}{{{latex_float(cw['noise_scan']['signal_exponent_vs_gamma'])}}}",
-        rf"\newcommand{{\MtwoCCWSignalExponent}}{{{latex_float(ccw['noise_scan']['signal_exponent_vs_gamma'])}}}",
-        rf"\newcommand{{\MtwoCWResidualExponent}}{{{latex_float(cw['noise_scan']['prediction_residual_exponent_vs_gamma'])}}}",
-        rf"\newcommand{{\MtwoCCWResidualExponent}}{{{latex_float(ccw['noise_scan']['prediction_residual_exponent_vs_gamma'])}}}",
-        rf"\newcommand{{\MtwoCWMaxPredictionError}}{{{latex_float(cw['noise_scan']['maximum_prediction_relative_error'])}}}",
-        rf"\newcommand{{\MtwoCCWMaxPredictionError}}{{{latex_float(ccw['noise_scan']['maximum_prediction_relative_error'])}}}",
-        "",
-    ])
-    path.write_text(text, encoding="utf-8")
+# ----------------------------------------------------------------------------
+# 1. MODEL  (two atoms, ground-rydberg, Pulser convention)
+# ----------------------------------------------------------------------------
+
+I2 = np.eye(2, dtype=complex)
+SX = np.array([[0, 1], [1, 0]], dtype=complex)
+SY = np.array([[0, -1j], [1j, 0]], dtype=complex)
+NN = np.array([[1, 0], [0, 0]], dtype=complex)  # n = |r><r| in (|r>,|g>) ordering
+
+X_OP = np.kron(SX, I2) + np.kron(I2, SX)
+Y_OP = np.kron(SY, I2) + np.kron(I2, SY)
+N_OP = np.kron(NN, I2) + np.kron(I2, NN)
+NN_OP = np.kron(NN, NN)
+N_LOC = [np.kron(NN, I2), np.kron(I2, NN)]
+
+DIM = 4
+DIM2 = DIM * DIM
+
+# computational basis order (Pulser): |rr>, |rg>, |gr>, |gg>
+IDX_RR, IDX_RG, IDX_GR, IDX_GG = 0, 1, 2, 3
+RHO0 = np.zeros((DIM, DIM), dtype=complex)
+RHO0[IDX_GG, IDX_GG] = 1.0  # the only preparable input state
+
+ATOM_SEP = 6.0  # um
+C6 = 5420158.53  # rad * um^6 / us   (== pulser MockDevice.interaction_coeff)
+U_INT = C6 / ATOM_SEP**6
+
+TAU = 0.120  # us, per segment
+NSEG = 6
+T_TOTAL = NSEG * TAU
+
+# Schedule model. GAP_TAU > 0 reproduces what a real device actually executes:
+# AnalogDevice inserts 2 x phase_jump_time (2 x 170 ns) of idle between pulses
+# whose phase differs, during which Omega = Delta = 0 and only the C6 interaction
+# acts. The M2 lift is performed on THIS schedule, so endpoint equivalence holds
+# for the executed evolution rather than for an idealized gap-free description.
+MODEL = {"gap_tau": 0.0, "omega_scale": 1.0, "phase_sign": 1.0}
+
+# reference control z0  (Table I of the manuscript)
+OMEGA0 = 2 * np.pi * np.array([2.0, 1.7, 2.3, 1.5, 2.1, 1.8])
+DELTA0 = 2 * np.pi * np.array([-2.3, -1.2, 0.4, 1.4, 2.0, 0.8])
+PHI0 = np.array([0.0, 0.4, 1.1, 2.0, 2.7, -2.4])
 
 
-def pip_freeze() -> str:
-    try:
-        return subprocess.check_output(
-            [sys.executable, "-m", "pip", "freeze"],
-            text=True,
-            stderr=subprocess.STDOUT,
-            timeout=60,
-        )
-    except Exception as exc:
-        return f"pip freeze unavailable: {type(exc).__name__}: {exc}\n"
+def controls_from_z(z: np.ndarray, phase_sign: "float | None" = None):
+    """z in R^18 -> (Omega_j, Delta_j, phi_j) arrays, manuscript parametrization.
+
+    phase_sign=None means "use the globally selected convention", so --phase-sign
+    reaches every downstream computation through this single point.
+    """
+    if phase_sign is None:
+        phase_sign = MODEL["phase_sign"]
+    z = np.asarray(z, dtype=float).reshape(NSEG, 3)
+    omega = MODEL["omega_scale"] * OMEGA0 * (1.0 + z[:, 0])
+    delta = DELTA0 + 2 * np.pi * z[:, 1]
+    phi = phase_sign * (PHI0 + z[:, 2])
+    return omega, delta, phi
 
 
-def audit(cfg: Cfg) -> tuple[dict[str, Any], list[dict[str, Any]], dict]:
-    model = Model(cfg)
-    zero_task = np.zeros(2)
-    geometry = endpoint_geometry(
-        jacobian_control(model, model.z0, zero_task, cfg.control_fd),
-        jacobian_control(model, model.z0, zero_task, cfg.control_fd / 2.0),
+def hamiltonian(omega: float, delta: float, phi: float) -> np.ndarray:
+    """Pulser-convention two-atom Rydberg Hamiltonian (verified by Gate H0)."""
+    return (
+        0.5 * omega * (np.cos(phi) * X_OP - np.sin(phi) * Y_OP)
+        - delta * N_OP
+        + U_INT * NN_OP
     )
-    if not geometry["stable"]:
-        raise AssertionError("endpoint rank/fiber projector is unstable")
-    rank = int(geometry["rank_half"])
 
-    runs = {
-        kind: transport_loop(
-            cfg, model, rank, kind, cfg.transport_step
-        )
-        for kind in ("CW", "CCW")
+
+def prop_from_H(H: np.ndarray, tau: float) -> np.ndarray:
+    """exp(-i H tau) via Hermitian eigendecomposition (fast + unitary to 1e-16)."""
+    w, V = np.linalg.eigh(H)
+    return (V * np.exp(-1j * w * tau)) @ V.conj().T
+
+
+@dataclass
+class Segment:
+    omega: float
+    delta: float
+    phi: float
+    tau: float
+
+
+def segments_of(z, phase_sign=None, readout: "Segment | None" = None):
+    """Full executed schedule: six drive segments, optional idle gaps, optional
+    readout-rotation segment appended identically for every control."""
+    omega, delta, phi = controls_from_z(z, phase_sign)
+    gap = MODEL["gap_tau"]
+    segs = []
+    for j in range(NSEG):
+        if gap > 0 and j > 0:
+            segs.append(Segment(0.0, 0.0, 0.0, gap))
+        segs.append(Segment(omega[j], delta[j], phi[j], TAU))
+    if readout is not None:
+        if gap > 0:
+            segs.append(Segment(0.0, 0.0, 0.0, gap))
+        segs.append(readout)
+    return segs
+
+
+def unitary_of_z(z: np.ndarray, phase_sign=None) -> np.ndarray:
+    """Ideal endpoint of the SCHEDULE (gaps included if MODEL['gap_tau'] > 0)."""
+    U = np.eye(DIM, dtype=complex)
+    for sg in segments_of(z, phase_sign):
+        U = prop_from_H(hamiltonian(sg.omega, sg.delta, sg.phi), sg.tau) @ U
+    return U
+
+
+# --- Liouville space (column stacking: vec(A X B) = kron(B.T, A) vec(X)) -----
+
+EYE_D = np.eye(DIM, dtype=complex)
+
+
+def vec(rho: np.ndarray) -> np.ndarray:
+    return rho.reshape(-1, order="F")
+
+
+def unvec(v: np.ndarray) -> np.ndarray:
+    return v.reshape(DIM, DIM, order="F")
+
+
+def sup_hamiltonian(H: np.ndarray) -> np.ndarray:
+    return -1j * (np.kron(EYE_D, H) - np.kron(H.T, EYE_D))
+
+
+def sup_unitary(U: np.ndarray) -> np.ndarray:
+    return np.kron(U.conj(), U)
+
+
+def build_dissipator() -> np.ndarray:
+    """D[rho] = sum_k ( n_k rho n_k - 1/2 {n_k, rho} ),  occupation dephasing.
+
+    Matches Pulser eff_noise with operators n_k and rate gamma exactly
+    (collapse ops sqrt(gamma) n_k applied locally on each atom).
+    """
+    D = np.zeros((DIM2, DIM2), dtype=complex)
+    for n in N_LOC:
+        D += np.kron(n.T, n) - 0.5 * np.kron(EYE_D, n) - 0.5 * np.kron(n.T, EYE_D)
+    return D
+
+
+D_SUP = build_dissipator()
+
+
+# ----------------------------------------------------------------------------
+# 2. ENDPOINT RESIDUAL, JACOBIANS, M2 LIFT
+# ----------------------------------------------------------------------------
+
+
+def u_target(s: np.ndarray, U0: np.ndarray) -> np.ndarray:
+    gen = -0.25j * (s[0] * X_OP + s[1] * Y_OP)
+    return expm(gen) @ U0
+
+
+def residual(z: np.ndarray, s: np.ndarray, U0: np.ndarray, phase_sign=None) -> np.ndarray:
+    """Phase-aligned real residual r(z,s) in R^32."""
+    Uz = unitary_of_z(z, phase_sign)
+    Ut = u_target(np.asarray(s, float), U0)
+    c = np.trace(Ut.conj().T @ Uz)
+    theta = np.angle(c)
+    R = np.exp(-1j * theta) * Uz - Ut
+    return np.concatenate([R.real.ravel(), R.imag.ravel()])
+
+
+def endpoint_infidelity(z: np.ndarray, U0: np.ndarray, phase_sign=None) -> float:
+    Uz = unitary_of_z(z, phase_sign)
+    return float(abs(1.0 - abs(np.trace(U0.conj().T @ Uz)) ** 2 / DIM**2))
+
+
+def jacobians(z, s, U0, h=1e-6, phase_sign=None):
+    """Central-difference Q = dr/dz (32x18), B = dr/ds (32x2)."""
+    z = np.asarray(z, float)
+    s = np.asarray(s, float)
+    Q = np.empty((32, 18))
+    for i in range(18):
+        e = np.zeros(18)
+        e[i] = h
+        Q[:, i] = (
+            residual(z + e, s, U0, phase_sign) - residual(z - e, s, U0, phase_sign)
+        ) / (2 * h)
+    B = np.empty((32, 2))
+    for i in range(2):
+        e = np.zeros(2)
+        e[i] = h
+        B[:, i] = (
+            residual(z, s + e, U0, phase_sign) - residual(z, s - e, U0, phase_sign)
+        ) / (2 * h)
+    return Q, B
+
+
+def minnorm_solve(Q, rhs, rcond=1e-6):
+    """Minimum-norm least-squares solution of Q dz = rhs, via reduced SVD."""
+    U, sv, Vt = np.linalg.svd(Q, full_matrices=False)
+    keep = sv > rcond * sv[0]
+    inv = np.zeros_like(sv)
+    inv[keep] = 1.0 / sv[keep]
+    dz = Vt.T @ (inv * (U.conj().T @ rhs))
+    res = float(np.linalg.norm(Q @ dz - rhs))
+    smin_keep = float(sv[keep].min()) if keep.any() else 0.0
+    smax_drop = float(sv[~keep].max()) if (~keep).any() else 0.0
+    return dz, res, int(keep.sum()), smin_keep, smax_drop
+
+
+def correct_endpoint(z, s, U0, rcond=1e-6, iters=3, phase_sign=None):
+    """Gauss-Newton correction restricted to range(Q^T) (min-norm LS step)."""
+    z = np.asarray(z, float).copy()
+    for _ in range(iters):
+        r = residual(z, s, U0, phase_sign)
+        if np.linalg.norm(r) < 1e-13:
+            break
+        Q, _ = jacobians(z, s, U0, phase_sign=phase_sign)
+        dz, _, _, _, _ = minnorm_solve(Q, -r, rcond)
+        z = z + dz
+    return z, float(np.linalg.norm(residual(z, s, U0, phase_sign)))
+
+
+def m2_transport(U0, vertices, h_s, rcond=1e-6, phase_sign=None, verbose=False):
+    """Lift a closed task-space loop; return final z and a numerical audit."""
+    z = np.zeros(18)
+    s = np.array(vertices[0], float)
+    audit = {
+        "n_steps": 0,
+        "ranks": [],
+        "smin_keep": [],
+        "smax_drop": [],
+        "lift_res": [],
+        "corr_res": [],
     }
-    # A single step-halving audit checks that the transported physical control
-    # and the resulting path response are not transport-discretization artifacts.
-    fine_cw = transport_loop(
-        cfg, model, rank, "CW", cfg.transport_step / 2.0
-    )
+    for a, b in zip(vertices[:-1], vertices[1:]):
+        seg = np.array(b, float) - np.array(a, float)
+        L = float(np.linalg.norm(seg))
+        nst = max(1, int(round(L / h_s)))
+        audit.setdefault("effective_h_s", []).append(float(L / nst))
+        ds = seg / nst
+        for _ in range(nst):
+            Q, B = jacobians(z, s, U0, phase_sign=phase_sign)
+            dz, lres, rank, smin, smax = minnorm_solve(Q, -(B @ ds), rcond)
+            z = z + dz
+            s = s + ds
+            z, cres = correct_endpoint(z, s, U0, rcond, iters=2, phase_sign=phase_sign)
+            audit["n_steps"] += 1
+            audit["ranks"].append(rank)
+            audit["smin_keep"].append(smin)
+            audit["smax_drop"].append(smax)
+            audit["lift_res"].append(lres)
+            audit["corr_res"].append(cres)
+    s_final = s
+    z, cres = correct_endpoint(z, s_final, U0, rcond, iters=6, phase_sign=phase_sign)
+    eff = audit.pop("effective_h_s", [h_s])
+    audit["effective_h_s"] = float(np.mean(eff))
+    audit["effective_h_s_spread"] = float(np.max(eff) - np.min(eff))
+    audit["nominal_h_s"] = float(h_s)
+    audit["reach_res"] = float(np.linalg.norm(s_final - np.array(vertices[-1], float)))
+    audit["final_res"] = cres
+    audit["rank_set"] = sorted(set(audit["ranks"]))
+    audit["min_smin_keep"] = float(np.min(audit["smin_keep"]))
+    audit["max_smax_drop"] = float(np.max(audit["smax_drop"]))
+    audit["max_lift_res"] = float(np.max(audit["lift_res"]))
+    audit["max_corr_res"] = float(np.max(audit["corr_res"]))
+    for k in ("ranks", "smin_keep", "smax_drop", "lift_res", "corr_res"):
+        audit.pop(k)
+    return z, audit
 
-    base_response = model.ideal_response(model.z0)
-    direction_results = []
-    all_rows: list[dict[str, Any]] = []
-    for kind in ("CW", "CCW"):
-        direction, rows = analyze_direction(
-            cfg, model, runs[kind], base_response
-        )
-        direction_results.append(direction)
-        all_rows.extend(rows)
 
-    coarse_response = model.ideal_response(runs["CW"]["z"])[2]
-    fine_response = model.ideal_response(fine_cw["z"])[2]
-    transport_control_convergence = relative_difference(
-        runs["CW"]["z"], fine_cw["z"]
-    )
-    transport_response_convergence = relative_difference(
-        coarse_response - base_response[2],
-        fine_response - base_response[2],
-    )
-    convergence_gate = bool(
-        fine_cw["numerical_pass"]
-        and transport_control_convergence
-        <= cfg.transport_convergence_tol
-        and transport_response_convergence
-        <= cfg.transport_convergence_tol
-    )
+# ----------------------------------------------------------------------------
+# 3. CHANNELS, RESPONSE OPERATORS
+# ----------------------------------------------------------------------------
 
-    geometry_public = {
-        key: value for key, value in geometry.items() if key != "projector"
-    }
-    all_direction_gates = bool(
-        all(result["supported"] for result in direction_results)
-    )
-    numerical_pass = bool(
-        geometry["stable"]
-        and all(run["numerical_pass"] for run in runs.values())
-        and convergence_gate
-    )
-    supported = bool(numerical_pass and all_direction_gates)
-    status = (
-        "NUMERICAL_FAIL_NO_PHYSICAL_INTERPRETATION"
-        if not numerical_pass
-        else "FOUR_STEP_PATH_RESOLVED_NOISE_CLOSURE_SUPPORTED"
-        if supported
-        else "PATH_RESOLVED_FIRST_ORDER_PREDICTION_NOT_SUPPORTED"
-    )
 
-    result = {
-        "version": VERSION,
-        "status": status,
-        "physical_support": supported,
-        "proposition": (
-            "For the tested exact two-atom Rydberg controls, distinct "
-            "implementations with the same complete ideal unitary endpoint "
-            "have different weak-dephasing channels, and the leading channel "
-            "difference is predicted without target fitting by the "
-            "interaction-picture dissipative response of the ideal paths."
-        ),
-        "four_step_closure": {
-            "step_1": "same complete ideal unitary endpoint",
-            "step_2": "different ideal-path dissipative response K",
-            "step_3": "different complete Lindblad channel",
-            "step_4": (
-                "no-fit first-order prediction with linear signal and "
-                "quadratic residual"
+def channel(segs, gamma: float) -> np.ndarray:
+    """Exact Lindblad channel as a 16x16 Liouville matrix."""
+    E = np.eye(DIM2, dtype=complex)
+    for sg in segs:
+        L0 = sup_hamiltonian(hamiltonian(sg.omega, sg.delta, sg.phi))
+        E = expm((L0 + gamma * D_SUP) * sg.tau) @ E
+    return E
+
+
+def channel_derivative(segs) -> np.ndarray:
+    """G = d/dgamma E(gamma) at gamma = 0, via the Frechet derivative of expm."""
+    props = []
+    fre = []
+    for sg in segs:
+        A = sup_hamiltonian(hamiltonian(sg.omega, sg.delta, sg.phi)) * sg.tau
+        E_dir = D_SUP * sg.tau
+        P, Lf = expm_frechet(A, E_dir, compute_expm=True)
+        props.append(P)
+        fre.append(Lf)
+    n = len(segs)
+    G = np.zeros((DIM2, DIM2), dtype=complex)
+    for j in range(n):
+        left = np.eye(DIM2, dtype=complex)
+        for k in range(n - 1, j, -1):
+            left = left @ props[k]
+        right = np.eye(DIM2, dtype=complex)
+        for k in range(j - 1, -1, -1):
+            right = right @ props[k]
+        G += left @ fre[j] @ right
+    return G
+
+
+def ideal_channel(segs) -> np.ndarray:
+    E = np.eye(DIM2, dtype=complex)
+    for sg in segs:
+        E = sup_unitary(prop_from_H(hamiltonian(sg.omega, sg.delta, sg.phi), sg.tau)) @ E
+    return E
+
+
+# ----------------------------------------------------------------------------
+# 4. OBSERVABLES  (diagonal in the computational basis = actually measurable)
+# ----------------------------------------------------------------------------
+
+OBSERVABLES = {
+    "P_gg": np.diag([0.0, 0.0, 0.0, 1.0]),
+    "P_rr": np.diag([1.0, 0.0, 0.0, 0.0]),
+    "P_one": np.diag([0.0, 1.0, 1.0, 0.0]),  # exactly one Rydberg
+    "N_ryd": np.diag([2.0, 1.0, 1.0, 0.0]),  # total Rydberg number
+    "ZZ": np.diag([1.0, -1.0, -1.0, 1.0]),  # parity
+}
+
+
+def probs_of(E: np.ndarray) -> np.ndarray:
+    """Diagonal populations after the channel, starting from |gg>."""
+    rho = unvec(E @ vec(RHO0))
+    p = np.real(np.diag(rho))
+    return p
+
+
+def observable_value(M: np.ndarray, E: np.ndarray) -> float:
+    return float(np.real(np.trace(M @ unvec(E @ vec(RHO0)))))
+
+
+def observable_variance(M: np.ndarray, E: np.ndarray) -> float:
+    """Exact single-shot variance of the measured random variable M (diagonal)."""
+    p = probs_of(E)
+    m = np.real(np.diag(M))
+    mean = float(p @ m)
+    return float(p @ (m**2) - mean**2)
+
+
+# ----------------------------------------------------------------------------
+# 5. PULSER COMPILATION + RESAMPLING GATE
+# ----------------------------------------------------------------------------
+
+
+def build_pulser_sequence(segs, device_name="mock"):
+    from pulser import Register, Sequence, Pulse
+    from pulser.devices import MockDevice, AnalogDevice
+
+    dev = MockDevice if device_name == "mock" else AnalogDevice
+    reg = Register.from_coordinates([[0.0, 0.0], [ATOM_SEP, 0.0]], prefix="q")
+    seq = Sequence(reg, dev)
+    seq.declare_channel("ryd", "rydberg_global")
+    for sg in segs:
+        dur_ns = int(round(sg.tau * 1000))
+        if sg.omega == 0.0 and sg.delta == 0.0:
+            if device_name == "mock":
+                seq.delay(dur_ns, "ryd")
+            # on a real device the delay is inserted automatically by the phase
+            # jump; adding it again would double-count it
+            continue
+        seq.add(
+            Pulse.ConstantPulse(
+                dur_ns, float(sg.omega), float(sg.delta), float(sg.phi) % (2 * np.pi)
             ),
-        },
-        "claim_boundary": (
-            "Applies only to this exact two-atom, six-segment Rydberg model, "
-            "the predeclared Euclidean endpoint connection, local dephasing, "
-            "and the tested weak-noise range.  It is not hardware evidence, "
-            "does not select a unique natural metric, and does not prove that "
-            "all quantum computation is geometric flow."
-        ),
-        "configuration": asdict(cfg),
-        "endpoint_geometry": geometry_public,
-        "transport_step_halving": {
-            "coarse_step": cfg.transport_step,
-            "fine_step": cfg.transport_step / 2.0,
-            "control_relative_difference": transport_control_convergence,
-            "path_response_relative_difference":
-                transport_response_convergence,
-            "fine_transport_numerical_pass": fine_cw["numerical_pass"],
-            "gate": convergence_gate,
-        },
-        "directions": direction_results,
-        "global_gates": {
-            "endpoint_geometry_stable": geometry["stable"],
-            "both_transports_numerically_valid":
-                all(run["numerical_pass"] for run in runs.values()),
-            "transport_step_halving_converged": convergence_gate,
-            "both_directions_close_all_four_steps": all_direction_gates,
-        },
-    }
-    return result, all_rows, runs
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir")
-
-    raw = sys.argv[1:]
-    cleaned: list[str] = []
-    ignored: list[str] = []
-    i = 0
-    while i < len(raw):
-        if raw[i] == "-f" and i + 1 < len(raw):
-            ignored.extend(raw[i:i + 2])
-            i += 2
-        elif raw[i].startswith("-f="):
-            ignored.append(raw[i])
-            i += 1
-        else:
-            cleaned.append(raw[i])
-            i += 1
-    if ignored:
-        print(f"[notebook] ignored kernel arguments: {ignored}")
-    return parser.parse_args(cleaned)
-
-
-def main() -> None:
-    args = parse_args()
-    started = time.perf_counter()
-    output = Path(
-        args.output_dir
-        or f"m2_four_step_closure_{time.strftime('%Y%m%d_%H%M%S')}"
-    )
-    output.mkdir(parents=True, exist_ok=False)
-
-    script_value = globals().get("__file__")
-    script_path = (
-        Path(script_value).resolve()
-        if script_value and Path(script_value).is_file()
-        else None
-    )
-    provenance = {
-        "python": sys.version,
-        "platform": platform.platform(),
-        "numpy": package_version("numpy"),
-        "scipy": package_version("scipy"),
-        "matplotlib": package_version("matplotlib"),
-        "script_path": str(script_path) if script_path else None,
-        "script_sha256": sha256(script_path) if script_path else None,
-    }
-    summary: dict[str, Any] = {
-        "version": VERSION,
-        "status": "RUNNING",
-        "provenance": provenance,
-    }
-    save_json(output / "summary.json", summary)
-
-    print("\n" + "=" * 96)
-    print("M2 FOUR-STEP PATH-RESOLVED NOISE CLOSURE")
-    print("=" * 96)
-    try:
-        cfg = Cfg()
-        result, rows, runs = audit(cfg)
-        save_json(output / "certificate.json", result)
-        save_csv(output / "noise_prediction.csv", rows)
-
-        # Recreate the model only for an explicit, human-readable control table.
-        save_controls(output / "controls.csv", Model(cfg), runs)
-        figure = save_plot(output / "path_noise_prediction.png", rows)
-        save_latex_macros(output / "results_macros.tex", result)
-        (output / "pip_freeze.txt").write_text(
-            pip_freeze(), encoding="utf-8"
+            "ryd",
         )
+    return seq
 
-        summary.update({
-            "status": "COMPLETE",
-            "scientific_status": result["status"],
-            "physical_support": result["physical_support"],
-            "outputs": {
-                "certificate": "certificate.json",
-                "noise_prediction": "noise_prediction.csv",
-                "controls": "controls.csv",
-                "figure": figure,
-                "latex_macros": "results_macros.tex",
-                "pip_freeze": "pip_freeze.txt",
-            },
-        })
 
-        concise = {
-            "status": result["status"],
-            "physical_support": result["physical_support"],
-            "endpoint_geometry": {
-                "rank": result["endpoint_geometry"]["rank_half"],
-                "fiber_dimension":
-                    result["endpoint_geometry"]["fiber_dimension"],
-                "stable": result["endpoint_geometry"]["stable"],
-            },
-            "transport_step_halving":
-                result["transport_step_halving"],
-            "directions": [
-                {
-                    "direction": item["direction"],
-                    "endpoint_infidelity":
-                        item["endpoint"]["full_unitary_infidelity"],
-                    "normalized_delta_K":
-                        item["path_response"][
-                            "normalized_delta_K_frobenius"
-                        ],
-                    "signal_exponent":
-                        item["noise_scan"]["signal_exponent_vs_gamma"],
-                    "residual_exponent":
-                        item["noise_scan"][
-                            "prediction_residual_exponent_vs_gamma"
-                        ],
-                    "maximum_prediction_relative_error":
-                        item["noise_scan"][
-                            "maximum_prediction_relative_error"
-                        ],
-                    "gates": item["gates"],
-                }
-                for item in result["directions"]
-            ],
-            "global_gates": result["global_gates"],
-            "claim_boundary": result["claim_boundary"],
-        }
-        print(json.dumps(clean(concise), indent=2, ensure_ascii=False))
+def unitary_from_compiled_samples(seq) -> np.ndarray:
+    """Rebuild U from the waveform Pulser actually schedules (1 ns resolution).
 
-        if not result["global_gates"]["both_transports_numerically_valid"]:
-            raise AssertionError(
-                "transport numerical gates failed; do not interpret physics"
+    This is the post-compilation re-verification: it does not trust the analytic
+    six-segment description, it reads back what the device would play.
+    """
+    from pulser.sampler import sample
+
+    ch = sample(seq).channel_samples["ryd"]
+    amp, det, ph = np.asarray(ch.amp), np.asarray(ch.det), np.asarray(ch.phase)
+    dt = 1e-3  # 1 ns in us
+    U = np.eye(DIM, dtype=complex)
+    # group consecutive identical (amp, det, phase) samples for speed
+    key = np.stack([amp, det, ph], axis=1)
+    starts = [0] + list(np.where(np.any(np.diff(key, axis=0) != 0, axis=1))[0] + 1)
+    starts.append(len(amp))
+    for a, b in zip(starts[:-1], starts[1:]):
+        H = hamiltonian(amp[a], det[a], ph[a])
+        U = prop_from_H(H, (b - a) * dt) @ U
+    return U
+
+
+def pulser_hamiltonian_probe():
+    """Gate H0: assert our hamiltonian() equals Pulser's, no convention guessing."""
+    from pulser_simulation import QutipEmulator
+
+    seg = Segment(2 * np.pi * 2.0, 2 * np.pi * (-2.3), 0.4, 0.120)
+    seq = build_pulser_sequence([seg], "mock")
+    sim = QutipEmulator.from_sequence(seq, sampling_rate=1.0)
+    H_pulser = np.asarray(sim.get_hamiltonian(60).full())
+    H_ours = hamiltonian(seg.omega, seg.delta, seg.phi)
+    err = float(np.max(np.abs(H_pulser - H_ours)))
+    init = np.asarray(sim.initial_state.full()).ravel()
+    gg_ok = bool(abs(abs(init[IDX_GG]) - 1.0) < 1e-12)
+    return err, gg_ok
+
+
+def pulser_validation(segs, gamma_list=(0.0, 0.030)):
+    """Three separate checks against Pulser, reported separately.
+
+    L1  our hamiltonian() == Pulser's get_hamiltonian(t) at every sample
+    L2  exact product of Pulser's OWN H(t) == our Liouville channel
+    L3  Pulser's QutipEmulator.run() == our Liouville channel
+
+    L1 and L2 validate the model and the propagator. L3 is a check ON PULSER'S
+    SOLVER: it uses an interpolated representation of the sampled coefficient
+    arrays and therefore carries an O(1e-3) systematic error on 120 ns square
+    pulses. That is orders of magnitude above the path signal, so run() is NOT
+    used as the numerical engine here. This is recorded rather than hidden.
+    """
+    import qutip
+    from pulser_simulation import QutipEmulator, SimConfig
+
+    out = {}
+    seq = build_pulser_sequence(segs, "mock")
+    sim = QutipEmulator.from_sequence(seq, sampling_rate=1.0)
+    n_ns = int(round(sum(sg.tau for sg in segs) * 1000))
+
+    # L1 and L2 share one pass: L1 compares H at EVERY sample, L2 propagates it
+    edges = np.cumsum([sg.tau for sg in segs])
+    H_ours = [hamiltonian(sg.omega, sg.delta, sg.phi) for sg in segs]
+    U = np.eye(DIM, dtype=complex)
+    l1 = 0.0
+    for k in range(n_ns):
+        Hp = np.asarray(sim.get_hamiltonian(k).full())
+        j = int(np.searchsorted(edges, k * 1e-3, side="right"))
+        j = min(j, len(segs) - 1)
+        l1 = max(l1, float(np.max(np.abs(Hp - H_ours[j]))))
+        U = prop_from_H(Hp, 1e-3) @ U
+    out["L1_hamiltonian_max_abs_err"] = float(l1)
+    out["L1_samples_checked"] = int(n_ns)
+    p_exact_pulserH = np.abs(U @ np.array([0, 0, 0, 1], dtype=complex)) ** 2
+    p_internal = probs_of(channel(segs, 0.0))
+    out["L2_exact_propagation_max_abs_err"] = float(
+        np.max(np.abs(p_exact_pulserH - p_internal))
+    )
+
+    # L3
+    l3 = {}
+    for g in gamma_list:
+        if g == 0.0:
+            res = sim.run(progress_bar=False)
+            pv = np.abs(np.asarray(res.states[-1].full()).ravel()) ** 2
+        else:
+            cfg = SimConfig(
+                noise=("eff_noise",),
+                eff_noise_opers=[qutip.Qobj(NN)],
+                eff_noise_rates=[float(g)],
             )
+            s2 = QutipEmulator.from_sequence(seq, sampling_rate=1.0, config=cfg)
+            res = s2.run(progress_bar=False)
+            pv = np.real(np.diag(np.asarray(res.states[-1].full())))
+        l3[f"gamma_{g}"] = float(np.max(np.abs(pv - probs_of(channel(segs, g)))))
+    out["L3_qutip_run_max_abs_err"] = l3
+    return out
+
+
+def compiled_blocks(seq, modulation=False):
+    """Return the schedule Pulser would actually play, as (amp, det, phase, tau)."""
+    from pulser.sampler import sample
+
+    ch = sample(seq, modulation=modulation).channel_samples["ryd"]
+    amp, det, ph = np.asarray(ch.amp), np.asarray(ch.det), np.asarray(ch.phase)
+    key = np.stack([amp, det, ph], axis=1)
+    starts = [0] + list(np.where(np.any(np.diff(key, axis=0) != 0, axis=1))[0] + 1)
+    starts.append(len(amp))
+    return [
+        Segment(amp[a], det[a], ph[a], (b - a) * 1e-3)
+        for a, b in zip(starts[:-1], starts[1:])
+    ]
+
+
+def unitary_of_blocks(blocks) -> np.ndarray:
+    U = np.eye(DIM, dtype=complex)
+    for sg in blocks:
+        U = prop_from_H(hamiltonian(sg.omega, sg.delta, sg.phi), sg.tau) @ U
+    return U
+
+
+def analog_schedule_report(z_map, U0, observable_name, readout, log):
+    """What a real AnalogDevice would execute, and what that does to the result.
+
+    Two distinct effects are separated:
+      (a) phase-jump idle gaps  -> deterministic, modelled exactly by MODEL['gap_tau']
+      (b) finite modulation bandwidth (8 MHz) -> smears the 120 ns segment edges,
+          is NOT in the model, and breaks the exact endpoint equivalence.
+
+    Effect (b) produces a *coherent* difference between the two controls that is
+    present already at gamma = 0. If it exceeds the path-induced weak-noise split,
+    the observable-level experiment cannot be run on that device as specified.
+    """
+    out = {}
+    try:
+        seqs = {
+            tag: build_pulser_sequence(segments_of(z, readout=readout), "analog")
+            for tag, z in z_map.items()
+        }
     except Exception as exc:
-        summary.update({
-            "status": "FAIL",
-            "error_type": type(exc).__name__,
-            "error": str(exc),
-            "traceback": traceback.format_exc(),
-        })
-        raise
-    finally:
-        summary["elapsed_seconds"] = time.perf_counter() - started
-        save_json(output / "summary.json", summary)
-        print(f"elapsed={summary['elapsed_seconds']:.2f}s")
-        print(f"outputs={output}")
+        from pulser.devices import AnalogDevice
+
+        lim = AnalogDevice.channels["rydberg_global"].max_amp
+        om = max(sg.omega for z in z_map.values()
+                 for sg in segments_of(z, readout=readout))
+        log(f"  AnalogDevice rejected the sequence: {type(exc).__name__}: {exc}")
+        log(f"  max Omega in the control = {om:.3f} rad/us, device limit = "
+            f"{lim:.3f} rad/us  ->  re-run with --omega-scale "
+            f"{0.98*lim/om:.3f}")
+        return {"compilable": False, "error": f"{type(exc).__name__}: {exc}",
+                "max_omega": float(om), "device_max_amp": float(lim),
+                "suggested_omega_scale": float(0.98 * lim / om)}
+
+    out["compilable"] = True
+    M = OBSERVABLES[observable_name]
+    U_unmod, U_mod = {}, {}
+    for tag, seq in seqs.items():
+        blocks_u = compiled_blocks(seq, modulation=False)
+        blocks_m = compiled_blocks(seq, modulation=True)
+        U_unmod[tag] = unitary_of_blocks(blocks_u)
+        U_mod[tag] = unitary_of_blocks(blocks_m)
+        out[f"{tag}_n_blocks_unmod"] = len(blocks_u)
+        out[f"{tag}_duration_us"] = float(sum(b.tau for b in blocks_u))
+
+    # (a) infer the idle gap the device actually inserts, then compare
+    blocks_ref = compiled_blocks(seqs["z0"], modulation=False)
+    idle = [b.tau for b in blocks_ref if b.omega == 0.0 and b.delta == 0.0]
+    inferred_gap = float(sum(idle) / max(len([b for b in blocks_ref
+                                              if b.omega != 0.0]) - 1, 1))
+    out["inferred_gap_us"] = inferred_gap
+    out["model_gap_us"] = MODEL["gap_tau"]
+    if abs(inferred_gap - MODEL["gap_tau"]) > 1e-9:
+        log(f"  !! device inserts {inferred_gap*1000:.0f} ns of idle between drive "
+            f"segments; current model uses {MODEL['gap_tau']*1000:.0f} ns.")
+        log(f"     re-run with --gap {inferred_gap:.3f} to lift on the executed "
+            f"schedule.")
+    model_err = {
+        tag: float(np.max(np.abs(U_unmod[tag] - unitary_of_blocks(
+            segments_of(z, readout=readout)))))
+        for tag, z in z_map.items()
+    }
+    out["gap_model_vs_pulser_maxabs"] = model_err
+    out["gap_model_ok"] = bool(max(model_err.values()) < 1e-9)
+    log(f"  executed duration on AnalogDevice: "
+        f"{out['z0_duration_us']:.3f} us  (gap-free model: "
+        f"{sum(s.tau for s in segments_of(np.zeros(18), readout=readout)):.3f} us)")
+    log(f"  gap model reproduces Pulser schedule: max|dU| = "
+        f"{max(model_err.values()):.3e}")
+
+    # (b) modulation damage, measured on the observable itself, at gamma = 0
+    def p_of(U):
+        rho = U @ RHO0 @ U.conj().T
+        return float(np.real(np.trace(M @ rho)))
+
+    for tag in z_map:
+        out[f"{tag}_eps_U_mod_vs_unmod"] = float(
+            abs(1 - abs(np.trace(U_unmod[tag].conj().T @ U_mod[tag])) ** 2 / DIM**2)
+        )
+    ref = "z0"
+    for tag in z_map:
+        if tag == ref:
+            continue
+        out[f"{tag}_eps_U_unmod_vs_z0"] = float(
+            abs(1 - abs(np.trace(U_unmod[ref].conj().T @ U_unmod[tag])) ** 2 / DIM**2)
+        )
+        out[f"{tag}_eps_U_mod_vs_z0"] = float(
+            abs(1 - abs(np.trace(U_mod[ref].conj().T @ U_mod[tag])) ** 2 / DIM**2)
+        )
+        out[f"{tag}_coherent_dP_from_modulation"] = abs(
+            p_of(U_mod[tag]) - p_of(U_mod[ref])
+        )
+        log(f"  {tag}: eps_U(unmod vs z0) = {out[f'{tag}_eps_U_unmod_vs_z0']:.3e}  ->  "
+            f"eps_U(modulated vs z0) = {out[f'{tag}_eps_U_mod_vs_z0']:.3e}")
+        log(f"      coherent |dP| injected by modulation at gamma=0: "
+            f"{out[f'{tag}_coherent_dP_from_modulation']:.3e}")
+    return out
+
+
+# ----------------------------------------------------------------------------
+# 6. MAIN EXPERIMENT
+# ----------------------------------------------------------------------------
+
+GAMMAS = np.array([0.0, 0.001875, 0.003750, 0.007500, 0.015000, 0.030000])
+
+
+def loop_vertices(eps, direction):
+    if direction == "CW":
+        return [(0, 0), (eps, 0), (eps, eps), (0, eps), (0, 0)]
+    return [(0, 0), (0, eps), (eps, eps), (eps, 0), (0, 0)]
+
+
+def scan_readout(dG, n_theta=41, n_phi=49, omega_max=2 * np.pi * 2.5, tau_ro=0.100,
+                 quick=False):
+    """Search the appended readout pulse (Omega, phi) and the observable M
+    maximizing the predicted first-order slope |chi|.
+
+    The readout pulse is a genuine extra segment: interaction and noise act during
+    it. Because E_z(0) = E_0(0), the readout only multiplies the derivative from
+    the left, so dG_total = P_ro(0) dG exactly.
+    """
+    if quick:
+        n_theta, n_phi = 15, 17
+    best = None
+    rows = []
+    omegas = np.linspace(0.0, omega_max, n_theta)
+    phis = np.linspace(0.0, 2 * np.pi, n_phi, endpoint=False)
+    # the executed tail is (idle gap, if the schedule has one) then the readout
+    # pulse; omitting the gap here would corrupt the predicted slope
+    gap = MODEL["gap_tau"]
+    P_gap = (
+        sup_unitary(prop_from_H(hamiltonian(0.0, 0.0, 0.0), gap))
+        if gap > 0
+        else np.eye(DIM2, dtype=complex)
+    )
+    for om in omegas:
+        for ph in phis:
+            P_ro = sup_unitary(
+                prop_from_H(hamiltonian(om, 0.0, ph), tau_ro)
+            ) @ P_gap
+            drho = unvec(P_ro @ dG @ vec(RHO0))
+            for name, M in OBSERVABLES.items():
+                chi = float(np.real(np.trace(M @ drho)))
+                rows.append((om, ph, name, chi))
+                if best is None or abs(chi) > abs(best[3]):
+                    best = (om, ph, name, chi)
+            if om == 0.0:
+                break  # phase is irrelevant when Omega = 0
+    # unconstrained bound for rho = |gg>: max over ALL POVM-like M with ||M||<=1
+    drho_no_ro = unvec(P_gap @ dG @ vec(RHO0))
+    bound = float(np.sum(np.abs(np.linalg.eigvalsh((drho_no_ro + drho_no_ro.conj().T) / 2))))
+    return best, rows, bound
+
+
+def loglog_slope(x, y):
+    m = (x > 0) & (y > 0)
+    if m.sum() < 2:
+        return float("nan")
+    return float(np.polyfit(np.log(x[m]), np.log(y[m]), 1)[0])
+
+
+def run_direction(direction, eps, h_s, U0, args, log):
+    t0 = time.time()
+    log(f"\n--- lift {direction}, eps = {eps:g}, h_s = {h_s:g} ---")
+    z, audit = m2_transport(U0, loop_vertices(eps, direction), h_s)
+    eu = endpoint_infidelity(z, U0)
+    log(f"    steps={audit['n_steps']}  rank(s)={audit['rank_set']}  "
+        f"eps_U={eu:.3e}  |r|={audit['final_res']:.3e}  ({time.time()-t0:.1f}s)")
+    return z, audit, eu
+
+
+def _in_notebook() -> bool:
+    """True inside Jupyter / Colab, where sys.argv carries the kernel's -f flag."""
+    if "ipykernel" in sys.modules or "google.colab" in sys.modules:
+        return True
+    return any("kernel-" in a and a.endswith(".json") for a in sys.argv[1:])
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="pasqal_local_observable_path_split.py")
+    ap.add_argument("--quick", action="store_true", help="coarse transport + coarse scan")
+    ap.add_argument("--eps", type=float, default=0.040)
+    ap.add_argument("--hs", type=float, default=0.002)
+    ap.add_argument("--eps-sweep", action="store_true")
+    ap.add_argument("--step-halving", action="store_true",
+                    help="audit the h_s dependence of ||K_z-K_0||_F: it is NOT a "
+                         "converged number, and this reports how far from "
+                         "converged it is")
+    ap.add_argument("--no-pulser-check", action="store_true")
+    ap.add_argument("--outdir", default=".")
+    ap.add_argument("--gamma-max-extra", type=float, default=0.0,
+                    help="if >0, append extra gammas up to this value")
+    ap.add_argument("--gap", type=float, default=0.0,
+                    help="idle gap in us inserted between drive segments; use "
+                         "0.340 to model AnalogDevice phase-jump delays")
+    ap.add_argument("--omega-scale", type=float, default=1.0,
+                    help="global rescale of the reference Rabi table; 0.8 brings "
+                         "it inside AnalogDevice's 2 MHz amplitude limit")
+    ap.add_argument("--phase-sign", type=float, default=1.0, choices=[1.0, -1.0],
+                    help="+1 = Pulser convention (default), -1 = manuscript's "
+                         "+sin(phi) Y convention applied to the same phase table")
+    ap.add_argument("--source-path", default=None,
+                    help="path to the archived source, for the provenance digest "
+                         "when running from a notebook cell (no __file__)")
+    ap.add_argument("--analog-report", action="store_true",
+                    help="compile onto AnalogDevice and quantify modulation damage")
+    if argv is None:
+        argv = [] if _in_notebook() else sys.argv[1:]
+    # parse_known_args so that a host environment injecting its own flags
+    # (Colab's "-f kernel-*.json") cannot kill the run
+    args, ignored = ap.parse_known_args(list(argv))
+    if ignored:
+        print(f"[note] ignoring arguments not belonging to this script: {ignored}")
+
+    global _SOURCE_PATH_OVERRIDE
+    if args.source_path:
+        _SOURCE_PATH_OVERRIDE = args.source_path
+    MODEL["gap_tau"] = float(args.gap)
+    MODEL["omega_scale"] = float(args.omega_scale)
+    MODEL["phase_sign"] = float(args.phase_sign)
+    os.makedirs(args.outdir, exist_ok=True)
+    logfile = open(os.path.join(args.outdir, "ep_obs_run.log"), "w")
+
+    def log(msg=""):
+        print(msg)
+        logfile.write(str(msg) + "\n")
+        logfile.flush()
+
+    h_s = 0.008 if args.quick else args.hs
+    cert = {
+        "version": VERSION,
+        "utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source_sha256": self_sha256(),
+        "packages": package_versions(),
+        "args": vars(args),
+        "model": {
+            "atoms": 2, "separation_um": ATOM_SEP, "C6": C6, "U_int": U_INT,
+            "tau_us": TAU, "n_segments": NSEG, "T_us": T_TOTAL,
+            "gap_tau_us": MODEL["gap_tau"], "omega_scale": MODEL["omega_scale"],
+            "phase_sign": MODEL["phase_sign"],
+            "schedule_duration_us": float(
+                sum(s_.tau for s_ in segments_of(np.zeros(18)))),
+            "dissipator": "occupation dephasing, sum_k D[n_k]",
+            "input_state": "|gg><gg| (only preparable state)",
+        },
+        "gates": {},
+    }
+
+    log("=" * 78)
+    log(f"{VERSION}  observable-level executed-path diagnostic (PASQAL / Pulser local)")
+    log("=" * 78)
+    log(f"UTC          : {cert['utc']}")
+    log(f"source sha256: {cert['source_sha256']}")
+    for k, v in cert["packages"].items():
+        log(f"  {k:20s} {v}")
+
+    # ---------------- Gate H0 : Hamiltonian convention -----------------------
+    if not args.no_pulser_check:
+        err, gg_ok = pulser_hamiltonian_probe()
+        cert["gates"]["H0_hamiltonian_matches_pulser"] = {
+            "max_abs_err": err, "init_state_is_gg": gg_ok, "pass": bool(err < 1e-9 and gg_ok)
+        }
+        log(f"\n[H0] internal H == Pulser H : max|dH| = {err:.3e}   init=|gg>: {gg_ok}")
+
+    U0 = unitary_of_z(np.zeros(18))
+
+    # ---------------- Gate H1 : phase-convention bookkeeping -----------------
+    # TRUE statement, verified here: H(-phi) = conj(H(phi)) elementwise.
+    # FALSE statement, explicitly NOT claimed: that this makes U(-phi) a simple
+    # function of U(phi). It does not - conjugating each factor transposes it,
+    # and transposition reverses the order of the time-ordered product. So the
+    # manuscript's +sin(phi) Y convention and Pulser's -sin(phi) Y convention,
+    # applied to the SAME numerical phase table, give genuinely different
+    # unitaries and different numerical values of ||K_z - K_0||. The structure
+    # of the result (fiber existence, rank, exponents, first-order law) is
+    # convention independent; the numbers are not. Use --phase-sign -1 to run
+    # the manuscript convention.
+    h_conj_err = float(
+        np.max(np.abs(hamiltonian(1.3, -0.7, -0.9) - hamiltonian(1.3, -0.7, 0.9).conj()))
+    )
+    U_plus = unitary_of_z(np.zeros(18), phase_sign=+1.0)
+    U_minus = unitary_of_z(np.zeros(18), phase_sign=-1.0)
+    u_flip_gap = float(np.max(np.abs(U_minus - U_plus.conj())))
+    cert["gates"]["H1_phase_convention_bookkeeping"] = {
+        "H_minus_phi_equals_conj_H": h_conj_err,
+        "U_flip_vs_conj_U_gap": u_flip_gap,
+        "pass": bool(h_conj_err < 1e-14),
+        "note": "gate is on the Hamiltonian identity only; the unitary gap is "
+                "reported because it is NOT expected to vanish",
+    }
+    log(f"[H1] H(-phi) == conj(H(phi)) : max|dH| = {h_conj_err:.3e}")
+    log(f"     (for the record, |U(-phi) - conj(U(phi))| = {u_flip_gap:.3e}, "
+        f"nonzero by construction - the ordered product does not conjugate)")
+
+    # ---------------- 1. freeze two equivalent controls ----------------------
+    log("\n" + "-" * 78)
+    log("STEP 1  freeze two full-unitary-equivalent controls (M2 lift)")
+    log("-" * 78)
+    results = {}
+    for direction in ("CW", "CCW"):
+        z, audit, eu = run_direction(direction, args.eps, h_s, U0, args, log)
+        results[direction] = {"z": z, "audit": audit, "eps_U": eu}
+
+    cert["gates"]["G1_endpoint_infidelity"] = {
+        d: results[d]["eps_U"] for d in results
+    }
+    cert["gates"]["G1_endpoint_infidelity"]["threshold"] = 1e-11
+    cert["gates"]["G1_endpoint_infidelity"]["pass"] = bool(
+        all(results[d]["eps_U"] <= 1e-11 for d in results)
+    )
+    cert["gates"]["G2_residual_norm"] = {
+        d: results[d]["audit"]["final_res"] for d in results
+    }
+    cert["gates"]["G2_residual_norm"]["threshold"] = 2e-9
+    cert["gates"]["G2_residual_norm"]["pass"] = bool(
+        all(results[d]["audit"]["final_res"] <= 2e-9 for d in results)
+    )
+    cert["gates"]["G3_rank_audit"] = {
+        d: {
+            "ranks": results[d]["audit"]["rank_set"],
+            "min_kept_sv": results[d]["audit"]["min_smin_keep"],
+            "max_dropped_sv": results[d]["audit"]["max_smax_drop"],
+            "gap": results[d]["audit"]["min_smin_keep"]
+            / max(results[d]["audit"]["max_smax_drop"], 1e-300),
+        }
+        for d in results
+    }
+    cert["gates"]["G3_rank_audit"]["pass"] = bool(
+        all(
+            results[d]["audit"]["rank_set"] == [8]
+            and results[d]["audit"]["min_smin_keep"]
+            / max(results[d]["audit"]["max_smax_drop"], 1e-300)
+            >= 1e4
+            for d in results
+        )
+    )
+    cert["gates"]["G4_distinct_controls"] = {
+        d: float(np.linalg.norm(results[d]["z"])) for d in results
+    }
+    cert["gates"]["G4_distinct_controls"]["pass"] = bool(
+        all(np.linalg.norm(results[d]["z"]) > 1e-6 for d in results)
+    )
+
+    # ---------------- G14 : transport convergence audit ----------------------
+    if args.step_halving:
+        log("\n" + "-" * 78)
+        log("G14  step-halving audit of the transport, both directions")
+        log("     ||K_z-K_0||_F is a property of the particular fiber point the")
+        log("     transport lands on. That point moves with h_s. The physics claim")
+        log("     (a distinct control with an identical endpoint exists, and its")
+        log("     first-order response predicts the split) holds at every h_s; the")
+        log("     numerical VALUE of ||dK|| does not converge quickly.")
+        log("-" * 78)
+        segs_ref = segments_of(np.zeros(18))
+        K0_ref = np.linalg.solve(ideal_channel(segs_ref),
+                                 channel_derivative(segs_ref))
+        LIFT_RES_MAX, LIFT_EPSU_MAX = 2e-9, 1e-11
+        g14 = {"lift_residual_threshold": LIFT_RES_MAX,
+               "endpoint_infidelity_threshold": LIFT_EPSU_MAX,
+               "directions": {}}
+        for direction in ("CW", "CCW"):
+            hist, rejected = {}, []
+            for hs_a in (h_s, h_s / 2, h_s / 4):
+                za, auda = m2_transport(U0, loop_vertices(args.eps, direction), hs_a)
+                eua = endpoint_infidelity(za, U0)
+                sg = segments_of(za)
+                dKa = np.linalg.solve(ideal_channel(sg),
+                                      channel_derivative(sg)) - K0_ref
+                rec = {
+                    "nominal_h_s": float(hs_a),
+                    "effective_h_s": auda["effective_h_s"],
+                    "effective_h_s_spread": auda["effective_h_s_spread"],
+                    "n_steps": auda["n_steps"],
+                    "lift_final_res": auda["final_res"],
+                    "max_lift_res": auda["max_lift_res"],
+                    "eps_U": eua,
+                    "RK": float(np.linalg.norm(dKa, "fro") / 16.0),
+                    "z_norm": float(np.linalg.norm(za)),
+                }
+                # a silently failed lift must never enter the extrapolation
+                rec["usable"] = bool(auda["final_res"] <= LIFT_RES_MAX
+                                     and eua <= LIFT_EPSU_MAX)
+                if rec["usable"]:
+                    # keyed by the NOMINAL step, which is distinct by construction.
+                    # Keying by the effective step would silently drop a grid
+                    # whenever round(L/h_s) quantization makes two grids coincide.
+                    hist[hs_a] = (za, rec["RK"], rec)
+                else:
+                    rejected.append(rec)
+                    log(f"  [{direction}] h_s={hs_a:.5f} REJECTED: "
+                        f"|r|={auda['final_res']:.2e}, eps_U={eua:.2e}")
+                log(f"  [{direction}] h_s nominal {hs_a:.5f} / effective "
+                    f"{auda['effective_h_s']:.5f} (spread "
+                    f"{auda['effective_h_s_spread']:.1e}, {auda['n_steps']} steps)"
+                    f"   ||dK||_F/16 = {rec['RK']:.7e}   |r| = "
+                    f"{auda['final_res']:.2e}   eps_U = {eua:.2e}")
+            entry = {"grids": [hist[k][2] for k in sorted(hist, reverse=True)],
+                     "rejected": rejected}
+            ks = sorted(hist, reverse=True)          # nominal, coarsest first
+            eff = {k: hist[k][2]["effective_h_s"] for k in ks}
+            # round(L/h_s) quantization can make two nominal grids share the same
+            # effective step; that breaks the refinement assumption entirely
+            n_distinct = len({round(v, 15) for v in eff.values()})
+            entry["effective_h_s"] = {f"nominal={k}": eff[k] for k in ks}
+            entry["distinct_effective_grids"] = n_distinct
+            if n_distinct < len(ks):
+                log(f"  [{direction}] !! quantization collapsed {len(ks)} nominal "
+                    f"grids onto {n_distinct} effective ones; refinement is not "
+                    f"actually happening. Reduce h_s or increase eps.")
+            deltas = []
+            for a, b in zip(ks[:-1], ks[1:]):
+                dz = float(np.linalg.norm(hist[b][0] - hist[a][0])
+                           / np.linalg.norm(hist[b][0]))
+                dk = float(abs(hist[b][1] - hist[a][1]) / hist[b][1])
+                ea, eb = eff[a], eff[b]
+                deltas.append({"from_effective_h_s": ea, "to_effective_h_s": eb,
+                               "refinement_ratio": float(ea / eb) if eb > 0 else
+                               float("inf"),
+                               "delta_z": dz, "delta_K": dk})
+                log(f"  [{direction}] {ea:.5f} -> {eb:.5f} "
+                    f"(ratio {ea/eb:.4f}): delta_z = {dz:.4f}   "
+                    f"delta_K = {dk:.4f}")
+            entry["deltas"] = deltas
+            if len(ks) >= 2 and n_distinct >= 2:
+                # first-order Richardson on the ACTUAL effective steps:
+                #   f0 = f(h2) + (f(h2) - f(h1)) * h2 / (h1 - h2)
+                # reduces to 2 f(h2) - f(h1) only when h1 = 2 h2 exactly
+                h1, h2 = eff[ks[-2]], eff[ks[-1]]
+                f1, f2 = hist[ks[-2]][1], hist[ks[-1]][1]
+                if h1 - h2 <= 1e-12 * max(h1, 1e-30):
+                    rich = float("nan")
+                    log(f"  [{direction}] two finest effective steps coincide; "
+                        f"Richardson extrapolation skipped")
+                else:
+                    rich = f2 + (f2 - f1) * h2 / (h1 - h2)
+                entry["richardson_h_to_0"] = float(rich)
+                entry["richardson_used"] = {"h1": h1, "h2": h2}
+                log(f"  [{direction}] first-order extrapolate h_s -> 0 : "
+                    f"||dK||_F/16 ~ {rich:.4e}")
+                log(f"  [{direction}] -> quote at most 2 significant figures "
+                    f"({f2:.2e}); further digits are an artefact of h_s.")
+            ratios_ok = all(1.5 <= d["refinement_ratio"] <= 3.0 for d in deltas)
+            entry["refinement_ratios_ok"] = bool(ratios_ok)
+            entry["pass"] = bool(
+                not rejected
+                and len(ks) == 3
+                and n_distinct == 3
+                and ratios_ok
+                and np.isfinite(entry.get("richardson_h_to_0", np.nan))
+                and all(d["delta_z"] <= 0.02 and d["delta_K"] <= 0.02
+                        for d in deltas)
+            )
+            g14["directions"][direction] = entry
+        g14["pass"] = bool(all(v["pass"] for v in g14["directions"].values()))
+        g14["note"] = ("passing does NOT mean ||dK|| is converged; convergence is "
+                       "first order and the value still drifts in the third "
+                       "significant figure. Grids whose lift did not meet the "
+                       "residual and endpoint thresholds are rejected and excluded "
+                       "from the extrapolation.")
+        cert["gates"]["G14_transport_step_halving"] = g14
+
+    # ---------------- 2. re-verify AFTER compilation -------------------------
+    log("\n" + "-" * 78)
+    log("STEP 2  compile to Pulser and re-verify the ideal endpoint from the")
+    log("        waveform actually scheduled (not from the analytic segments)")
+    log("-" * 78)
+    if not args.no_pulser_check:
+        comp = {}
+        for tag, z in [("z0", np.zeros(18))] + [(d, results[d]["z"]) for d in results]:
+            segs = segments_of(z)
+            seq = build_pulser_sequence(segs, "mock")
+            Uc = unitary_from_compiled_samples(seq)
+            Ua = unitary_of_z(z)
+            comp[tag] = {
+                "compiled_vs_analytic_maxabs": float(np.max(np.abs(Uc - Ua))),
+                "compiled_eps_U_vs_U0": float(
+                    abs(1.0 - abs(np.trace(U0.conj().T @ Uc)) ** 2 / DIM**2)
+                ),
+            }
+            log(f"  {tag:4s}  ||U_compiled - U_analytic||_max = "
+                f"{comp[tag]['compiled_vs_analytic_maxabs']:.3e}   "
+                f"eps_U(compiled vs U0) = {comp[tag]['compiled_eps_U_vs_U0']:.3e}")
+        cert["gates"]["G5_post_compilation_endpoint"] = comp
+        cert["gates"]["G5_post_compilation_endpoint"]["pass"] = bool(
+            all(v["compiled_eps_U_vs_U0"] <= 1e-11 for v in comp.values())
+        )
+        # AnalogDevice feasibility (honest report, not a pass/fail of the physics)
+        try:
+            build_pulser_sequence(segments_of(np.zeros(18)), "analog")
+            analog_msg = "AnalogDevice accepted the reference sequence"
+            analog_ok = True
+        except Exception as exc:
+            analog_msg = f"AnalogDevice REJECTED: {type(exc).__name__}: {exc}"
+            analog_ok = False
+        log(f"  [device] {analog_msg}")
+        cert["gates"]["G5b_analog_device_compilable"] = {
+            "ok": analog_ok, "message": analog_msg
+        }
+
+    # ---------------- 3-5. response operators + observable design ------------
+    log("\n" + "-" * 78)
+    log("STEP 3  path-resolved response and observable design")
+    log("-" * 78)
+    segs0 = segments_of(np.zeros(18))
+    G0 = channel_derivative(segs0)
+    U0_sup = ideal_channel(segs0)
+    K0 = np.linalg.solve(U0_sup, G0)
+
+    design = {}
+    for d in results:
+        segs = segments_of(results[d]["z"])
+        Gz = channel_derivative(segs)
+        dG = Gz - G0
+        Kz = np.linalg.solve(ideal_channel(segs), Gz)
+        dK = Kz - K0
+        RK = float(np.linalg.norm(dK, "fro") / 16.0)
+        # consistency: dG should equal U0_sup @ dK
+        num = float(np.linalg.norm(dG - U0_sup @ dK, "fro"))
+        den = 0.5 * (np.linalg.norm(dG, "fro") + np.linalg.norm(U0_sup @ dK, "fro"))
+        delta_common = float(num / max(den, 1e-300))
+        best, rows, bound = scan_readout(dG, quick=args.quick)
+        om_ro, ph_ro, mname, chi = best
+        design[d] = {
+            "RK": RK,
+            "delta_common": delta_common,
+            "readout_omega": float(om_ro),
+            "readout_phi": float(ph_ro),
+            "readout_tau": 0.100,
+            "observable": mname,
+            "chi": float(chi),
+            "chi_bound_trace_norm": bound,
+            "dG": dG,
+        }
+        log(f"  {d:4s}  ||K_z-K_0||_F/16 = {RK:.7e}   delta_common = {delta_common:.2e}")
+        log(f"        best readout: Omega/2pi = {om_ro/(2*np.pi):.4f} MHz, "
+            f"phi = {ph_ro:.4f} rad, tau = 100 ns")
+        log(f"        best observable: {mname:6s}  chi = {chi:+.7e}  "
+            f"(bound over all M with ||M||<=1: {bound:.3e})")
+
+    cert["gates"]["G6_delta_common"] = {
+        d: design[d]["delta_common"] for d in design
+    }
+    cert["gates"]["G6_delta_common"]["threshold"] = 1e-8
+    cert["gates"]["G6_delta_common"]["pass"] = bool(
+        all(design[d]["delta_common"] <= 1e-8 for d in design)
+    )
+
+    # ---------------- 6. gamma sweep, exact Lindblad -------------------------
+    log("\n" + "-" * 78)
+    log("STEP 4-6  gamma sweep, exact Lindblad, parameter-free slope prediction")
+    log("-" * 78)
+    gammas = GAMMAS.copy()
+    if args.gamma_max_extra > 0:
+        extra = np.geomspace(GAMMAS[-1] * 2, args.gamma_max_extra, 4)
+        gammas = np.concatenate([gammas, extra])
+
+    csv_rows = []
+    for d in design:
+        ro = Segment(design[d]["readout_omega"], 0.0, design[d]["readout_phi"],
+                     design[d]["readout_tau"])
+        segs_z = segments_of(results[d]["z"], readout=ro)
+        segs_0 = segments_of(np.zeros(18), readout=ro)
+        M = OBSERVABLES[design[d]["observable"]]
+        chi = design[d]["chi"]
+        dP, Pz, P0, DE = [], [], [], []
+        for g in gammas:
+            Ez = channel(segs_z, g)
+            E0 = channel(segs_0, g)
+            pz = observable_value(M, Ez)
+            p0 = observable_value(M, E0)
+            Pz.append(pz)
+            P0.append(p0)
+            dP.append(pz - p0)
+            DE.append(float(np.linalg.norm(Ez - E0, "fro") / 16.0))
+        dP = np.array(dP)
+        DE = np.array(DE)
+        pred = chi * gammas
+        resid = np.abs(dP - pred)
+        rel = np.where(np.abs(dP) > 0, resid / np.maximum(np.abs(dP), 1e-300), np.nan)
+        p_signal = loglog_slope(gammas, np.abs(dP))
+        p_resid = loglog_slope(gammas, resid)
+        max_rel = float(np.nanmax(rel[gammas > 0]))
+        floor = float(abs(dP[0]))
+        design[d].update(
+            dict(gammas=gammas, dP=dP, DE=DE, pred=pred, resid=resid,
+                 Pz=np.array(Pz), P0=np.array(P0),
+                 p_signal=p_signal, p_resid=p_resid, max_rel=max_rel, floor=floor)
+        )
+        log(f"\n  === {d} ===  observable {design[d]['observable']}, "
+            f"predicted slope chi = {chi:+.7e}")
+        log(f"   {'gamma':>10s} {'P_z':>14s} {'P_z0':>14s} {'DeltaP':>13s} "
+            f"{'gamma*chi':>13s} {'residual':>11s} {'rel.err':>9s}")
+        for i, g in enumerate(gammas):
+            log(f"   {g:10.6f} {Pz[i]:14.10f} {P0[i]:14.10f} {dP[i]:+13.6e} "
+                f"{pred[i]:+13.6e} {resid[i]:11.4e} "
+                f"{'' if g == 0 else f'{rel[i]:9.3%}'}")
+            csv_rows.append(dict(direction=d, gamma=g, P_z=Pz[i], P_z0=P0[i],
+                                 dP=dP[i], pred=pred[i], residual=resid[i],
+                                 D_E=DE[i], observable=design[d]["observable"]))
+        log(f"   zero-noise floor |DeltaP(0)| = {floor:.3e}")
+        log(f"   log-log exponent of |DeltaP| : {p_signal:.6f}   (target 1)")
+        log(f"   log-log exponent of residual : {p_resid:.6f}   (target 2)")
+        log(f"   max relative error           : {max_rel:.4%}")
+
+    cert["gates"]["G7_signal_exponent"] = {d: design[d]["p_signal"] for d in design}
+    cert["gates"]["G7_signal_exponent"]["window"] = [0.94, 1.06]
+    cert["gates"]["G7_signal_exponent"]["pass"] = bool(
+        all(0.94 <= design[d]["p_signal"] <= 1.06 for d in design)
+    )
+    cert["gates"]["G8_residual_exponent"] = {d: design[d]["p_resid"] for d in design}
+    cert["gates"]["G8_residual_exponent"]["window"] = [1.85, 2.15]
+    cert["gates"]["G8_residual_exponent"]["pass"] = bool(
+        all(1.85 <= design[d]["p_resid"] <= 2.15 for d in design)
+    )
+    cert["gates"]["G9_max_relative_error"] = {d: design[d]["max_rel"] for d in design}
+    cert["gates"]["G9_max_relative_error"]["threshold"] = 0.03
+    cert["gates"]["G9_max_relative_error"]["pass"] = bool(
+        all(design[d]["max_rel"] <= 0.03 for d in design)
+    )
+    cert["gates"]["G10_signal_over_zero_noise_floor"] = {
+        d: float(abs(design[d]["dP"][1]) / max(design[d]["floor"], 1e-300))
+        for d in design
+    }
+    cert["gates"]["G10_signal_over_zero_noise_floor"]["threshold"] = 1e5
+    cert["gates"]["G10_signal_over_zero_noise_floor"]["pass"] = bool(
+        all(
+            abs(design[d]["dP"][1]) / max(design[d]["floor"], 1e-300) >= 1e5
+            for d in design
+        )
+    )
+
+    # ---------------- Pulser emulator cross-check ----------------------------
+    if not args.no_pulser_check:
+        log("\n" + "-" * 78)
+        log("VALIDATION AGAINST PULSER  (three independent levels)")
+        log("-" * 78)
+        d0 = list(design)[0]
+        ro = Segment(design[d0]["readout_omega"], 0.0, design[d0]["readout_phi"],
+                     design[d0]["readout_tau"])
+        val = pulser_validation(segments_of(results[d0]["z"], readout=ro))
+        log(f"  L1  our H(t) vs Pulser H(t)            : {val['L1_hamiltonian_max_abs_err']:.3e}")
+        log(f"  L2  exact product of Pulser's own H(t) : {val['L2_exact_propagation_max_abs_err']:.3e}")
+        for k, v in val["L3_qutip_run_max_abs_err"].items():
+            log(f"  L3  QutipEmulator.run(), {k:14s}: {v:.3e}")
+        sig = abs(design[d0]["dP"][-1])
+        worst_l3 = max(val["L3_qutip_run_max_abs_err"].values())
+        log(f"\n  path signal to be resolved             : {sig:.3e}")
+        log(f"  QutipEmulator.run() systematic error   : {worst_l3:.3e}"
+            f"   ({worst_l3/max(sig,1e-300):.1f}x the signal)")
+        log("  -> the emulator's ODE path is unusable here; all numbers above")
+        log("     come from exact Liouville propagation, validated by L1 and L2.")
+        cert["gates"]["G11a_model_matches_pulser"] = {
+            "L1": val["L1_hamiltonian_max_abs_err"],
+            "L2": val["L2_exact_propagation_max_abs_err"],
+            "threshold": 1e-10,
+            "pass": bool(val["L1_hamiltonian_max_abs_err"] < 1e-10
+                         and val["L2_exact_propagation_max_abs_err"] < 1e-10),
+        }
+        cert["gates"]["G11b_qutip_run_resolves_signal"] = {
+            "worst_abs_err": worst_l3,
+            "signal": sig,
+            "ratio_err_over_signal": float(worst_l3 / max(sig, 1e-300)),
+            "pass": bool(worst_l3 < 0.1 * sig),
+            "note": "expected FAIL: QutipEmulator.run() interpolates the sampled "
+                    "waveform and carries ~1e-3 systematic error on square pulses. "
+                    "Recorded as a documented limitation, not used as the engine.",
+        }
+
+    # ---------------- AnalogDevice reality report ----------------------------
+    if args.analog_report and not args.no_pulser_check:
+        log("\n" + "-" * 78)
+        log("HARDWARE REALITY  compile onto AnalogDevice; separate the two effects")
+        log("  (a) phase-jump idle gaps   (deterministic, modellable)")
+        log("  (b) 8 MHz modulation       (breaks the endpoint equivalence)")
+        log("-" * 78)
+        d0 = list(design)[0]
+        ro = Segment(design[d0]["readout_omega"], 0.0, design[d0]["readout_phi"],
+                     design[d0]["readout_tau"])
+        zmap = {"z0": np.zeros(18)}
+        zmap.update({d: results[d]["z"] for d in results})
+        rep = analog_schedule_report(zmap, U0, design[d0]["observable"], ro, log)
+        cert["analog_report"] = rep
+        if rep.get("compilable"):
+            sig = abs(design[d0]["dP"][-1])
+            coh = rep.get(f"{d0}_coherent_dP_from_modulation", float("inf"))
+            log(f"\n  path signal at gamma={design[d0]['gammas'][-1]:g}: |dP| = {sig:.3e}")
+            log(f"  modulation artefact at gamma=0 : |dP| = {coh:.3e}")
+            log(f"  signal / artefact = {sig / max(coh, 1e-300):.3e}")
+            cert["gates"]["G13_signal_over_modulation_artefact"] = {
+                "signal": sig, "artefact": coh,
+                "ratio": float(sig / max(coh, 1e-300)),
+                "threshold": 10.0,
+                "pass": bool(sig / max(coh, 1e-300) >= 10.0),
+                "note": "a FAIL means the control must be re-lifted on the "
+                        "modulated schedule before any hardware run",
+            }
+
+    # ---------------- 7. shot budget (the reality check) ---------------------
+    log("\n" + "-" * 78)
+    log("FEASIBILITY  shots required to resolve the split at 5 sigma")
+    log("-" * 78)
+    feas = {}
+    for d in design:
+        ro = Segment(design[d]["readout_omega"], 0.0, design[d]["readout_phi"],
+                     design[d]["readout_tau"])
+        segs_z = segments_of(results[d]["z"], readout=ro)
+        segs_0 = segments_of(np.zeros(18), readout=ro)
+        M = OBSERVABLES[design[d]["observable"]]
+        g = design[d]["gammas"][-1]
+        Ez, E0 = channel(segs_z, g), channel(segs_0, g)
+        vz, v0 = observable_variance(M, Ez), observable_variance(M, E0)
+        dp = abs(observable_value(M, Ez) - observable_value(M, E0))
+        n5 = 25.0 * (vz + v0) / max(dp, 1e-300) ** 2
+        feas[d] = {"gamma": float(g), "abs_dP": dp, "var_z": vz, "var_0": v0,
+                   "shots_per_arm_5sigma": n5}
+        log(f"  {d}: at gamma = {g:g} 1/us, |DeltaP| = {dp:.3e}, "
+            f"Var = {vz:.4f}/{v0:.4f}")
+        log(f"      shots per arm for 5 sigma: {n5:.3e}")
+    cert["feasibility"] = feas
+    worst = max(feas[d]["shots_per_arm_5sigma"] for d in feas)
+    cert["gates"]["G12_shot_budget_practical"] = {
+        "max_shots_per_arm_5sigma": worst,
+        "threshold": 1e8,
+        "pass": bool(worst <= 1e8),
+        "note": "informational; a FAIL means the eps=0.04 fiber loop is too small "
+                "for an observable-level experiment, not that the physics is wrong",
+    }
+    log(f"\n  [G12] worst-case shots per arm = {worst:.3e}  "
+        f"({'FEASIBLE' if worst <= 1e8 else 'NOT FEASIBLE at this loop scale'})")
+
+    # ---------------- 8. optional design sweep over loop scale ---------------
+    if args.eps_sweep:
+        log("\n" + "-" * 78)
+        log("DESIGN SWEEP  loop scale eps -> response, slope, required shots")
+        log("-" * 78)
+        sweep = []
+        gam_probe = (0.03, 0.10, 0.30)
+        log(f"  columns: eps | eps_U | ||dK||_F/16 | M | chi | then per gamma in "
+            f"{gam_probe}: |dP|, shots(5sigma), linearity error")
+        for eps in (0.04, 0.08, 0.16, 0.32, 0.64, 1.00):
+            hs = max(4 * eps / 120.0, 0.002)
+            try:
+                z, audit = m2_transport(U0, loop_vertices(eps, "CW"), hs)
+            except Exception as exc:
+                log(f"  eps={eps:5.2f}: lift failed ({exc})")
+                continue
+            eu = endpoint_infidelity(z, U0)
+            om, dl, ph = controls_from_z(z)
+            segs = segments_of(z)
+            Gz_ = channel_derivative(segs)
+            dG = Gz_ - G0
+            dK = np.linalg.solve(ideal_channel(segs), Gz_) - K0
+            RK = float(np.linalg.norm(dK, "fro") / 16.0)
+            best, _, bound = scan_readout(dG, quick=True)
+            chi = best[3]
+            ro = Segment(best[0], 0.0, best[1], 0.100)
+            M = OBSERVABLES[best[2]]
+            segs_z = segments_of(z, readout=ro)
+            segs_0 = segments_of(np.zeros(18), readout=ro)
+            per_gamma = {}
+            for g in gam_probe:
+                Ez, E0e = channel(segs_z, g), channel(segs_0, g)
+                dp = observable_value(M, Ez) - observable_value(M, E0e)
+                n5 = 25.0 * (observable_variance(M, Ez) + observable_variance(M, E0e)) \
+                    / max(abs(dp), 1e-300) ** 2
+                lin = abs(abs(dp) - abs(chi * g)) / max(abs(dp), 1e-300)
+                per_gamma[f"gamma_{g}"] = {"abs_dP": abs(dp),
+                                           "shots_5sigma": n5,
+                                           "linearity_rel_err": lin}
+            rec = dict(eps=eps, h_s=hs, eps_U=eu, RK=RK, observable=best[2],
+                       chi=float(chi), per_gamma=per_gamma,
+                       max_Omega_over_2pi=float(np.max(om) / (2 * np.pi)),
+                       min_Omega_over_2pi=float(np.min(om) / (2 * np.pi)),
+                       z_norm=float(np.linalg.norm(z)))
+            sweep.append(rec)
+            tail = "  ".join(
+                f"[g={g}: |dP|={per_gamma[f'gamma_{g}']['abs_dP']:.2e} "
+                f"N={per_gamma[f'gamma_{g}']['shots_5sigma']:.1e} "
+                f"lin={per_gamma[f'gamma_{g}']['linearity_rel_err']:.1%}]"
+                for g in gam_probe)
+            log(f"  eps={eps:5.2f} eU={eu:7.1e} ||dK||/16={RK:8.2e} {best[2]:5s} "
+                f"chi={chi:+9.2e}  {tail}")
+            log(f"        Omega/2pi in [{np.min(om)/(2*np.pi):.2f},"
+                f"{np.max(om)/(2*np.pi):.2f}] MHz  (AnalogDevice limit 2.00 MHz)")
+        # design recommendation
+        DEV_LIMIT_MHZ = 2.0  # AnalogDevice rydberg_global max_amp / 2pi
+        ok = [r for r in sweep
+              if r["max_Omega_over_2pi"] <= DEV_LIMIT_MHZ
+              and min(r["per_gamma"][f"gamma_{g}"]["shots_5sigma"]
+                      for g in gam_probe) <= 1e7]
+        over = [r for r in sweep
+                if r["max_Omega_over_2pi"] > DEV_LIMIT_MHZ
+                and min(r["per_gamma"][f"gamma_{g}"]["shots_5sigma"]
+                        for g in gam_probe) <= 1e7]
+        log("")
+        if ok:
+            b = min(ok, key=lambda r: min(
+                r["per_gamma"][f"gamma_{g}"]["shots_5sigma"] for g in gam_probe))
+            log(f"  RECOMMENDATION: eps >= {b['eps']:g} with gamma >= 0.1 1/us brings "
+                f"the split within ~1e7 shots per arm, with Omega inside the "
+                f"AnalogDevice limit.")
+        elif over:
+            b = min(over, key=lambda r: r["eps"])
+            log(f"  RECOMMENDATION: the shot budget only becomes reasonable at "
+                f"eps >= {b['eps']:g} (>=1e7 -> "
+                f"{min(b['per_gamma'][f'gamma_{g}']['shots_5sigma'] for g in gam_probe):.1e}"
+                f" shots), but that lift drives Omega/2pi to "
+                f"{b['max_Omega_over_2pi']:.2f} MHz, above the {DEV_LIMIT_MHZ:.2f} MHz "
+                f"AnalogDevice limit. Rescale the reference table first "
+                f"(--omega-scale ~0.8) and re-run the sweep; the fiber structure is "
+                f"unchanged by a uniform rescale of Omega only up to the fixed C6 "
+                f"term, so the sweep must actually be redone, not extrapolated.")
+        else:
+            log("  RECOMMENDATION: no (eps, gamma) in the scanned box reaches 1e7 "
+                "shots per arm. The observable-level experiment is not feasible "
+                "for this reference control without a larger fiber excursion or a "
+                "stronger controllable noise lever.")
+        log("  Note: at gamma >= 0.1 the O(gamma^2) term is no longer negligible; "
+            "the parameter-free LINEAR prediction must then be replaced by a "
+            "second-order one, or gamma extrapolated to zero from the scan.")
+        cert["eps_sweep"] = sweep
+
+    # ---------------- outputs ------------------------------------------------
+    with open(os.path.join(args.outdir, "ep_obs_gamma_scan.csv"), "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(csv_rows[0].keys()))
+        w.writeheader()
+        w.writerows(csv_rows)
+
+    ctrl = {"z0": np.zeros(18).tolist()}
+    for d in results:
+        ctrl[d] = results[d]["z"].tolist()
+    with open(os.path.join(args.outdir, "ep_obs_controls.json"), "w") as fh:
+        json.dump(ctrl, fh, indent=2)
+
+    for d in design:
+        for k in ("dG",):
+            design[d].pop(k, None)
+        for k in ("gammas", "dP", "DE", "pred", "resid", "Pz", "P0"):
+            design[d][k] = np.asarray(design[d][k]).tolist()
+    cert["design"] = design
+    cert["lift_audit"] = {d: results[d]["audit"] for d in results}
+
+    all_pass = all(
+        v.get("pass", True) for v in cert["gates"].values() if isinstance(v, dict)
+    )
+    cert["ALL_GATES_PASS"] = bool(all_pass)
+    with open(os.path.join(args.outdir, "ep_obs_certificate.json"), "w") as fh:
+        json.dump(cert, fh, indent=2, default=float)
+
+    log("\n" + "=" * 78)
+    log("GATE SUMMARY")
+    log("=" * 78)
+    for name, val in cert["gates"].items():
+        if isinstance(val, dict) and "pass" in val:
+            log(f"  {'PASS' if val['pass'] else 'FAIL'}  {name}")
+    log(f"\n  ALL GATES PASS: {all_pass}")
+    log("\nwritten: ep_obs_certificate.json, ep_obs_gamma_scan.csv, "
+        "ep_obs_controls.json, ep_obs_run.log")
+
+    # figure
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(1, 2, figsize=(11, 4.2))
+        for d, c in zip(design, ("tab:blue", "tab:orange")):
+            g = np.array(design[d]["gammas"])
+            dP = np.abs(np.array(design[d]["dP"]))
+            pr = np.abs(np.array(design[d]["pred"]))
+            rs = np.array(design[d]["resid"])
+            m = g > 0
+            ax[0].loglog(g[m], dP[m], "o-", color=c,
+                         label=f"{d} exact |$\\Delta P$| ({design[d]['observable']})")
+            ax[0].loglog(g[m], pr[m], "--", color=c, label=f"{d} $\\gamma\\chi$ (no fit)")
+            ax[1].loglog(g[m], rs[m], "s-", color=c,
+                         label=f"{d} residual, slope={design[d]['p_resid']:.3f}")
+        ax[0].set_xlabel(r"$\gamma$  [$\mu s^{-1}$]")
+        ax[0].set_ylabel(r"$|\Delta P|$")
+        ax[0].set_title("observable-level split, parameter-free prediction")
+        ax[0].legend(fontsize=7)
+        ax[0].grid(alpha=.3, which="both")
+        ax[1].set_xlabel(r"$\gamma$  [$\mu s^{-1}$]")
+        ax[1].set_ylabel(r"$|\Delta P - \gamma\chi|$")
+        ax[1].set_title("residual (expected slope 2)")
+        ax[1].legend(fontsize=7)
+        ax[1].grid(alpha=.3, which="both")
+        fig.tight_layout()
+        fig.savefig(os.path.join(args.outdir, "ep_obs_prediction.png"), dpi=160)
+        log("written: ep_obs_prediction.png")
+    except Exception as exc:
+        log(f"(figure skipped: {exc})")
+
+    logfile.close()
+
+
+def run(**kwargs):
+    """Notebook entry point.
+
+        import pasqal_local_observable_path_split as ep
+        ep.run(quick=True, analog_report=True, outdir="out")
+
+    Booleans map to flags, everything else to "--key value". Underscores in the
+    keyword become dashes, so eps_sweep -> --eps-sweep.
+    """
+    argv = []
+    for key, val in kwargs.items():
+        flag = "--" + key.replace("_", "-")
+        if isinstance(val, bool):
+            if val:
+                argv.append(flag)
+        else:
+            argv += [flag, str(val)]
+    return main(argv)
 
 
 if __name__ == "__main__":
