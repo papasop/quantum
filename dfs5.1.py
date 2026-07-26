@@ -1,14 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DFS CHANNEL-COST + JOINT IDENTIFICATION + MISSPECIFICATION SWEEP v5.0
-=====================================================================
+DFS OPERATIONAL PROTOCOL + CHANNEL SUPPORT AUDIT v6.0
+=====================================================
 
-Rewrite of v3.1 (v4 lineage).  Every gate in this script can fail, and every
-gate class has been observed to fail on an injected defect.
+Protocol-first upgrade of v5.1.  The operational primitive is a predeclared
+preparation/evolution/readout protocol Pi, not an isolated scalar chosen after
+seeing a desired zero.  The script distinguishes four objects:
 
-What v5 adds over v4
---------------------
+  1. local model rate       j_Pi(rho) = Tr(L_0^dagger L_0 rho),
+  2. accumulated cost       J_Pi[rho] = integral j_Pi(rho_t) dt,
+  3. finite channel witness E_ch      = 1/2 ||J(E_noisy)-J(E_ideal)||_1,
+  4. abstract tangent F     = NOT CONSTRUCTED by this script.
+
+What v6 adds over v5.1
+----------------------
+  L0    A frozen protocol manifest is serialized and hashed before any outcome
+        is computed.
+  L1A   The collective-dephasing DFS is certified algebraically as the kernel
+        of the predeclared local rate and as an invariant subspace of H.
+  L1B   A finite nonconstant trajectory is propagated inside that kernel.  Its
+        accumulated declared jump cost and dissipator activity vanish.
+  L1C   The same frozen meter gives positive cost on a control state.
+  L1D   A contraction family H_epsilon=epsilon H gives nonconstant zero-cost
+        paths for every epsilon>0 and approaches the constant path as
+        epsilon->0.  This is the finite-attainment/integrability witness.
+  L2+   The v5.1 channel reduction, symmetry-opening law, calibration, joint
+        identification, negative controls, and misspecification sweeps remain
+        as model support rather than as a universal Principle-R claim.
+
+Inherited v5 additions
+----------------------
   L1.0  The encoded channel is REDUCED, exactly, to a one-qubit channel
         (H_L = J X_L, single jump sqrt(gamma) delta Z_L).  Everything else in
         Layer 1 -- the exact zero at delta=0, the absence of leakage, the
@@ -34,8 +56,9 @@ imbalanced collective-dephasing jump
 
     L_delta = sqrt(gamma) [ Z1 + (1 + delta) Z2 ].
 
-Cost is the normalized Choi-state trace distance between the encoded noisy and
-encoded ideal channels,  E_ch = 1/2 || J(noisy) - J(ideal) ||_1.
+The finite channel witness is the normalized Choi-state trace distance between
+the encoded noisy and encoded ideal channels,
+E_ch = 1/2 || J(noisy) - J(ideal) ||_1.  E_ch is not the local cost density.
 
 Gates:
   L1.1  E_ch(delta=0) = 0 over a *duration sweep*, not one time.
@@ -87,7 +110,7 @@ control parameter, not an estimated quantity; only gamma is inferred.
 
 Run:
     pip install -U numpy scipy matplotlib
-    python dfs_channel_cost_calibration_v4.py
+    python dfs_operational_v6.py
 """
 from __future__ import annotations
 
@@ -117,7 +140,7 @@ import numpy as np
 from scipy.linalg import expm
 from scipy.optimize import minimize_scalar
 
-VERSION = "DFS-CHANNEL-COST-JOINT-ID-MISSPEC-v5.1"
+VERSION = "DFS-OPERATIONAL-PROTOCOL-v6.0"
 
 
 # ----------------------------------------------------------------------------
@@ -128,6 +151,15 @@ class Config:
     exchange_J: float = 1.0
     true_gamma: float = 0.20
     target_duration: float = math.pi / 2.0
+
+    # --- Layer 0/1: protocol-first operational audit ---
+    # The path is sampled only after the protocol manifest has been written.
+    trajectory_samples: int = 401
+    contraction_epsilons: tuple[float, ...] = (
+        1.0, 0.5, 0.25, 0.125, 0.0625,
+    )
+    nonconstant_trace_distance_minimum: float = 1.0e-8
+    contraction_monotonic_tolerance: float = 1.0e-13
 
     # --- Layer 1 ---
     duration_sweep: tuple[float, ...] = (0.1, 0.5, math.pi / 2.0, 2.0, 5.0, 25.0)
@@ -290,7 +322,7 @@ def save_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def create_unique_output_dir(requested: str | None) -> Path:
     base = Path(
         requested
-        or f"dfs_channel_v5_1_{time.strftime('%Y%m%d_%H%M%S')}"
+        or f"dfs_operational_v6_{time.strftime('%Y%m%d_%H%M%S')}"
     )
     for candidate in [base] + [
         base.with_name(f"{base.name}_run{i:02d}") for i in range(2, 1000)
@@ -329,6 +361,296 @@ def build_operators(cfg: Config) -> dict[str, np.ndarray]:
         "V": np.column_stack([ket(1), ket(2)]),
         "I4": np.eye(4, dtype=complex),
     }
+
+
+def protocol_manifest(cfg: Config) -> dict[str, Any]:
+    """Predeclare the operational experiment before computing any outcome."""
+    return {
+        "protocol_id": "collective-dephasing-DFS-Pi-v1",
+        "model_domain": "exact two-qubit Lindblad model",
+        "basis_order": ["|00>", "|01>", "|10>", "|11>"],
+        "preparation": {
+            "zero_path_input": "|01>",
+            "positive_control_input": "(|00>+|01>)/sqrt(2)",
+        },
+        "hamiltonian": "H=(J/2)(XX+YY)",
+        "declared_meter": {
+            "jump": "L0=sqrt(gamma)(Z1+Z2)",
+            "local_rate": "j_Pi(rho)=Tr(L0^dagger L0 rho)",
+            "accumulated_cost": "J_Pi[rho]=integral_0^T j_Pi(rho_t) dt",
+            "dissipator_activity": "||D[L0](rho_t)||_F",
+        },
+        "finite_channel_witness": (
+            "E_ch=1/2||J(encoded noisy channel)-J(encoded ideal channel)||_1"
+        ),
+        "frozen_parameters": {
+            "exchange_J": cfg.exchange_J,
+            "gamma": cfg.true_gamma,
+            "duration": cfg.target_duration,
+            "trajectory_samples": cfg.trajectory_samples,
+            "contraction_epsilons": cfg.contraction_epsilons,
+        },
+        "decision_rules": {
+            "exact_zero_tolerance": cfg.exact_zero_tolerance,
+            "leakage_tolerance": cfg.leakage_tolerance,
+            "nonconstant_trace_distance_minimum": (
+                cfg.nonconstant_trace_distance_minimum
+            ),
+        },
+        "claim_boundary": (
+            "The protocol defines a model-local jump cost. It does not define "
+            "zero total energy, a universal tangent density F, Principle R, "
+            "or Lorentzian signature."
+        ),
+    }
+
+
+def dissipator(jump: np.ndarray, rho: np.ndarray) -> np.ndarray:
+    kernel = jump.conj().T @ jump
+    return jump @ rho @ jump.conj().T - 0.5 * (kernel @ rho + rho @ kernel)
+
+
+def pure_trace_distance(left: np.ndarray, right: np.ndarray) -> float:
+    overlap = abs(np.vdot(left, right)) ** 2
+    return float(math.sqrt(max(0.0, 1.0 - min(1.0, overlap))))
+
+
+def operational_zero_mode_audit(
+    cfg: Config,
+    operators: dict[str, np.ndarray],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Certify a finite, integrable zero-cost trajectory for frozen protocol Pi."""
+    hamiltonian = operators["H"]
+    encoding = operators["V"]
+    projector = encoding @ encoding.conj().T
+    complement = operators["I4"] - projector
+    jump = jump_for_delta(cfg.true_gamma, 0.0, operators)
+    kernel = jump.conj().T @ jump
+
+    analytic = {
+        "norm_L0_P_DFS": float(np.linalg.norm(jump @ projector, ord="fro")),
+        "norm_K0_P_DFS": float(np.linalg.norm(kernel @ projector, ord="fro")),
+        "norm_commutator_H_P_DFS": float(
+            np.linalg.norm(hamiltonian @ projector - projector @ hamiltonian)
+        ),
+        "norm_Q_H_P_DFS": float(
+            np.linalg.norm(complement @ hamiltonian @ projector)
+        ),
+        "DFS_rank": int(round(float(np.real(np.trace(projector))))),
+        "cost_kernel_eigenvalues": np.linalg.eigvalsh(kernel),
+    }
+    analytic_gates = {
+        "L0_annihilates_DFS": analytic["norm_L0_P_DFS"]
+        <= cfg.exact_zero_tolerance,
+        "K0_annihilates_DFS": analytic["norm_K0_P_DFS"]
+        <= cfg.exact_zero_tolerance,
+        "Hamiltonian_preserves_DFS": (
+            analytic["norm_commutator_H_P_DFS"] <= cfg.exact_zero_tolerance
+            and analytic["norm_Q_H_P_DFS"] <= cfg.exact_zero_tolerance
+        ),
+        "DFS_equals_cost_kernel_dimension": int(
+            np.count_nonzero(
+                np.abs(analytic["cost_kernel_eigenvalues"])
+                <= cfg.exact_zero_tolerance
+            )
+        )
+        == analytic["DFS_rank"],
+    }
+
+    initial = ket(1)
+    initial_rho = np.outer(initial, initial.conj())
+    times = np.linspace(0.0, cfg.target_duration, cfg.trajectory_samples)
+    trajectory_rows: list[dict[str, Any]] = []
+    jump_rates: list[float] = []
+    activities: list[float] = []
+    distances: list[float] = []
+    state_leakages: list[float] = []
+    tangent_leakages: list[float] = []
+    tangent_kernel_residuals: list[float] = []
+
+    for point in times:
+        state = expm(-1.0j * hamiltonian * point) @ initial
+        rho = np.outer(state, state.conj())
+        tangent = -1.0j * hamiltonian @ state
+        rate = max(0.0, float(np.real(np.trace(kernel @ rho))))
+        activity = float(np.linalg.norm(dissipator(jump, rho), ord="fro"))
+        distance = pure_trace_distance(initial, state)
+        state_leakage = float(np.real(np.vdot(state, complement @ state)))
+        tangent_leakage = float(np.linalg.norm(complement @ tangent))
+        tangent_kernel = float(np.linalg.norm(kernel @ tangent))
+        jump_rates.append(rate)
+        activities.append(activity)
+        distances.append(distance)
+        state_leakages.append(abs(state_leakage))
+        tangent_leakages.append(tangent_leakage)
+        tangent_kernel_residuals.append(tangent_kernel)
+        trajectory_rows.append(
+            {
+                "time": point,
+                "trace_distance_from_initial": distance,
+                "jump_rate": rate,
+                "dissipator_activity": activity,
+                "DFS_state_leakage": abs(state_leakage),
+                "DFS_tangent_leakage": tangent_leakage,
+                "cost_kernel_tangent_residual": tangent_kernel,
+            }
+        )
+
+    accumulated_cost = float(np.trapezoid(jump_rates, times))
+    accumulated_activity = float(np.trapezoid(activities, times))
+    trajectory = {
+        "maximum_trace_distance_from_initial": max(distances),
+        "accumulated_declared_jump_cost": accumulated_cost,
+        "accumulated_dissipator_activity": accumulated_activity,
+        "maximum_DFS_state_leakage": max(state_leakages),
+        "maximum_DFS_tangent_leakage": max(tangent_leakages),
+        "maximum_cost_kernel_tangent_residual": max(tangent_kernel_residuals),
+    }
+    trajectory_gates = {
+        "finite_nonconstant_path": trajectory[
+            "maximum_trace_distance_from_initial"
+        ]
+        >= cfg.nonconstant_trace_distance_minimum,
+        "zero_accumulated_declared_cost": accumulated_cost
+        <= cfg.exact_zero_tolerance,
+        "zero_accumulated_dissipator_activity": accumulated_activity
+        <= cfg.exact_zero_tolerance,
+        "state_path_stays_in_DFS": trajectory["maximum_DFS_state_leakage"]
+        <= cfg.leakage_tolerance,
+        "path_tangent_stays_in_DFS": trajectory["maximum_DFS_tangent_leakage"]
+        <= cfg.leakage_tolerance,
+        "path_tangent_stays_in_cost_kernel": trajectory[
+            "maximum_cost_kernel_tangent_residual"
+        ]
+        <= cfg.exact_zero_tolerance,
+    }
+
+    positive_initial = (ket(0) + ket(1)) / math.sqrt(2.0)
+    positive_rates: list[float] = []
+    positive_activities: list[float] = []
+    for point in times:
+        state = expm(-1.0j * hamiltonian * point) @ positive_initial
+        rho = np.outer(state, state.conj())
+        positive_rates.append(float(np.real(np.trace(kernel @ rho))))
+        positive_activities.append(
+            float(np.linalg.norm(dissipator(jump, rho), ord="fro"))
+        )
+    positive_cost = float(np.trapezoid(positive_rates, times))
+    analytic_positive_cost = 2.0 * cfg.true_gamma * cfg.target_duration
+    positive_control = {
+        "initial_state": "(|00>+|01>)/sqrt(2)",
+        "accumulated_declared_jump_cost": positive_cost,
+        "analytic_accumulated_jump_cost": analytic_positive_cost,
+        "relative_error": abs(positive_cost - analytic_positive_cost)
+        / analytic_positive_cost,
+        "accumulated_dissipator_activity": float(
+            np.trapezoid(positive_activities, times)
+        ),
+    }
+    positive_control_gates = {
+        "same_meter_cost_positive": positive_cost
+        > cfg.nonconstant_trace_distance_minimum,
+        "same_meter_activity_positive": positive_control[
+            "accumulated_dissipator_activity"
+        ]
+        > cfg.nonconstant_trace_distance_minimum,
+        "same_meter_cost_matches_analytic_calibration": positive_control[
+            "relative_error"
+        ]
+        <= cfg.model_closed_form_tolerance,
+    }
+
+    contraction_rows: list[dict[str, Any]] = []
+    for epsilon in cfg.contraction_epsilons:
+        endpoint = expm(
+            -1.0j * epsilon * hamiltonian * cfg.target_duration
+        ) @ initial
+        endpoint_distance = pure_trace_distance(initial, endpoint)
+        maximum_distance = 0.0
+        rates: list[float] = []
+        for point in times:
+            state = expm(-1.0j * epsilon * hamiltonian * point) @ initial
+            maximum_distance = max(
+                maximum_distance, pure_trace_distance(initial, state)
+            )
+            rho = np.outer(state, state.conj())
+            rates.append(max(0.0, float(np.real(np.trace(kernel @ rho)))))
+        contraction_rows.append(
+            {
+                "epsilon": epsilon,
+                "endpoint_trace_distance_from_constant_path": endpoint_distance,
+                "maximum_trace_distance_from_initial": maximum_distance,
+                "accumulated_declared_jump_cost": float(
+                    np.trapezoid(rates, times)
+                ),
+                "nonconstant": maximum_distance
+                >= cfg.nonconstant_trace_distance_minimum,
+            }
+        )
+    ordered_by_epsilon = sorted(contraction_rows, key=lambda row: row["epsilon"])
+    endpoint_distances = [
+        row["endpoint_trace_distance_from_constant_path"]
+        for row in ordered_by_epsilon
+    ]
+    monotone = all(
+        endpoint_distances[index + 1] + cfg.contraction_monotonic_tolerance
+        >= endpoint_distances[index]
+        for index in range(len(endpoint_distances) - 1)
+    )
+    contraction = {
+        "family": "H_epsilon=epsilon H, epsilon>0, fixed duration",
+        "rows": contraction_rows,
+        "smallest_epsilon_endpoint_distance": ordered_by_epsilon[0][
+            "endpoint_trace_distance_from_constant_path"
+        ],
+        "all_members_nonconstant": all(row["nonconstant"] for row in contraction_rows),
+        "all_members_zero_declared_cost": all(
+            row["accumulated_declared_jump_cost"] <= cfg.exact_zero_tolerance
+            for row in contraction_rows
+        ),
+        "endpoint_distance_monotone_with_epsilon": monotone,
+    }
+    contraction_gates = {
+        "finite_zero_cost_family": contraction["all_members_zero_declared_cost"],
+        "every_positive_epsilon_path_nonconstant": contraction[
+            "all_members_nonconstant"
+        ],
+        "family_contracts_toward_constant_path": monotone
+        and ordered_by_epsilon[0][
+            "endpoint_trace_distance_from_constant_path"
+        ]
+        < ordered_by_epsilon[-1][
+            "endpoint_trace_distance_from_constant_path"
+        ],
+    }
+
+    gates = {
+        **analytic_gates,
+        **trajectory_gates,
+        **positive_control_gates,
+        **contraction_gates,
+    }
+    report = {
+        "status": (
+            "DECLARED_PROTOCOL_INTEGRABLE_NONCONSTANT_ZERO_COST_PATH_SUPPORTED"
+            if all(gates.values())
+            else "OPERATIONAL_ZERO_MODE_GATE_FAILURE"
+        ),
+        "object_hierarchy": {
+            "operational_primitive": "predeclared protocol Pi",
+            "model_local_rate": "j_Pi(rho)=Tr(K0 rho), K0=L0^dagger L0",
+            "accumulated_model_cost": "J_Pi[rho]=integral j_Pi(rho_t)dt",
+            "finite_channel_witness": "E_ch (audited separately in Layer 2)",
+            "abstract_tangent_density_F": "NOT_CONSTRUCTED",
+            "universal_Principle_R_bridge": "NOT_ESTABLISHED",
+        },
+        "analytic_DFS_certificate": analytic,
+        "finite_zero_cost_trajectory": trajectory,
+        "same_meter_positive_control": positive_control,
+        "contraction_family": contraction,
+        "gates": gates,
+    }
+    return report, trajectory_rows, contraction_rows
 
 
 def liouvillian(hamiltonian: np.ndarray, jumps: list[np.ndarray]) -> np.ndarray:
@@ -836,7 +1158,9 @@ def layer1_audit(
                 if all(gates.values())
                 else "CHANNEL_STRUCTURE_AUDIT_FAILED"
             ),
-            "cost_definition": "E_ch = 1/2 ||J(encoded noisy) - J(encoded ideal)||_1",
+            "finite_channel_witness_definition": (
+                "E_ch = 1/2 ||J(encoded noisy) - J(encoded ideal)||_1"
+            ),
             "logical_reduction": reduction,
             "duration_sweep": duration_rows,
             "maximum_encoded_cost_at_delta_zero": maximum_zero,
@@ -2262,15 +2586,54 @@ def main() -> None:
     save_json(output / "summary.json", summary)
 
     print("\n" + "=" * 100)
-    print("DFS CHANNEL-COST + JOINT ID + MISSPECIFICATION SWEEP v5.1")
+    print("DFS OPERATIONAL PROTOCOL + CHANNEL SUPPORT AUDIT v6.0")
     print("=" * 100)
     print("backend=exact NumPy/SciPy | cloud access=none")
 
     try:
         cfg = Config()
+
+        # Layer 0 is deliberately serialized before operators are built or any
+        # outcome is evaluated.  The hash makes the freeze externally auditable.
+        frozen_protocol = protocol_manifest(cfg)
+        frozen_protocol_sha256 = sha256_object(frozen_protocol)
+        save_json(output / "frozen_protocol.json", frozen_protocol)
+        save_json(
+            output / "frozen_protocol_commitment.json",
+            {
+                "protocol_sha256": frozen_protocol_sha256,
+                "frozen_before_outcome_computation": True,
+            },
+        )
         operators = build_operators(cfg)
 
-        print("\n[LAYER 1] Channel-level structural audit")
+        print("\n[LAYER 0] Frozen operational protocol")
+        print(
+            json.dumps(
+                {
+                    "protocol_id": frozen_protocol["protocol_id"],
+                    "protocol_sha256": frozen_protocol_sha256,
+                    "frozen_before_outcome_computation": True,
+                },
+                indent=2,
+            )
+        )
+
+        print("\n[LAYER 1] Integrable operational zero-mode audit")
+        operational, trajectory_rows, contraction_rows = (
+            operational_zero_mode_audit(cfg, operators)
+        )
+        print(json.dumps(clean(operational["gates"]), indent=2))
+        print(
+            "  max path distance="
+            f"{operational['finite_zero_cost_trajectory']['maximum_trace_distance_from_initial']:.6f}"
+            "  J_Pi="
+            f"{operational['finite_zero_cost_trajectory']['accumulated_declared_jump_cost']:.3e}"
+            "  positive-control J_Pi="
+            f"{operational['same_meter_positive_control']['accumulated_declared_jump_cost']:.6f}"
+        )
+
+        print("\n[LAYER 2] Channel-level structural audit")
         layer1, selection_rows, powerlaw_rows = layer1_audit(cfg, operators)
         print(json.dumps(clean(layer1["gates"]), indent=2))
         law = layer1["symmetry_breaking_law"]
@@ -2301,14 +2664,14 @@ def main() -> None:
         print("  [non-voting] representation regression:")
         print("   ", json.dumps(clean(layer1["nonvoting_regression_checks"])))
 
-        print("\n[NEGATIVE CONTROL] Injected defects must trip their gates")
+        print("\n[DIAGNOSTIC CONTROL] Injected defects must trip their gates")
         control = negative_control(cfg, operators)
         print(json.dumps(clean({
             k: v["gate_fires"] for k, v in control.items()
             if isinstance(v, dict)
         }), indent=2))
 
-        print("\n[LAYER 2] Cross-experiment calibration")
+        print("\n[LAYER 3] Cross-experiment calibration")
         layer2, data = layer2_calibration(cfg, operators, output)
         print(json.dumps(clean(layer2["gates"]), indent=2))
         print(
@@ -2319,7 +2682,7 @@ def main() -> None:
             f"{layer2['ech_extrapolation']['d_log_Ech_d_log_gamma']:.4f}"
         )
 
-        print("\n[LAYER 2B] Joint identification of (gamma, delta0)")
+        print("\n[LAYER 3B] Joint identification of (gamma, delta0)")
         layer2b, joint_data = layer2b_joint_identification(cfg, operators, output)
         print(json.dumps(clean(layer2b["gates"]), indent=2))
         print(
@@ -2331,7 +2694,7 @@ def main() -> None:
             f"  transfer_max_pull={layer2b['transfer_maximum_absolute_pull']:.2f}"
         )
 
-        print("\n[LAYER 3] Model-misspecification sensitivity (kappa sweep)")
+        print("\n[LAYER 4] Model-misspecification sensitivity (kappa sweep)")
         misspecification = misspecification_sensitivity(cfg, operators)
         for name, entry in misspecification.items():
             if not isinstance(entry, dict) or "sweep" not in entry:
@@ -2358,7 +2721,48 @@ def main() -> None:
 
         l1, l2, l2b = layer1["gates"], layer2["gates"], layer2b["gates"]
 
-        # ---- bucket 1: gates that vote on declared model support ----------
+        # ---- bucket 1: protocol-first operational claim -------------------
+        operational_gates = {
+            "protocol_frozen_before_outcomes": True,
+            "analytic_DFS_kernel_and_invariance": all(
+                operational["gates"][key]
+                for key in (
+                    "L0_annihilates_DFS",
+                    "K0_annihilates_DFS",
+                    "Hamiltonian_preserves_DFS",
+                    "DFS_equals_cost_kernel_dimension",
+                )
+            ),
+            "finite_integrable_nonconstant_zero_cost_path": all(
+                operational["gates"][key]
+                for key in (
+                    "finite_nonconstant_path",
+                    "zero_accumulated_declared_cost",
+                    "zero_accumulated_dissipator_activity",
+                    "state_path_stays_in_DFS",
+                    "path_tangent_stays_in_DFS",
+                    "path_tangent_stays_in_cost_kernel",
+                )
+            ),
+            "same_meter_positive_control": all(
+                operational["gates"][key]
+                for key in (
+                    "same_meter_cost_positive",
+                    "same_meter_activity_positive",
+                    "same_meter_cost_matches_analytic_calibration",
+                )
+            ),
+            "contraction_family": all(
+                operational["gates"][key]
+                for key in (
+                    "finite_zero_cost_family",
+                    "every_positive_epsilon_path_nonconstant",
+                    "family_contracts_toward_constant_path",
+                )
+            ),
+        }
+
+        # ---- bucket 2: gates that vote on declared model support ----------
         model_gates = {
             "logical_reduction_to_one_qubit_channel": l1[
                 "encoded_channel_reduces_to_one_qubit_channel"
@@ -2407,7 +2811,7 @@ def main() -> None:
             ),
         }
 
-        # ---- bucket 2: does the diagnostic system actually detect faults? --
+        # ---- bucket 3: does the diagnostic system actually detect faults? --
         # These validate the INSTRUMENT.  They are not physical findings and
         # they do not vote on declared model support.
         diagnostic_validation_checks = {
@@ -2428,29 +2832,31 @@ def main() -> None:
             ],
         }
 
-        # ---- bucket 3: code regression only -------------------------------
+        # ---- bucket 4: code regression only -------------------------------
         # E_ch is defined from the superoperator, so invariance under a change
         # of Lindblad representation is true by construction.  Verifying it
         # tests the implementation, not the physics.  Non-voting by design.
         nonvoting_regression_checks = dict(layer1["nonvoting_regression_checks"])
 
+        operational_support = all(operational_gates.values())
         declared_model_support = all(model_gates.values())
         diagnostics_validated = all(diagnostic_validation_checks.values())
         regression_clean = all(nonvoting_regression_checks.values())
         scientific_status = (
-            "DECLARED_MODEL_SUPPORT_ESTABLISHED"
-            if declared_model_support
-            else "MODEL_GATE_FAILURE"
+            "DECLARED_DFS_PROTOCOL_HAS_AN_INTEGRABLE_NONCONSTANT_ZERO_COST_PATH"
+            if operational_support and declared_model_support
+            else "OPERATIONAL_OR_MODEL_GATE_FAILURE"
         )
         global_gates = {
+            "declared_operational_protocol_support": operational_support,
             "declared_model_support": declared_model_support,
             "diagnostic_system_validated": diagnostics_validated,
             "code_regression_clean": regression_clean,
         }
-        supported = declared_model_support
         certificate = {
             "version": VERSION,
             "scientific_status": scientific_status,
+            "declared_operational_protocol_support": operational_support,
             "declared_model_support": declared_model_support,
             "support_type": (
                 "exact-model + synthetic-counts; NOT physical measurement. "
@@ -2458,10 +2864,20 @@ def main() -> None:
                 "for the declared Lindblad model with synthetic finite-shot "
                 "data.  It is not evidence about hardware."
             ),
+            "frozen_protocol": frozen_protocol,
+            "frozen_protocol_sha256": frozen_protocol_sha256,
+            "object_hierarchy": operational["object_hierarchy"],
+            "operational_gates": operational_gates,
             "model_gates": model_gates,
             "diagnostic_validation_checks": diagnostic_validation_checks,
             "nonvoting_regression_checks": nonvoting_regression_checks,
             "gate_bucket_semantics": {
+                "operational_gates": (
+                    "Vote on the restricted operational statement: the frozen "
+                    "two-qubit protocol has a finite nonconstant path with zero "
+                    "accumulated declared jump cost, plus a same-meter positive "
+                    "control and a contracting family."
+                ),
                 "model_gates": (
                     "Vote on declared_model_support.  Each is a falsifiable "
                     "statement about the declared model or the estimation "
@@ -2481,6 +2897,7 @@ def main() -> None:
             "diagnostics_validated": diagnostics_validated,
             "code_regression_clean": regression_clean,
             "frozen_config": asdict(cfg),
+            "operational_zero_mode": operational,
             "layer1": layer1,
             "layer2": layer2,
             "layer2b_joint_identification": layer2b,
@@ -2488,6 +2905,16 @@ def main() -> None:
             "negative_control": control,
             "global_gates": global_gates,
             "changes_from_v31": [
+                "v6: added a protocol-first Layer 0; the preparation, "
+                "Hamiltonian, declared meter, readouts, tolerances, and "
+                "decision rules are serialized and hashed before outcomes.",
+                "v6: separated the local model rate j_Pi, accumulated path "
+                "cost J_Pi, and finite encoded-channel witness E_ch.",
+                "v6: added an algebraic DFS kernel/invariance certificate, a "
+                "finite nonconstant zero-cost trajectory, a same-meter "
+                "positive control, and a contracting H_epsilon family.",
+                "v6: explicitly records abstract tangent F as NOT_CONSTRUCTED "
+                "and the bridge to universal Principle R as NOT_ESTABLISHED.",
                 "Ramsey observable moved to the H-invariant |00>,|11> pair; "
                 "v3.1's exp(-2 gamma t) belongs to the |00>,|01> coherence, "
                 "which H rotates.  Witness included in layer2.model_validity.",
@@ -2536,7 +2963,13 @@ def main() -> None:
                 "check, CSV field-name union, independent RNG streams.",
             ],
             "claim_boundary": (
-                "The encoded Choi-distance zero is a channel-level statement "
+                "For the frozen exact two-qubit collective-dephasing protocol, "
+                "a finite nonconstant trajectory remains in the kernel of the "
+                "predeclared local jump rate and has zero accumulated declared "
+                "jump cost; the same frozen meter is positive on a control, "
+                "and a finite epsilon-family contracts toward the constant "
+                "path. The encoded Choi-distance zero is a separate finite "
+                "channel-level statement "
                 "about a leakage-free logical qubit, exact over the tested "
                 "duration sweep.  Symmetry breaking follows E_ch = gamma "
                 "delta^2 t at leading order.  gamma is inferred from "
@@ -2549,11 +2982,15 @@ def main() -> None:
                 "laboratory calibration, no zero-total-energy, no universal "
                 "realizability, and no Lorentzian claim.  Generator and "
                 "estimator still share a model family; kappa_detect bounds how "
-                "far that assumption can be wrong before this protocol notices."
+                "far that assumption can be wrong before this protocol notices. "
+                "The script does not construct a universal tangent density F "
+                "and does not establish Principle R or Lorentzian signature."
             ),
         }
 
         save_json(output / "certificate.json", certificate)
+        save_csv(output / "operational_trajectory.csv", trajectory_rows)
+        save_csv(output / "contraction_family.csv", contraction_rows)
         save_csv(output / "layer1_selection.csv", selection_rows)
         save_csv(output / "layer1_scaling_slices.csv", powerlaw_rows)
         save_csv(
@@ -2591,6 +3028,7 @@ def main() -> None:
                 "status": "COMPLETE",
                 "scientific_status": scientific_status,
                 "declared_model_support": declared_model_support,
+                "declared_operational_protocol_support": operational_support,
                 "diagnostics_validated": diagnostics_validated,
                 "code_regression_clean": regression_clean,
                 "figure": figure,
@@ -2617,11 +3055,15 @@ def main() -> None:
                 clean(
                     {
                         "scientific_status": scientific_status,
+                        "declared_operational_protocol_support": (
+                            operational_support
+                        ),
                         "declared_model_support": declared_model_support,
                         "support_type": (
                             "exact-model + synthetic-counts; "
                             "NOT physical measurement"
                         ),
+                        "operational_gates": operational_gates,
                         "model_gates": model_gates,
                         "diagnostic_validation_checks": (
                             diagnostic_validation_checks
@@ -2638,7 +3080,12 @@ def main() -> None:
                 ensure_ascii=False,
             )
         )
-        if not (declared_model_support and diagnostics_validated and regression_clean):
+        if not (
+            operational_support
+            and declared_model_support
+            and diagnostics_validated
+            and regression_clean
+        ):
             raise AssertionError(f"Gates failed: {failed}")
     except Exception as exc:
         summary.update(
