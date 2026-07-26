@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-paper117_pasqal_local_no_account_v5_2.py  (v5.2.1 local Pulser)
+paper117_pasqal_local_no_account_v5_2_3.py  (v5.2.3 local Pulser)
 
 Account-free local PASQAL/Pulser validation for Y.Y.N. Li's neutral-atom
 pulse-ordering manuscript.
@@ -96,6 +96,28 @@ physics of the scan):
       per-gap comparison is exactly a test of the f-shape f(1-f) versus
       min(f,1-f).
 
+Changes from v5.2.1 (auditability and convention consistency only):
+
+  F13. The three-segment adjacent detuning spacing is now a named constant
+       with explicit rad/us units instead of an unexplained 0.12 literal.
+
+  F14. The legacy loop count used only to choose auxiliary N != 8
+       cross-validation durations is now named and scoped explicitly.  Its
+       value is not fitted from the 117-point data and does not enter the
+       frozen N=8 paper claims.
+
+  F15. fixed_commutator_norm now uses the same qubit-to-computational-bit
+       mapping as exact_hamiltonian_for_segments.  For the present homogeneous
+       sum this relabelling is permutation invariant and therefore does not
+       change the reported norm; it prevents a silent convention mismatch in
+       future site-dependent extensions.
+
+  F16. (v5.2.3) The Colab bootstrap no longer rejects a kernel merely because
+       IPython or Colab preloaded SciPy. A preloaded stack is accepted only
+       when its live versions, installed metadata, and a clean-subprocess
+       import probe are mutually consistent. A restart is still required
+       after the script actually repairs packages already loaded in memory.
+
 Scientific scope
 ----------------
 - Independent dense scipy evolution is the primary scan backend; local
@@ -157,7 +179,7 @@ Numerical discipline
 
 Colab:
     Upload this file, then run:
-    %run paper117_pasqal_local_no_account_v5_2.py
+    %run paper117_pasqal_local_no_account_v5_2_3.py
 """
 
 import hashlib
@@ -187,6 +209,15 @@ LOCAL_STACK_REQUIREMENTS = {
     "pulser-simulation": "1.8.0",
 }
 
+STACK_MODULE_TO_DISTRIBUTION = {
+    "numpy": "numpy",
+    "scipy": "scipy",
+    "pandas": "pandas",
+    "qutip": "qutip",
+    "pulser": "pulser",
+    "pulser_simulation": "pulser-simulation",
+}
+
 
 def installed_version(distribution_name):
     try:
@@ -212,22 +243,29 @@ def local_stack_probe():
     )
 
 
+def loaded_stack_versions():
+    """
+    Return versions of scientific packages already resident in this kernel.
+
+    A missing ``__version__`` is recorded but is not by itself treated as a
+    mismatch; installed metadata and the clean-subprocess probe remain
+    mandatory independent checks.
+    """
+    loaded = {}
+    for module_name, distribution_name in STACK_MODULE_TO_DISTRIBUTION.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        version = getattr(module, "__version__", None)
+        loaded[distribution_name] = (
+            None if version is None else str(version)
+        )
+    return loaded
+
+
 def ensure_account_free_local_stack():
     """Establish and independently import-test one coherent local stack."""
-    preloaded_sensitive = sorted(
-        name
-        for name in sys.modules
-        if name.split(".", 1)[0]
-        in {"scipy", "qutip", "pulser", "pulser_simulation"}
-    )
-    if preloaded_sensitive:
-        raise RuntimeError(
-            "A SciPy/Qutip/Pulser module is already loaded in this notebook "
-            "kernel, so package consistency can no longer be guaranteed. "
-            "Restart the runtime once and run this file before importing "
-            "those packages. No account or cloud login is required."
-        )
-
+    loaded_before = loaded_stack_versions()
     versions = {
         name: installed_version(name) for name in LOCAL_STACK_REQUIREMENTS
     }
@@ -236,6 +274,29 @@ def ensure_account_free_local_stack():
         for name, expected in LOCAL_STACK_REQUIREMENTS.items()
         if versions[name] != expected
     }
+    loaded_mismatches = {
+        name: {
+            "expected": LOCAL_STACK_REQUIREMENTS[name],
+            "loaded": loaded_version,
+        }
+        for name, loaded_version in loaded_before.items()
+        if (
+            loaded_version is not None
+            and loaded_version != LOCAL_STACK_REQUIREMENTS[name]
+        )
+    }
+
+    # A live module from an older installation cannot be replaced safely
+    # inside the same Python process. This case normally means the user
+    # installed packages earlier in the current notebook and then reran.
+    if loaded_mismatches and not mismatches:
+        raise RuntimeError(
+            "The installed local stack is correct, but this notebook kernel "
+            "still holds older in-memory modules: "
+            f"{loaded_mismatches}. Restart the runtime once, then rerun this "
+            "same file. No account or cloud login is required."
+        )
+
     initial_probe = local_stack_probe() if not mismatches else None
     needs_repair = bool(
         mismatches or initial_probe is None or initial_probe.returncode != 0
@@ -274,26 +335,15 @@ def ensure_account_free_local_stack():
                 f"stderr:\n{repaired_probe.stderr}"
             )
 
-        loaded_scientific_modules = sorted(
-            name
-            for name in sys.modules
-            if name.split(".", 1)[0]
-            in {
-                "numpy",
-                "scipy",
-                "pandas",
-                "qutip",
-                "pulser",
-                "pulser_simulation",
-            }
-        )
-        if loaded_scientific_modules:
+        if loaded_before:
             raise RuntimeError(
                 "The coherent local stack has now been installed and verified "
                 "in a fresh subprocess, but this notebook kernel had already "
-                "loaded an older NumPy/SciPy/Qutip/Pulser module. Restart the "
-                "runtime once, then rerun this same file. No account or cloud "
-                "login is required."
+                "loaded scientific modules before the repair: "
+                f"{loaded_before}. Restart the runtime once, then rerun this "
+                "same file. The next run will accept compatible modules "
+                "preloaded automatically by Colab. No account or cloud login "
+                "is required."
             )
 
     unresolved = {
@@ -317,6 +367,12 @@ def ensure_account_free_local_stack():
             "subprocess still cannot import the complete stack. Restart the "
             "runtime; if this persists, use a fresh Colab runtime.\n"
             f"stderr:\n{final_probe.stderr}"
+        )
+
+    if loaded_before:
+        print(
+            "[bootstrap] Compatible preloaded scientific modules accepted; "
+            "installed metadata and clean-subprocess import probe both pass."
         )
 
 
@@ -375,6 +431,18 @@ MAX_DURATION_NS = 10000
 OMEGA = 1.22
 SPACING_UM = 8.0
 AVG_DETUNING = -0.31
+
+# Adjacent spacing of the ordered values (low, mid, high) in the frozen
+# equal-duration three-segment diagnostic. Detunings use angular-frequency
+# units throughout this script, i.e. rad / microsecond. The full low-to-high
+# span is twice this value.
+THREE_SEGMENT_DETUNING_STEP_RAD_PER_US = 0.12
+
+# Legacy loop-motivated scale used only to choose auxiliary N != 8
+# cross-validation durations. It is not fitted from the 117-point scan and
+# does not enter the frozen N=8 paper diagnostics, whose duration is fixed by
+# PAPER_TOTAL_NS below.
+AUXILIARY_CROSSVALIDATION_LOOP_COUNT = 2.22
 # Frozen Pulser DigitalAnalogDevice value used by the independent dense
 # Hamiltonian.  When Pulser is installed, equality with the live device object
 # is checked at import time. SciPy remains the primary solver, while the local
@@ -461,7 +529,7 @@ if not (MIN_DURATION_NS <= PAPER_TOTAL_NS <= MAX_DURATION_NS):
 
 # ---------- output directory with timestamp ----------
 TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
-OUTDIR = Path(f"paper117_pasqal_local_v5_2_{TIMESTAMP}")
+OUTDIR = Path(f"paper117_pasqal_local_v5_2_3_{TIMESTAMP}")
 OUTDIR.mkdir(exist_ok=True)
 
 
@@ -900,8 +968,18 @@ def pulser_to_standard_basis(psi, n):
     return normalize_state(out)
 
 
-def duration_from_loop_ns(n, omega=OMEGA, loop=2.22):
-    """Loop-motivated duration, before the divisibility snap."""
+def duration_from_loop_ns(
+    n,
+    omega=OMEGA,
+    loop=AUXILIARY_CROSSVALIDATION_LOOP_COUNT,
+):
+    """
+    Auxiliary loop-motivated duration, before the divisibility snap.
+
+    The default loop count is a frozen cross-validation convention, not a
+    parameter inferred from the 117-point data. N=8 paper diagnostics bypass
+    this value and use PAPER_TOTAL_NS.
+    """
     t_us = 2 * math.pi * loop / (math.sqrt(n) * omega)
     t_ns = int(round(1000 * t_us))
     t_ns = int(round(t_ns / CLOCK_NS) * CLOCK_NS)
@@ -1121,14 +1199,22 @@ def measure_differential_support(forward, reverse, total_ns, signed_gap):
 
 
 def fixed_commutator_norm(n, omega=OMEGA):
-    """Metadata value ||[H_X,N]|| for the declared N and the given Omega."""
+    """
+    Metadata value ||[H_X,N]|| for the declared N and the given Omega.
+
+    Qubit q is mapped to computational-basis bit n-1-q, exactly as in
+    exact_hamiltonian_for_segments. The current homogeneous sum is invariant
+    under this relabelling, but keeping one convention avoids errors in later
+    site-dependent extensions.
+    """
     dim = 2 ** n
     HX = np.zeros((dim, dim), dtype=np.complex128)
     Nop = np.zeros((dim, dim), dtype=np.complex128)
     for x in range(dim):
         Nop[x, x] = bin(x).count("1")
         for q in range(n):
-            HX[x ^ (1 << q), x] += omega / 2.0
+            bit = n - 1 - q
+            HX[x ^ (1 << bit), x] += omega / 2.0
     return float(np.linalg.norm(HX @ Nop - Nop @ HX, ord=2))
 
 
@@ -1381,7 +1467,12 @@ def run_3segment_magnus_diagnostic(
     if total_ns != nominal_total_ns:
         raise AssertionError("Three-segment diagnostic changed total duration.")
 
-    detunings = (avg_det - 0.12, avg_det, avg_det + 0.12)
+    detuning_step = THREE_SEGMENT_DETUNING_STEP_RAD_PER_US
+    detunings = (
+        avg_det - detuning_step,
+        avg_det,
+        avg_det + detuning_step,
+    )
     constant_single = [(avg_det, total_ns)]
     constant_three = [(avg_det, duration_each_ns)] * 3
     psi_constant = exact_state_from_segments(n, constant_single, omega=omega)
@@ -3074,7 +3165,7 @@ def main():
     print(
         "\n" + "=" * 88
         + "\nPAPER117 PASQAL/PULSER LOCAL VALIDATION "
-        "(v5.2.1, NO ACCOUNT)\n"
+        "(v5.2.3, NO ACCOUNT)\n"
         + "=" * 88
     )
     print("output:", OUTDIR)
