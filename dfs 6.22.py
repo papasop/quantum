@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DFS OPERATIONAL PROTOCOL + CHANNEL SUPPORT AUDIT v6.0
-=====================================================
+DFS OPERATIONAL PROTOCOL + CHANNEL SUPPORT AUDIT v6.2.2
+=======================================================
 
 Protocol-first upgrade of v5.1.  The operational primitive is a predeclared
 preparation/evolution/readout protocol Pi, not an isolated scalar chosen after
@@ -13,8 +13,149 @@ seeing a desired zero.  The script distinguishes four objects:
   3. finite channel witness E_ch      = 1/2 ||J(E_noisy)-J(E_ideal)||_1,
   4. abstract tangent F     = NOT CONSTRUCTED by this script.
 
-What v6 adds over v5.1
-----------------------
+What v6.2.2 closes in v6.2.1
+----------------------------
+Symmetry, not correctness.  v6.2.1 gave Layer 2 a point-by-point comparison
+against its commitment, but Layer 2B still verified only the receipt hash.
+Execution order there was already right -- the joint transfer predictions were
+written and hashed before the data was drawn -- so this was never a run-time
+defect.  The gap was semantic: a hash proves the FILE is intact, not that the
+values that actually entered the pulls came from it.
+
+v6.2.2 applies the same coverage-then-deviation structure to Layer 2B:
+
+  * `joint_commitment_coverage` re-reads frozen_joint_predictions.json and
+    compares every scored `predicted_visibility` against it by
+    (offset, duration), and additionally checks that the committed gamma_hat
+    and delta0_hat are the estimates actually used to build the predictions.
+  * the new gate `every_scored_joint_prediction_matches_the_commitment_on_disk`
+    joins `prediction_freezes_verify_from_disk`, so the sentence "every scored
+    prediction matches the commitment" now holds for both layers.
+
+No number changes; the deviation is 0.0 in the reference run.
+
+What v6.2.1 closed in v6.2
+--------------------------
+An audit gap, not a scientific one.  v6.2's gate
+`every_scored_prediction_matches_the_commitment_on_disk` compared the Ramsey
+held-out and logical-X_L transfer predictions point by point, but for the E_ch
+payload it recorded only a COUNT.  The values that actually entered the error
+calculation -- `predicted_encoded_cost_closed_form` -- were never checked
+against the file, so the gate name promised more than it verified.  Accurately,
+v6.2 established: every scored VISIBILITY prediction matches the commitment,
+while the encoded-cost payload is independently hashed and preserved.
+
+v6.2.1 closes the semantics:
+
+  * `maximum_encoded_cost_commitment_deviation` compares each E_ch prediction
+    against `committed["encoded_cost_extrapolation"]` by delta, and the gate
+    requires BOTH deviations to be exactly zero and BOTH families to be fully
+    covered.  The gate name is now no stronger than what is checked.
+  * coverage is established BEFORE any deviation is computed.  v6.2 evaluated
+    max(...) first, so a scored point absent from the commitment raised a
+    KeyError and crashed the run rather than failing the gate.  A missing
+    commitment is now reported as `missing_visibility_points` /
+    `missing_encoded_cost_points` and fails the gate.
+
+No number changes; the E_ch deviation is 0.0 in the reference run, which is
+what v6.2 assumed without checking.
+
+What v6.2 changed in v6.1
+-------------------------
+Three refinements.  No physics, no tolerance and no estimator is touched, and
+every reported number is bit-identical to v6.1 and to v6.0.
+
+  1  NAMING OF THE GUARANTEE.  `commitment_verifies_from_disk` establishes only
+     that the serialized payload can be rebuilt from disk and rehashes to the
+     recorded digest.  It does NOT independently establish that the payload was
+     written before any outcome was computed -- there is no external timestamp
+     and no third party.  The guarantee is EXECUTION-ORDER FREEZING WITHIN THE
+     EXECUTABLE AUDIT, and it must not be written up as formal preregistration.
+     v6.1 said this only in a source comment; v6.2 states it in the receipt
+     file, in `gate_bucket_semantics`, and in `claim_boundary`, so the wording
+     travels with the artefact.
+
+  2  ONE COMMITMENT FOR EVERY LAYER-2 HELD-OUT PREDICTION.  v6.1 committed the
+     E_ch extrapolation and the Layer-2B joint transfer, but the same-observable
+     Ramsey held-out points and the cross-observable X_L transfer points relied
+     on execution order alone with nothing on disk to check them against.  The
+     order is now: calibration fit -> build every held-out prediction -> one
+     commitment file -> draw all held-out counts -> score.  The new gate
+     `every_scored_prediction_matches_the_commitment_on_disk` re-reads that file
+     and compares it against every value actually scored, so a prediction
+     recomputed after the fact, or a scored point that was never committed,
+     makes the gate fail.
+
+  3  SYMBOL ALIGNMENT WITH THE PAPER.  The contraction family is written H_s =
+     s H in the manuscript, so `contraction_epsilons` -> `contraction_scales`,
+     the row key `epsilon` -> `scale_s`, and
+     `every_positive_epsilon_path_nonconstant` ->
+     `every_positive_scale_path_nonconstant`.  Values and semantics unchanged.
+
+  NOTE.  Item 3 renames a key inside the protocol manifest, so
+  `protocol_sha256` necessarily differs from the v6.0/v6.1 value
+  7c465d17bd212f5af4106432a13929a1de30a9f94db92f8003bdeefb9e7c1749.  That is a
+  rename of a frozen field, not a change of protocol.
+
+What v6.1 fixed in v6.0
+-----------------------
+The physics, the Lindblad model, the estimators and every tolerance are
+unchanged, and v6.0's numbers reproduce.  What was broken was the AUDITING
+MACHINERY -- the parts that decide whether a gate can fail at all.
+
+  B1  freeze_and_commit().  v6.0 wrote frozen["predictions"] = prediction_rows
+      BY REFERENCE and then mutated those same dicts when the truth was
+      revealed, so the in-memory frozen object no longer hashed to its own
+      receipt (observed: ef985ffa... -> cec041c2...), and no gate ever re-read
+      the file.  Payloads are now deep-copied, hashed, read back from disk and
+      re-hashed, and the result is a gate that can fail.
+
+  B2  Layer 2B committed nothing.  It drew the held-out X_L data, computed the
+      residuals and the pulls, and only afterwards wrote a file named
+      "frozen_joint_predictions.json" -- with no hash and no receipt.  That
+      file documented a comparison already made.  Predictions are now written
+      and hashed BEFORE the transfer data is drawn.
+
+  B3  identifiability_witness() evaluated the Fisher matrix at cfg.true_gamma
+      and cfg.true_delta0, and its gates VOTE.  An experiment design may not
+      read the truth.  The voting instance now sits at the stated design prior;
+      a second, explicitly non-voting instance reports the achieved information
+      at the fitted values.
+
+  B4  The single-setting rank-deficiency test used single[0]/single[-1], which
+      is NEGATIVE (observed: -1.090e-17) for a numerically rank-one matrix, so
+      "ratio <= 1e-6" passed on SIGN rather than on magnitude and would also
+      have passed for a genuinely indefinite matrix.  It now uses magnitudes.
+
+  B5  operational_negative_control().  v6.0 introduced sixteen voting Layer-0
+      gates and not one mutation able to trip any of them, which contradicts
+      this script's own doctrine that a gate never observed to fail is not
+      evidence.  Four mutations are added.  M7 (H = 0) is the one that matters:
+      it demonstrates that `finite_nonconstant_path` really does exclude
+      standing still, which is the only thing separating the zero-cost claim
+      from a tautology.
+
+  B6  operational_gates["protocol_frozen_before_outcomes"] was hardcoded True.
+      That is an unfailable gate -- precisely the defect v3.1 was criticised
+      for.  It is replaced by a disk round-trip verification and renamed to
+      state only what it actually checks.
+
+Robustness, non-scientific: NumPy 1.x fallback for the trapezoid rule; explicit
+errors instead of ZeroDivisionError when a control offset cancels the prior
+imbalance; explicit error instead of a NumPy exception when the joint coverage
+sweep yields fewer than two usable replicates; stdout layer labels aligned with
+the certificate keys; the positive control gated on its own cost threshold
+rather than borrowing the trace-distance threshold.
+
+Checked and deliberately NOT changed: the kappa=0 false-alarm gate and
+kappa_detect are single-draw statistics.  Over 300 reseeds the kappa=0 transfer
+max-pull had mean 1.87, p95 2.87, max 3.88 against a 4-sigma threshold (0/300
+false alarms), and kappa_detect was 5e-4 in 40/40 reseeds.  At these shot counts
+the single draw is not a defect and replicating it would only hide an already
+quantified fact.
+
+What v6 added over v5.1
+-----------------------
   L0    A frozen protocol manifest is serialized and hashed before any outcome
         is computed.
   L1A   The collective-dephasing DFS is certified algebraically as the kernel
@@ -22,9 +163,9 @@ What v6 adds over v5.1
   L1B   A finite nonconstant trajectory is propagated inside that kernel.  Its
         accumulated declared jump cost and dissipator activity vanish.
   L1C   The same frozen meter gives positive cost on a control state.
-  L1D   A contraction family H_epsilon=epsilon H gives nonconstant zero-cost
-        paths for every epsilon>0 and approaches the constant path as
-        epsilon->0.  This is the finite-attainment/integrability witness.
+  L1D   A contraction family H_s = s H gives nonconstant zero-cost paths for
+        every s>0 and approaches the constant path as s->0.  This is the
+        finite-attainment/integrability witness.
   L2+   The v5.1 channel reduction, symmetry-opening law, calibration, joint
         identification, negative controls, and misspecification sweeps remain
         as model support rather than as a universal Principle-R claim.
@@ -97,24 +238,25 @@ Here:
     space, rate 2 gamma delta^2, against fresh finite-shot data (gate L2.5);
   * coverage of the asymptotic interval is measured over a seed sweep instead
     of a single draw;
-  * predictions are serialized and hashed before the truth is computed, so the
-    freeze is auditable rather than asserted in a comment.
+  * predictions are serialized, hashed and re-verified from disk before the
+    truth is computed, so the freeze is auditable rather than asserted.
 
 Honest boundary
 ---------------
 Exact NumPy/SciPy model evidence plus finite-shot synthetic data.  Not QPU
 data, not laboratory calibration, not zero total energy, not a universal
 realizability or Lorentzian claim.  "Blind" here means software-enforced
-information separation over synthetic counts.  delta is treated as a known
-control parameter, not an estimated quantity; only gamma is inferred.
+information separation over synthetic counts.  In Layer 2 delta is treated as a
+known control parameter and only gamma is inferred; Layer 2B relaxes that.
 
 Run:
     pip install -U numpy scipy matplotlib
-    python dfs_operational_v6.py
+    python dfs_operational_v6_2_2.py
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import importlib.metadata
@@ -140,7 +282,15 @@ import numpy as np
 from scipy.linalg import expm
 from scipy.optimize import minimize_scalar
 
-VERSION = "DFS-OPERATIONAL-PROTOCOL-v6.0"
+VERSION = "DFS-OPERATIONAL-PROTOCOL-v6.2.2"
+
+
+def integrate(values: Any, times: Any) -> float:
+    """FIX v6.1: np.trapezoid is NumPy>=2.0 only; fall back on NumPy 1.x."""
+    rule = getattr(np, "trapezoid", None)
+    if rule is None:
+        rule = np.trapz
+    return float(rule(values, times))
 
 
 # ----------------------------------------------------------------------------
@@ -155,11 +305,17 @@ class Config:
     # --- Layer 0/1: protocol-first operational audit ---
     # The path is sampled only after the protocol manifest has been written.
     trajectory_samples: int = 401
-    contraction_epsilons: tuple[float, ...] = (
+    # RENAMED v6.2 (was contraction_epsilons): the paper writes H_s = s H,
+    # so the code uses the same symbol.  Values and semantics unchanged.
+    contraction_scales: tuple[float, ...] = (
         1.0, 0.5, 0.25, 0.125, 0.0625,
     )
     nonconstant_trace_distance_minimum: float = 1.0e-8
     contraction_monotonic_tolerance: float = 1.0e-13
+    # FIX v6.1: the positive control is an accumulated COST, not a trace
+    # distance.  v6.0 gated it against nonconstant_trace_distance_minimum,
+    # which is a threshold on a different quantity in different units.
+    same_meter_minimum_accumulated_cost: float = 1.0e-6
 
     # --- Layer 1 ---
     duration_sweep: tuple[float, ...] = (0.1, 0.5, math.pi / 2.0, 2.0, 5.0, 25.0)
@@ -319,10 +475,58 @@ def save_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(clean(rows))
 
 
+def freeze_and_commit(output: Path, name: str, payload: Any) -> tuple[str, bool]:
+    """FIX v6.1 (B1): make a freeze falsifiable instead of asserted.
+
+    v6.0 stored `frozen["predictions"] = prediction_rows` BY REFERENCE and then
+    mutated those same dicts when the truth was revealed, so the in-memory
+    frozen object no longer hashed to its own receipt, and no gate ever re-read
+    the file.  Here the payload is deep-copied before serialization, the hash is
+    taken over the copy, and the file is read BACK from disk and re-hashed.  The
+    returned `verified` flag is a gate that can fail: tampering with the file
+    after the fact makes the recomputed hash disagree with the receipt.
+
+    Scope note (v6.2, item 1).  This proves the commitment is reproducible from
+    disk.  It does NOT prove that no outcome was computed first: there is no
+    external timestamp and no third party.  The ordering is enforced by where
+    this function is called, and a reviewer must check the call site.  The
+    correct write-up is "execution-order freezing within the executable audit",
+    never "preregistration".
+    """
+    snapshot = copy.deepcopy(payload)
+    path = output / f"{name}.json"
+    save_json(path, snapshot)
+    digest = sha256_object(snapshot)
+    reloaded = json.loads(path.read_text(encoding="utf-8"))
+    verified = bool(sha256_object(reloaded) == digest)
+    save_json(
+        output / f"{name}_receipt.json",
+        {
+            "sha256_of_canonical_payload": digest,
+            "recomputed_from_disk_matches": verified,
+            "guarantee": "execution-order freezing within the executable audit",
+            "not_a_guarantee_of": "formal preregistration",
+            "note": (
+                "Hash is taken over the canonical (sorted-key, compact) JSON "
+                "of the payload, not over the indented file bytes.  Written "
+                "and hashed BEFORE any truth value or held-out draw was "
+                "computed.  This establishes only that the payload can be "
+                "rebuilt from disk and rehashes to the recorded digest.  There "
+                "is no external timestamp and no third party, so it does NOT "
+                "independently establish that the write preceded every "
+                "computation; that ordering is enforced by the call site and "
+                "must be checked there.  Do not describe this as "
+                "preregistration."
+            ),
+        },
+    )
+    return digest, verified
+
+
 def create_unique_output_dir(requested: str | None) -> Path:
     base = Path(
         requested
-        or f"dfs_operational_v6_{time.strftime('%Y%m%d_%H%M%S')}"
+        or f"dfs_operational_v6_2_2_{time.strftime('%Y%m%d_%H%M%S')}"
     )
     for candidate in [base] + [
         base.with_name(f"{base.name}_run{i:02d}") for i in range(2, 1000)
@@ -388,7 +592,7 @@ def protocol_manifest(cfg: Config) -> dict[str, Any]:
             "gamma": cfg.true_gamma,
             "duration": cfg.target_duration,
             "trajectory_samples": cfg.trajectory_samples,
-            "contraction_epsilons": cfg.contraction_epsilons,
+            "contraction_scales": cfg.contraction_scales,
         },
         "decision_rules": {
             "exact_zero_tolerance": cfg.exact_zero_tolerance,
@@ -496,8 +700,8 @@ def operational_zero_mode_audit(
             }
         )
 
-    accumulated_cost = float(np.trapezoid(jump_rates, times))
-    accumulated_activity = float(np.trapezoid(activities, times))
+    accumulated_cost = integrate(jump_rates, times)
+    accumulated_activity = integrate(activities, times)
     trajectory = {
         "maximum_trace_distance_from_initial": max(distances),
         "accumulated_declared_jump_cost": accumulated_cost,
@@ -535,7 +739,7 @@ def operational_zero_mode_audit(
         positive_activities.append(
             float(np.linalg.norm(dissipator(jump, rho), ord="fro"))
         )
-    positive_cost = float(np.trapezoid(positive_rates, times))
+    positive_cost = integrate(positive_rates, times)
     analytic_positive_cost = 2.0 * cfg.true_gamma * cfg.target_duration
     positive_control = {
         "initial_state": "(|00>+|01>)/sqrt(2)",
@@ -543,17 +747,17 @@ def operational_zero_mode_audit(
         "analytic_accumulated_jump_cost": analytic_positive_cost,
         "relative_error": abs(positive_cost - analytic_positive_cost)
         / analytic_positive_cost,
-        "accumulated_dissipator_activity": float(
-            np.trapezoid(positive_activities, times)
-        ),
+        "accumulated_dissipator_activity": integrate(positive_activities, times),
     }
     positive_control_gates = {
+        # FIX v6.1: gated on same_meter_minimum_accumulated_cost, which is a
+        # threshold on a cost, instead of on the trace-distance threshold.
         "same_meter_cost_positive": positive_cost
-        > cfg.nonconstant_trace_distance_minimum,
+        > cfg.same_meter_minimum_accumulated_cost,
         "same_meter_activity_positive": positive_control[
             "accumulated_dissipator_activity"
         ]
-        > cfg.nonconstant_trace_distance_minimum,
+        > cfg.same_meter_minimum_accumulated_cost,
         "same_meter_cost_matches_analytic_calibration": positive_control[
             "relative_error"
         ]
@@ -561,15 +765,15 @@ def operational_zero_mode_audit(
     }
 
     contraction_rows: list[dict[str, Any]] = []
-    for epsilon in cfg.contraction_epsilons:
+    for scale_s in cfg.contraction_scales:
         endpoint = expm(
-            -1.0j * epsilon * hamiltonian * cfg.target_duration
+            -1.0j * scale_s * hamiltonian * cfg.target_duration
         ) @ initial
         endpoint_distance = pure_trace_distance(initial, endpoint)
         maximum_distance = 0.0
         rates: list[float] = []
         for point in times:
-            state = expm(-1.0j * epsilon * hamiltonian * point) @ initial
+            state = expm(-1.0j * scale_s * hamiltonian * point) @ initial
             maximum_distance = max(
                 maximum_distance, pure_trace_distance(initial, state)
             )
@@ -577,20 +781,18 @@ def operational_zero_mode_audit(
             rates.append(max(0.0, float(np.real(np.trace(kernel @ rho)))))
         contraction_rows.append(
             {
-                "epsilon": epsilon,
+                "scale_s": scale_s,
                 "endpoint_trace_distance_from_constant_path": endpoint_distance,
                 "maximum_trace_distance_from_initial": maximum_distance,
-                "accumulated_declared_jump_cost": float(
-                    np.trapezoid(rates, times)
-                ),
+                "accumulated_declared_jump_cost": integrate(rates, times),
                 "nonconstant": maximum_distance
                 >= cfg.nonconstant_trace_distance_minimum,
             }
         )
-    ordered_by_epsilon = sorted(contraction_rows, key=lambda row: row["epsilon"])
+    ordered_by_scale = sorted(contraction_rows, key=lambda row: row["scale_s"])
     endpoint_distances = [
         row["endpoint_trace_distance_from_constant_path"]
-        for row in ordered_by_epsilon
+        for row in ordered_by_scale
     ]
     monotone = all(
         endpoint_distances[index + 1] + cfg.contraction_monotonic_tolerance
@@ -598,9 +800,9 @@ def operational_zero_mode_audit(
         for index in range(len(endpoint_distances) - 1)
     )
     contraction = {
-        "family": "H_epsilon=epsilon H, epsilon>0, fixed duration",
+        "family": "H_s = s H, s > 0, fixed duration",
         "rows": contraction_rows,
-        "smallest_epsilon_endpoint_distance": ordered_by_epsilon[0][
+        "smallest_scale_endpoint_distance": ordered_by_scale[0][
             "endpoint_trace_distance_from_constant_path"
         ],
         "all_members_nonconstant": all(row["nonconstant"] for row in contraction_rows),
@@ -608,18 +810,18 @@ def operational_zero_mode_audit(
             row["accumulated_declared_jump_cost"] <= cfg.exact_zero_tolerance
             for row in contraction_rows
         ),
-        "endpoint_distance_monotone_with_epsilon": monotone,
+        "endpoint_distance_monotone_with_scale": monotone,
     }
     contraction_gates = {
         "finite_zero_cost_family": contraction["all_members_zero_declared_cost"],
-        "every_positive_epsilon_path_nonconstant": contraction[
+        "every_positive_scale_path_nonconstant": contraction[
             "all_members_nonconstant"
         ],
         "family_contracts_toward_constant_path": monotone
-        and ordered_by_epsilon[0][
+        and ordered_by_scale[0][
             "endpoint_trace_distance_from_constant_path"
         ]
-        < ordered_by_epsilon[-1][
+        < ordered_by_scale[-1][
             "endpoint_trace_distance_from_constant_path"
         ],
     }
@@ -640,7 +842,7 @@ def operational_zero_mode_audit(
             "operational_primitive": "predeclared protocol Pi",
             "model_local_rate": "j_Pi(rho)=Tr(K0 rho), K0=L0^dagger L0",
             "accumulated_model_cost": "J_Pi[rho]=integral j_Pi(rho_t)dt",
-            "finite_channel_witness": "E_ch (audited separately in Layer 2)",
+            "finite_channel_witness": "E_ch (audited separately in Layer 1)",
             "abstract_tangent_density_F": "NOT_CONSTRUCTED",
             "universal_Principle_R_bridge": "NOT_ESTABLISHED",
         },
@@ -649,6 +851,11 @@ def operational_zero_mode_audit(
         "same_meter_positive_control": positive_control,
         "contraction_family": contraction,
         "gates": gates,
+        "falsifiability_note": (
+            "These gates are exercised against injected defects in "
+            "`operational_negative_control`; v6.0 shipped them with no "
+            "mutation able to trip any of them."
+        ),
     }
     return report, trajectory_rows, contraction_rows
 
@@ -817,7 +1024,7 @@ def representation_regression(
         channel_superoperator(hamiltonian, degenerate_mix, duration)
     )
 
-    # (d) NEW: mixing two LINEARLY INDEPENDENT jumps.
+    # (d) mixing two LINEARLY INDEPENDENT jumps.
     second_jump = math.sqrt(0.05) * operators["X1"]
     distinct = [reference_jump, second_jump]
     distinct_reference = channel_superoperator(hamiltonian, distinct, duration)
@@ -833,7 +1040,7 @@ def representation_regression(
         / size
     )
 
-    # (e) NEW: inhomogeneous gauge freedom, the representation freedom that
+    # (e) inhomogeneous gauge freedom, the representation freedom that
     #     actually has content:  L -> L + c I,  H -> H - (i/2)(c* L - c L^dag).
     shift = 0.37 + 0.21j
     shifted_jump = reference_jump + shift * operators["I4"]
@@ -1535,55 +1742,43 @@ def layer2_calibration(
     )
     gamma_relative_error = abs(gamma_hat - cfg.true_gamma) / cfg.true_gamma
 
-    # ---- freeze: everything below uses gamma_hat only --------------------
-    heldout_rows = generate_rows(
-        cfg.true_gamma,
-        cfg.calibration_delta,
-        cfg.heldout_times,
-        cfg.shots_per_time,
-        heldout_rng,
-        "heldout_parity",
-        simulate_parity_visibility,
-        operators,
-    )
-    for row in heldout_rows:
-        row["predicted_visibility"] = closed_form_parity_visibility(
-            gamma_hat, cfg.calibration_delta, row["duration"]
-        )
-        row["visibility_residual"] = (
-            row["measured_visibility"] - row["predicted_visibility"]
-        )
-    heldout_summary = residual_sigma_summary(heldout_rows)
-
-    # ---- cross-experiment transfer: different observable, different
-    #      subspace, unseen delta, rate slower by 16/delta^2 ---------------
-    transfer_rows: list[dict[str, Any]] = []
-    for delta, times in cfg.transfer_schedule:
-        block = generate_rows(
-            cfg.true_gamma,
-            delta,
-            times,
-            cfg.shots_per_time,
-            transfer_rng,
-            "transfer_logical_x",
-            simulate_logical_x_visibility,
-            operators,
-        )
-        for row in block:
-            row["predicted_visibility"] = closed_form_logical_x_visibility(
-                gamma_hat, delta, row["duration"]
-            )
-            row["visibility_residual"] = (
-                row["measured_visibility"] - row["predicted_visibility"]
-            )
-            row["rate_ratio_versus_calibration"] = (
-                (2.0 + cfg.calibration_delta) ** 2 / delta**2
-            )
-        transfer_rows.extend(block)
-    transfer_summary = residual_sigma_summary(transfer_rows)
-
-    # ---- E_ch extrapolation over the control grid ------------------------
-    # This is NOT an independent test of gamma_hat; see the note below.
+    # ---- freeze: EVERY held-out prediction is built and committed BEFORE
+    #      any held-out datum is drawn ------------------------------------
+    #
+    # FIX v6.2 (item 2).  v6.1 committed only the E_ch extrapolation.  The
+    # same-observable Ramsey held-out points and the cross-observable X_L
+    # transfer points were predicted correctly but relied on execution order
+    # alone, with nothing on disk to check them against.  All three families
+    # now go into a single commitment file, the counts are drawn afterwards,
+    # and `every_scored_prediction_matches_the_commitment_on_disk` re-reads
+    # that file and compares it against every value actually scored.
+    heldout_predictions = [
+        {
+            "family": "heldout_same_observable",
+            "observable": "parity_00_11",
+            "delta": cfg.calibration_delta,
+            "duration": duration,
+            "predicted_visibility": closed_form_parity_visibility(
+                gamma_hat, cfg.calibration_delta, duration
+            ),
+        }
+        for duration in cfg.heldout_times
+    ]
+    transfer_predictions = [
+        {
+            "family": "cross_experiment_transfer",
+            "observable": "logical_x",
+            "delta": delta,
+            "duration": duration,
+            "predicted_visibility": closed_form_logical_x_visibility(
+                gamma_hat, delta, duration
+            ),
+        }
+        for delta, times in cfg.transfer_schedule
+        for duration in times
+    ]
+    # E_ch extrapolation over the control grid.  This is NOT an independent
+    # test of gamma_hat; see `extrapolation_is_not_an_independent_test`.
     prediction_rows = [
         {
             "delta": delta,
@@ -1598,25 +1793,73 @@ def layer2_calibration(
         }
         for delta in cfg.heldout_deltas
     ]
-    frozen = {
-        "gamma_hat": gamma_hat,
-        "target_duration": cfg.target_duration,
-        "predictions": prediction_rows,
-    }
-    frozen_path = output / "frozen_predictions.json"
-    save_json(frozen_path, frozen)
-    frozen_hash = sha256_object(frozen)
-    save_json(
-        output / "freeze_receipt.json",
+    # FIX v6.1 (B1): deep-copied, hashed, and re-verified from disk.  v6.0
+    # hashed an object that aliased prediction_rows and was mutated below.
+    frozen_hash, frozen_verified = freeze_and_commit(
+        output,
+        "frozen_predictions",
         {
-            "note": (
-                "Written and hashed BEFORE any truth value was computed.  "
-                "Recompute sha256 over the canonical JSON of "
-                "frozen_predictions.json to verify the freeze."
-            ),
-            "sha256_of_canonical_frozen_object": frozen_hash,
+            "gamma_hat": gamma_hat,
+            "target_duration": cfg.target_duration,
+            "heldout_same_observable": heldout_predictions,
+            "cross_experiment_transfer": transfer_predictions,
+            "encoded_cost_extrapolation": prediction_rows,
         },
     )
+
+    # ---- data drawn only after the commitment ---------------------------
+    heldout_rows = generate_rows(
+        cfg.true_gamma,
+        cfg.calibration_delta,
+        cfg.heldout_times,
+        cfg.shots_per_time,
+        heldout_rng,
+        "heldout_parity",
+        simulate_parity_visibility,
+        operators,
+    )
+    for row, prediction in zip(heldout_rows, heldout_predictions):
+        if row["duration"] != prediction["duration"]:
+            raise RuntimeError(
+                "held-out draw order does not match the commitment order"
+            )
+        row["predicted_visibility"] = prediction["predicted_visibility"]
+        row["visibility_residual"] = (
+            row["measured_visibility"] - row["predicted_visibility"]
+        )
+    heldout_summary = residual_sigma_summary(heldout_rows)
+
+    # ---- cross-experiment transfer: different observable, different
+    #      subspace, unseen delta, rate slower by 16/delta^2 ---------------
+    committed_transfer = {
+        (entry["delta"], entry["duration"]): entry["predicted_visibility"]
+        for entry in transfer_predictions
+    }
+    transfer_rows: list[dict[str, Any]] = []
+    for delta, times in cfg.transfer_schedule:
+        block = generate_rows(
+            cfg.true_gamma,
+            delta,
+            times,
+            cfg.shots_per_time,
+            transfer_rng,
+            "transfer_logical_x",
+            simulate_logical_x_visibility,
+            operators,
+        )
+        for row in block:
+            key = (delta, row["duration"])
+            if key not in committed_transfer:
+                raise RuntimeError(f"transfer point {key} was never committed")
+            row["predicted_visibility"] = committed_transfer[key]
+            row["visibility_residual"] = (
+                row["measured_visibility"] - row["predicted_visibility"]
+            )
+            row["rate_ratio_versus_calibration"] = (
+                (2.0 + cfg.calibration_delta) ** 2 / delta**2
+            )
+        transfer_rows.extend(block)
+    transfer_summary = residual_sigma_summary(transfer_rows)
 
     # ---- truth revealed only now ----------------------------------------
     extrapolation_errors: list[float] = []
@@ -1652,6 +1895,94 @@ def layer2_calibration(
     )
     log_sensitivity = float((bumped - base) / base / 0.001)
 
+    # Re-read the commitment from disk and confirm that every value actually
+    # scored above came from it.  This is the falsifiable form of "the
+    # predictions were frozen": a prediction recomputed after the fact, or a
+    # held-out point never committed, makes this gate fail.
+    committed = json.loads(
+        (output / "frozen_predictions.json").read_text(encoding="utf-8")
+    )
+    committed_visibility = {
+        (entry["observable"], entry["delta"], entry["duration"]): entry[
+            "predicted_visibility"
+        ]
+        for family in ("heldout_same_observable", "cross_experiment_transfer")
+        for entry in committed[family]
+    }
+    committed_encoded_cost = {
+        entry["delta"]: entry["predicted_encoded_cost_closed_form"]
+        for entry in committed["encoded_cost_extrapolation"]
+    }
+    scored_visibility = [("parity_00_11", row) for row in heldout_rows] + [
+        ("logical_x", row) for row in transfer_rows
+    ]
+
+    # FIX v6.2.1: coverage is established BEFORE any deviation is computed.
+    # v6.2 evaluated max(...) first, so a point that was never committed raised
+    # a KeyError and crashed the run instead of failing the gate.  A missing
+    # commitment is a gate failure, not a traceback.
+    missing_visibility = [
+        [observable, row["delta"], row["duration"]]
+        for observable, row in scored_visibility
+        if (observable, row["delta"], row["duration"]) not in committed_visibility
+    ]
+    missing_encoded_cost = [
+        row["delta"]
+        for row in prediction_rows
+        if row["delta"] not in committed_encoded_cost
+    ]
+
+    # FIX v6.2.1: the E_ch payload is now compared POINT BY POINT against the
+    # commitment, not merely counted.  v6.2 recorded only
+    # committed_encoded_cost_predictions, so the values that actually entered
+    # the error calculation were never checked against disk and the gate name
+    # `every_scored_prediction_...` was stronger than what was verified.
+    maximum_visibility_deviation = max(
+        (
+            abs(
+                row["predicted_visibility"]
+                - committed_visibility[
+                    (observable, row["delta"], row["duration"])
+                ]
+            )
+            for observable, row in scored_visibility
+            if (observable, row["delta"], row["duration"]) in committed_visibility
+        ),
+        default=0.0,
+    )
+    maximum_encoded_cost_deviation = max(
+        (
+            abs(
+                row["predicted_encoded_cost_closed_form"]
+                - committed_encoded_cost[row["delta"]]
+            )
+            for row in prediction_rows
+            if row["delta"] in committed_encoded_cost
+        ),
+        default=0.0,
+    )
+
+    commitment_coverage = {
+        "committed_visibility_predictions": len(committed_visibility),
+        "scored_visibility_predictions": len(scored_visibility),
+        "committed_encoded_cost_predictions": len(committed_encoded_cost),
+        "scored_encoded_cost_predictions": len(prediction_rows),
+        "missing_visibility_points": missing_visibility,
+        "missing_encoded_cost_points": missing_encoded_cost,
+        "every_scored_point_was_committed": (
+            not missing_visibility and not missing_encoded_cost
+        ),
+        "maximum_visibility_commitment_deviation": maximum_visibility_deviation,
+        "maximum_encoded_cost_commitment_deviation": (
+            maximum_encoded_cost_deviation
+        ),
+        "note": (
+            "Deviations are computed only over points that ARE present in the "
+            "commitment; absence is reported separately by "
+            "every_scored_point_was_committed, and the gate requires both."
+        ),
+    }
+
     gates = {
         **model["gates"],
         "mle_converged": fit_diagnostics["optimizer_success"],
@@ -1670,6 +2001,18 @@ def layer2_calibration(
         <= cfg.ech_relative_error_tolerance,
         "ech_closed_form_model_error_small": max(model_only_errors)
         <= cfg.ech_model_relative_error_tolerance,
+        "frozen_prediction_receipt_verifies_from_disk": frozen_verified,
+        "every_scored_prediction_matches_the_commitment_on_disk": (
+            commitment_coverage["every_scored_point_was_committed"]
+            and commitment_coverage["maximum_visibility_commitment_deviation"]
+            == 0.0
+            and commitment_coverage["maximum_encoded_cost_commitment_deviation"]
+            == 0.0
+            and commitment_coverage["scored_visibility_predictions"]
+            == commitment_coverage["committed_visibility_predictions"]
+            and commitment_coverage["scored_encoded_cost_predictions"]
+            == commitment_coverage["committed_encoded_cost_predictions"]
+        ),
     }
 
     coverage = coverage_sweep(cfg, operators, coverage_rng)
@@ -1698,6 +2041,8 @@ def layer2_calibration(
             "heldout_residual_summary": heldout_summary,
             "cross_experiment_transfer_summary": transfer_summary,
             "frozen_prediction_sha256": frozen_hash,
+            "frozen_prediction_receipt_verified": frozen_verified,
+            "commitment_coverage": commitment_coverage,
             "ech_extrapolation": {
                 "maximum_relative_error_total": max(extrapolation_errors),
                 "maximum_relative_error_model_only": max(model_only_errors),
@@ -1730,7 +2075,6 @@ def layer2_calibration(
     )
 
 
-
 # ----------------------------------------------------------------------------
 # Layer 2B -- joint identification of (gamma, delta0)
 # ----------------------------------------------------------------------------
@@ -1739,6 +2083,11 @@ def design_times(cfg: Config, offset: float) -> tuple[float, ...]:
     rate = 2.0 * cfg.design_prior_gamma * (
         2.0 + cfg.design_prior_delta0 + offset
     ) ** 2
+    if not (rate > 0.0):
+        raise ValueError(
+            f"control offset {offset} cancels 2+design_prior_delta0; the "
+            "predicted parity decay rate is zero and no time grid exists."
+        )
     return tuple(float(u / rate) for u in cfg.design_time_units)
 
 
@@ -1746,6 +2095,13 @@ def transfer_design_times(cfg: Config, offset: float) -> tuple[float, ...]:
     rate = 2.0 * cfg.design_prior_gamma * (
         cfg.design_prior_delta0 + offset
     ) ** 2
+    # FIX v6.1: an offset that cancels the prior imbalance gave a bare
+    # ZeroDivisionError rather than a diagnosable failure.
+    if not (rate > 0.0):
+        raise ValueError(
+            f"transfer offset {offset} cancels design_prior_delta0; the "
+            "predicted X_L decay rate is zero and no transfer grid exists."
+        )
     return tuple(float(u / rate) for u in cfg.joint_transfer_time_units)
 
 
@@ -1844,12 +2200,25 @@ def fit_joint_mle(
     )
 
 
-def identifiability_witness(cfg: Config) -> dict[str, Any]:
+def identifiability_witness(
+    cfg: Config, gamma: float, delta0: float, evaluation_point: str
+) -> dict[str, Any]:
     """A single control setting cannot identify (gamma, delta0); three can.
 
     With one setting the model depends on the pair only through the product
     gamma*(2+delta0+offset)^2, so the Fisher matrix is exactly rank one.  This
     is the reason the v4 protocol had to treat delta as known.
+
+    FIX v6.1 (B3).  v6.0 evaluated this at cfg.true_gamma and cfg.true_delta0
+    while its gates VOTED.  An experiment design may not read the truth, so the
+    voting instance is now evaluated at the stated design prior; a second,
+    explicitly non-voting instance is reported at the fitted values as the
+    achieved information.
+
+    FIX v6.1 (B4).  v6.0 computed single[0]/single[-1], which is NEGATIVE
+    (observed -1.090e-17) for a numerically rank-one matrix, so the gate
+    `ratio <= 1e-6` passed on SIGN rather than on magnitude, and would also have
+    passed for a genuinely indefinite matrix.  The ratio now uses magnitudes.
     """
     def rows_for(offsets: tuple[float, ...]) -> list[dict[str, Any]]:
         return [
@@ -1862,14 +2231,16 @@ def identifiability_witness(cfg: Config) -> dict[str, Any]:
             for duration in design_times(cfg, offset)
         ]
 
-    single = np.linalg.eigvalsh(
-        joint_fisher(cfg.true_gamma, cfg.true_delta0, rows_for((0.0,)))
-    )
+    single = np.linalg.eigvalsh(joint_fisher(gamma, delta0, rows_for((0.0,))))
     multiple = np.linalg.eigvalsh(
-        joint_fisher(cfg.true_gamma, cfg.true_delta0, rows_for(cfg.control_offsets))
+        joint_fisher(gamma, delta0, rows_for(cfg.control_offsets))
     )
-    single_ratio = float(single[0] / single[-1])
+    largest = float(abs(single[-1]))
+    single_ratio = float(abs(single[0]) / largest) if largest > 0.0 else float("inf")
     return {
+        "evaluation_point": evaluation_point,
+        "evaluated_at_gamma": float(gamma),
+        "evaluated_at_delta0": float(delta0),
         "single_setting_fisher_eigenvalues": single.tolist(),
         "single_setting_eigenvalue_ratio": single_ratio,
         "multi_setting_fisher_eigenvalues": multiple.tolist(),
@@ -1889,7 +2260,13 @@ def layer2b_joint_identification(
     streams = np.random.default_rng(cfg.master_seed + 77).spawn(3)
     calibration_rng, transfer_rng, coverage_rng = streams
 
-    identifiability = identifiability_witness(cfg)
+    # Voting instance: design-time, evaluated at the STATED PRIOR only.
+    identifiability = identifiability_witness(
+        cfg,
+        cfg.design_prior_gamma,
+        cfg.design_prior_delta0,
+        "design_prior_pre_data",
+    )
 
     calibration_rows: list[dict[str, Any]] = []
     for offset in cfg.control_offsets:
@@ -1930,61 +2307,122 @@ def layer2b_joint_identification(
     # The predicted rate is 2*gamma*(delta0+offset)^2, so it needs BOTH
     # estimates.  Uncertainty is propagated by the delta method and combined
     # with shot noise, instead of comparing against shot noise alone.
-    transfer_rows: list[dict[str, Any]] = []
+    #
+    # FIX v6.1 (B2).  v6.0 drew the held-out data, computed residuals and
+    # pulls, and only THEN wrote "frozen_joint_predictions.json" -- unhashed.
+    # That file recorded a comparison already made.  The predictions are now
+    # committed and hashed FIRST; the transfer data is drawn afterwards.
+    predicted_rows: list[dict[str, Any]] = []
     for offset in cfg.joint_transfer_offsets:
         for duration in transfer_design_times(cfg, offset):
-            exact = simulate_logical_x_visibility(
-                cfg.true_gamma, cfg.true_delta0 + offset, duration, operators
-            )
-            plus, measured = draw_counts(
-                exact, cfg.shots_per_time, transfer_rng
-            )
-            predicted = joint_logical_x_visibility(
-                gamma_hat, delta0_hat, offset, duration
-            )
-            total = delta0_hat + offset
-            jacobian = np.array(
-                [
-                    -2.0 * total**2 * duration * predicted,
-                    -4.0 * gamma_hat * total * duration * predicted,
-                ]
-            )
-            parameter_variance = float(jacobian @ covariance @ jacobian)
-            shot_variance = max(1.0 - exact**2, 0.0) / cfg.shots_per_time
-            sigma = math.sqrt(shot_variance + parameter_variance)
-            transfer_rows.append(
+            predicted_rows.append(
                 {
                     "offset": offset,
-                    "total_delta": total,
                     "duration": duration,
-                    "shots": cfg.shots_per_time,
-                    "exact_visibility": exact,
-                    "measured_visibility": measured,
-                    "predicted_visibility": predicted,
-                    "visibility_residual": measured - predicted,
-                    "shot_noise_sigma": math.sqrt(shot_variance),
-                    "parameter_propagation_sigma": math.sqrt(parameter_variance),
-                    "combined_sigma": sigma,
-                    "pull": (measured - predicted) / sigma,
-                    "data_role": "joint_transfer",
+                    "predicted_visibility": joint_logical_x_visibility(
+                        gamma_hat, delta0_hat, offset, duration
+                    ),
                 }
             )
+    joint_frozen_hash, joint_frozen_verified = freeze_and_commit(
+        output,
+        "frozen_joint_predictions",
+        {
+            "gamma_hat": gamma_hat,
+            "delta0_hat": delta0_hat,
+            "covariance": covariance.tolist(),
+            "predictions": predicted_rows,
+        },
+    )
+
+    transfer_rows: list[dict[str, Any]] = []
+    for entry in predicted_rows:
+        offset = entry["offset"]
+        duration = entry["duration"]
+        predicted = entry["predicted_visibility"]
+        exact = simulate_logical_x_visibility(
+            cfg.true_gamma, cfg.true_delta0 + offset, duration, operators
+        )
+        plus, measured = draw_counts(exact, cfg.shots_per_time, transfer_rng)
+        total = delta0_hat + offset
+        jacobian = np.array(
+            [
+                -2.0 * total**2 * duration * predicted,
+                -4.0 * gamma_hat * total * duration * predicted,
+            ]
+        )
+        parameter_variance = float(jacobian @ covariance @ jacobian)
+        shot_variance = max(1.0 - exact**2, 0.0) / cfg.shots_per_time
+        sigma = math.sqrt(shot_variance + parameter_variance)
+        transfer_rows.append(
+            {
+                "offset": offset,
+                "total_delta": total,
+                "duration": duration,
+                "shots": cfg.shots_per_time,
+                "exact_visibility": exact,
+                "measured_visibility": measured,
+                "predicted_visibility": predicted,
+                "visibility_residual": measured - predicted,
+                "shot_noise_sigma": math.sqrt(shot_variance),
+                "parameter_propagation_sigma": math.sqrt(parameter_variance),
+                "combined_sigma": sigma,
+                "pull": (measured - predicted) / sigma,
+                "data_role": "joint_transfer",
+            }
+        )
     worst_pull = max(abs(row["pull"]) for row in transfer_rows)
 
-    frozen = {
-        "gamma_hat": gamma_hat,
-        "delta0_hat": delta0_hat,
-        "covariance": covariance.tolist(),
-        "predictions": [
-            {
-                "offset": row["offset"],
-                "duration": row["duration"],
-                "predicted_visibility": row["predicted_visibility"],
-            }
-            for row in transfer_rows
-        ],
+    # ---- re-read the joint commitment and compare it point by point ------
+    #
+    # FIX v6.2.2.  v6.2.1 gave Layer 2 a point-by-point check against its
+    # commitment but left Layer 2B verifying only the receipt hash.  Execution
+    # order was already correct, so this was never a run-time defect -- but the
+    # semantics were asymmetric: a hash proves the FILE is intact, not that the
+    # values actually scored came from it.  The same coverage-then-deviation
+    # structure is applied here, so "every scored prediction matches the
+    # commitment" now holds for both layers rather than for one.
+    joint_committed = json.loads(
+        (output / "frozen_joint_predictions.json").read_text(encoding="utf-8")
+    )
+    committed_joint_lookup = {
+        (entry["offset"], entry["duration"]): entry["predicted_visibility"]
+        for entry in joint_committed["predictions"]
     }
-    save_json(output / "frozen_joint_predictions.json", frozen)
+    # Coverage FIRST: a scored point absent from the commitment must fail the
+    # gate, not raise KeyError.
+    missing_joint = [
+        [row["offset"], row["duration"]]
+        for row in transfer_rows
+        if (row["offset"], row["duration"]) not in committed_joint_lookup
+    ]
+    maximum_joint_deviation = max(
+        (
+            abs(
+                row["predicted_visibility"]
+                - committed_joint_lookup[(row["offset"], row["duration"])]
+            )
+            for row in transfer_rows
+            if (row["offset"], row["duration"]) in committed_joint_lookup
+        ),
+        default=0.0,
+    )
+    joint_commitment_coverage = {
+        "committed_transfer_predictions": len(committed_joint_lookup),
+        "scored_transfer_predictions": len(transfer_rows),
+        "missing_transfer_points": missing_joint,
+        "every_scored_point_was_committed": not missing_joint,
+        "maximum_transfer_commitment_deviation": maximum_joint_deviation,
+        "committed_parameters_match_the_estimates_used": (
+            joint_committed["gamma_hat"] == gamma_hat
+            and joint_committed["delta0_hat"] == delta0_hat
+        ),
+        "note": (
+            "The deviation is computed only over points that ARE present in "
+            "the commitment; absence is reported separately by "
+            "every_scored_point_was_committed, and the gate requires both."
+        ),
+    }
 
     # ---- coverage of the joint asymptotic intervals ----------------------
     exact_cache = {
@@ -2021,13 +2459,20 @@ def layer2b_joint_identification(
         gamma_covered += int(abs(g_hat - cfg.true_gamma) <= 1.96 * gamma_sigma)
         delta0_covered += int(abs(d_hat - cfg.true_delta0) <= 1.96 * delta0_sigma)
     replicates = len(gamma_pulls)
+    # FIX v6.1: np.std(..., ddof=1) raises on fewer than two replicates; the
+    # v6.0 max(replicates, 1) guard protected the ratios but not the spread.
+    if replicates < 2:
+        raise RuntimeError(
+            f"joint coverage sweep produced {replicates} usable replicates; "
+            "the joint MLE is not converging."
+        )
     sigma_band = math.sqrt(
-        cfg.coverage_nominal * (1 - cfg.coverage_nominal) / max(replicates, 1)
+        cfg.coverage_nominal * (1 - cfg.coverage_nominal) / replicates
     )
     coverage = {
         "replicates": replicates,
-        "gamma_empirical_coverage": gamma_covered / max(replicates, 1),
-        "delta0_empirical_coverage": delta0_covered / max(replicates, 1),
+        "gamma_empirical_coverage": gamma_covered / replicates,
+        "delta0_empirical_coverage": delta0_covered / replicates,
         "binomial_sigma": sigma_band,
         "gamma_pull_standard_deviation": float(np.std(gamma_pulls, ddof=1)),
         "delta0_pull_standard_deviation": float(np.std(delta0_pulls, ddof=1)),
@@ -2044,6 +2489,21 @@ def layer2b_joint_identification(
         <= cfg.delta0_absolute_error_tolerance,
         "two_parameter_transfer_within_combined_uncertainty": worst_pull
         <= cfg.transfer_sigma_tolerance,
+        "joint_frozen_prediction_receipt_verifies_from_disk": (
+            joint_frozen_verified
+        ),
+        "every_scored_joint_prediction_matches_the_commitment_on_disk": (
+            joint_commitment_coverage["every_scored_point_was_committed"]
+            and joint_commitment_coverage[
+                "maximum_transfer_commitment_deviation"
+            ]
+            == 0.0
+            and joint_commitment_coverage["scored_transfer_predictions"]
+            == joint_commitment_coverage["committed_transfer_predictions"]
+            and joint_commitment_coverage[
+                "committed_parameters_match_the_estimates_used"
+            ]
+        ),
         "joint_gamma_coverage_consistent": abs(
             coverage["gamma_empirical_coverage"] - cfg.coverage_nominal
         )
@@ -2064,9 +2524,14 @@ def layer2b_joint_identification(
                 "delta0 is unknown; the experimenter adds known control "
                 "offsets.  Three settings of the |00>,|11> coherence identify "
                 "(gamma, delta0) jointly; the logical X_L decay at unseen "
-                "offsets is kept entirely as held-out data."
+                "offsets is kept entirely as held-out data, and the two-"
+                "parameter prediction for it is hashed to disk before that "
+                "data is drawn."
             ),
-            "identifiability": identifiability,
+            "identifiability_design_prior_voting": identifiability,
+            "identifiability_at_estimates_nonvoting": identifiability_witness(
+                cfg, gamma_hat, delta0_hat, "fitted_estimates_post_data"
+            ),
             "true_gamma_hidden_from_fit": cfg.true_gamma,
             "true_delta0_hidden_from_fit": cfg.true_delta0,
             "gamma_hat": gamma_hat,
@@ -2076,11 +2541,15 @@ def layer2b_joint_identification(
             "fit_diagnostics": diagnostics,
             "maximum_closed_form_deviation": model_deviation,
             "transfer_maximum_absolute_pull": worst_pull,
+            "joint_frozen_prediction_sha256": joint_frozen_hash,
+            "joint_frozen_prediction_receipt_verified": joint_frozen_verified,
+            "joint_commitment_coverage": joint_commitment_coverage,
             "coverage": coverage,
             "gates": gates,
             "design_note": (
                 "Time grids come from design_prior_gamma/design_prior_delta0, "
-                "not from the true values.  Identification and the held-out "
+                "not from the true values, and so does the voting "
+                "identifiability witness.  Identification and the held-out "
                 "test use disjoint observables: using X_L data to pin delta0 "
                 "would buy identifiability at the cost of the held-out test, "
                 "and that trade-off is a real constraint of the protocol."
@@ -2104,6 +2573,13 @@ def misspecification_sensitivity(
     for the same-observable held-out test and for the cross-experiment
     transfer test.  The gap between the two is the argument for keeping the
     transfer test at all.
+
+    v6.1 note: kappa_detect and the kappa=0 false-alarm gate are single-draw
+    statistics.  This was audited rather than assumed: over 300 reseeds the
+    kappa=0 transfer max-pull had mean 1.87, p95 2.87 and max 3.88 against the
+    4-sigma threshold (0/300 false alarms), and kappa_detect for the
+    non-collective mechanism was 5e-4 in 40/40 reseeds.  At these shot counts
+    the single draw is stable and is deliberately left as is.
     """
     mechanisms: dict[str, list[np.ndarray]] = {
         "non_collective_dephasing_Z1": [operators["Z1"]],
@@ -2267,7 +2743,121 @@ def misspecification_sensitivity(
 
 
 # ----------------------------------------------------------------------------
-# negative control: prove the gates can fail
+# negative control for the OPERATIONAL (Layer 0) gates
+# ----------------------------------------------------------------------------
+def operational_negative_control(
+    cfg: Config, operators: dict[str, np.ndarray]
+) -> dict[str, Any]:
+    """FIX v6.1 (B5): give the Layer-0 gates something that can kill them.
+
+    v6.0 introduced sixteen voting operational gates and not one mutation able
+    to trip any of them.  By this script's own doctrine -- a gate that has never
+    been observed to fail is not evidence -- the entire new layer was
+    unwitnessed.  Each mutation below names the operational gate it targets.
+
+    M7 is the one that matters.  A constant path has zero declared cost
+    trivially; unless `finite_nonconstant_path` can actually fail, the
+    zero-cost claim is a tautology.  M7 exhibits exactly that failure.
+    """
+    encoding = operators["V"]
+    projector = encoding @ encoding.conj().T
+    complement = operators["I4"] - projector
+    times = np.linspace(0.0, cfg.target_duration, cfg.trajectory_samples)
+
+    def probe(
+        hamiltonian: np.ndarray, jump: np.ndarray, initial: np.ndarray
+    ) -> dict[str, float]:
+        kernel = jump.conj().T @ jump
+        rates: list[float] = []
+        distances: list[float] = []
+        leakages: list[float] = []
+        for point in times:
+            state = expm(-1.0j * hamiltonian * point) @ initial
+            rho = np.outer(state, state.conj())
+            rates.append(max(0.0, float(np.real(np.trace(kernel @ rho)))))
+            distances.append(pure_trace_distance(initial, state))
+            leakages.append(
+                abs(float(np.real(np.vdot(state, complement @ state))))
+            )
+        return {
+            "accumulated_declared_jump_cost": integrate(rates, times),
+            "maximum_trace_distance_from_initial": max(distances),
+            "maximum_DFS_state_leakage": max(leakages),
+        }
+
+    collective = jump_for_delta(cfg.true_gamma, 0.0, operators)
+    dfs_state = ket(1)
+    control_state = (ket(0) + ket(1)) / math.sqrt(2.0)
+    results: dict[str, Any] = {}
+
+    # M5: a single-qubit jump is not collective, so the DFS is not in the
+    #     kernel of the declared meter.  Expect J_Pi = gamma * T exactly.
+    m5 = probe(
+        operators["H"], math.sqrt(cfg.true_gamma) * operators["Z1"], dfs_state
+    )
+    results["M5_single_qubit_jump_breaks_the_cost_kernel"] = {
+        "targets_gate": "zero_accumulated_declared_cost",
+        "accumulated_declared_jump_cost": m5["accumulated_declared_jump_cost"],
+        "analytic_expectation_gamma_times_T": cfg.true_gamma * cfg.target_duration,
+        "tolerance": cfg.exact_zero_tolerance,
+        "gate_fires": m5["accumulated_declared_jump_cost"]
+        > cfg.exact_zero_tolerance,
+    }
+
+    # M6: a Hamiltonian that does not commute with the code projector drives
+    #     the state out of the DFS.
+    m6 = probe(
+        operators["H"] + cfg.exchange_J * operators["X1"], collective, dfs_state
+    )
+    results["M6_hamiltonian_does_not_preserve_the_DFS"] = {
+        "targets_gate": "state_path_stays_in_DFS",
+        "maximum_DFS_state_leakage": m6["maximum_DFS_state_leakage"],
+        "tolerance": cfg.leakage_tolerance,
+        "gate_fires": m6["maximum_DFS_state_leakage"] > cfg.leakage_tolerance,
+    }
+
+    # M7: THE TAUTOLOGY CHECK.  H = 0 gives a constant path with zero cost.
+    m7 = probe(np.zeros((4, 4), dtype=complex), collective, dfs_state)
+    results["M7_constant_path_is_zero_cost_but_trivial"] = {
+        "targets_gate": "finite_nonconstant_path",
+        "maximum_trace_distance_from_initial": m7[
+            "maximum_trace_distance_from_initial"
+        ],
+        "accumulated_declared_jump_cost": m7["accumulated_declared_jump_cost"],
+        "threshold": cfg.nonconstant_trace_distance_minimum,
+        "gate_fires": m7["maximum_trace_distance_from_initial"]
+        < cfg.nonconstant_trace_distance_minimum,
+    }
+
+    # M8: preparing the positive control INSIDE the DFS makes the same-meter
+    #     control vacuous; the gate must notice.
+    m8 = probe(operators["H"], collective, dfs_state)
+    results["M8_positive_control_prepared_inside_the_DFS"] = {
+        "targets_gate": "same_meter_cost_positive",
+        "declared_input": "|01> instead of (|00>+|01>)/sqrt(2)",
+        "accumulated_declared_jump_cost": m8["accumulated_declared_jump_cost"],
+        "threshold": cfg.same_meter_minimum_accumulated_cost,
+        "gate_fires": not (
+            m8["accumulated_declared_jump_cost"]
+            > cfg.same_meter_minimum_accumulated_cost
+        ),
+    }
+
+    reference = probe(operators["H"], collective, control_state)
+    results["reference_unmutated_protocol"] = {
+        "role": "sanity_only_not_a_mutation",
+        "positive_control_cost": reference["accumulated_declared_jump_cost"],
+    }
+    results["all_operational_mutations_detected"] = all(
+        entry["gate_fires"]
+        for entry in results.values()
+        if isinstance(entry, dict) and "gate_fires" in entry
+    )
+    return results
+
+
+# ----------------------------------------------------------------------------
+# negative control: prove the model gates can fail
 # ----------------------------------------------------------------------------
 def negative_control(
     cfg: Config, operators: dict[str, np.ndarray]
@@ -2405,7 +2995,9 @@ def negative_control(
     }
 
     results["all_mutations_detected"] = all(
-        entry["gate_fires"] for entry in results.values() if isinstance(entry, dict)
+        entry["gate_fires"]
+        for entry in results.values()
+        if isinstance(entry, dict) and "gate_fires" in entry
     )
     return results
 
@@ -2542,7 +3134,9 @@ def save_plot(
 # entry point
 # ----------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="DFS channel-cost audit v5")
+    parser = argparse.ArgumentParser(
+        description="DFS operational-protocol + channel support audit v6.2.2"
+    )
     parser.add_argument("--output-dir")
     raw, cleaned, ignored, index = sys.argv[1:], [], [], 0
     while index < len(raw):
@@ -2586,40 +3180,38 @@ def main() -> None:
     save_json(output / "summary.json", summary)
 
     print("\n" + "=" * 100)
-    print("DFS OPERATIONAL PROTOCOL + CHANNEL SUPPORT AUDIT v6.0")
+    print("DFS OPERATIONAL PROTOCOL + CHANNEL SUPPORT AUDIT v6.2.2")
     print("=" * 100)
     print("backend=exact NumPy/SciPy | cloud access=none")
 
     try:
         cfg = Config()
 
-        # Layer 0 is deliberately serialized before operators are built or any
-        # outcome is evaluated.  The hash makes the freeze externally auditable.
+        # The manifest is deliberately serialized before operators are built or
+        # any outcome is evaluated.  FIX v6.1 (B6): the commitment is now read
+        # back from disk and re-hashed, instead of being asserted True.
         frozen_protocol = protocol_manifest(cfg)
-        frozen_protocol_sha256 = sha256_object(frozen_protocol)
-        save_json(output / "frozen_protocol.json", frozen_protocol)
-        save_json(
-            output / "frozen_protocol_commitment.json",
-            {
-                "protocol_sha256": frozen_protocol_sha256,
-                "frozen_before_outcome_computation": True,
-            },
+        frozen_protocol_sha256, protocol_commitment_verified = freeze_and_commit(
+            output, "frozen_protocol", frozen_protocol
         )
         operators = build_operators(cfg)
 
-        print("\n[LAYER 0] Frozen operational protocol")
+        print("\n[COMMITMENT] Frozen operational protocol manifest")
         print(
             json.dumps(
                 {
                     "protocol_id": frozen_protocol["protocol_id"],
                     "protocol_sha256": frozen_protocol_sha256,
-                    "frozen_before_outcome_computation": True,
+                    "commitment_verifies_from_disk": protocol_commitment_verified,
                 },
                 indent=2,
             )
         )
 
-        print("\n[LAYER 1] Integrable operational zero-mode audit")
+        print(
+            "\n[LAYER 0] Integrable operational zero-mode audit "
+            "-> certificate.operational_zero_mode"
+        )
         operational, trajectory_rows, contraction_rows = (
             operational_zero_mode_audit(cfg, operators)
         )
@@ -2633,7 +3225,7 @@ def main() -> None:
             f"{operational['same_meter_positive_control']['accumulated_declared_jump_cost']:.6f}"
         )
 
-        print("\n[LAYER 2] Channel-level structural audit")
+        print("\n[LAYER 1] Channel-level structural audit -> certificate.layer1")
         layer1, selection_rows, powerlaw_rows = layer1_audit(cfg, operators)
         print(json.dumps(clean(layer1["gates"]), indent=2))
         law = layer1["symmetry_breaking_law"]
@@ -2665,13 +3257,20 @@ def main() -> None:
         print("   ", json.dumps(clean(layer1["nonvoting_regression_checks"])))
 
         print("\n[DIAGNOSTIC CONTROL] Injected defects must trip their gates")
+        operational_control = operational_negative_control(cfg, operators)
+        print("  operational (Layer 0) mutations:")
+        print("   ", json.dumps(clean({
+            k: v["gate_fires"] for k, v in operational_control.items()
+            if isinstance(v, dict) and "gate_fires" in v
+        })))
         control = negative_control(cfg, operators)
-        print(json.dumps(clean({
+        print("  model mutations:")
+        print("   ", json.dumps(clean({
             k: v["gate_fires"] for k, v in control.items()
-            if isinstance(v, dict)
-        }), indent=2))
+            if isinstance(v, dict) and "gate_fires" in v
+        })))
 
-        print("\n[LAYER 3] Cross-experiment calibration")
+        print("\n[LAYER 2] Cross-experiment calibration -> certificate.layer2")
         layer2, data = layer2_calibration(cfg, operators, output)
         print(json.dumps(clean(layer2["gates"]), indent=2))
         print(
@@ -2682,7 +3281,10 @@ def main() -> None:
             f"{layer2['ech_extrapolation']['d_log_Ech_d_log_gamma']:.4f}"
         )
 
-        print("\n[LAYER 3B] Joint identification of (gamma, delta0)")
+        print(
+            "\n[LAYER 2B] Joint identification of (gamma, delta0) "
+            "-> certificate.layer2b_joint_identification"
+        )
         layer2b, joint_data = layer2b_joint_identification(cfg, operators, output)
         print(json.dumps(clean(layer2b["gates"]), indent=2))
         print(
@@ -2693,8 +3295,20 @@ def main() -> None:
             f"  corr={layer2b['fit_diagnostics']['correlation']:+.4f}"
             f"  transfer_max_pull={layer2b['transfer_maximum_absolute_pull']:.2f}"
         )
+        print(
+            "  identifiability evaluated at "
+            f"{layer2b['identifiability_design_prior_voting']['evaluation_point']}"
+            " (voting):"
+            " single_ratio="
+            f"{layer2b['identifiability_design_prior_voting']['single_setting_eigenvalue_ratio']:.3e}"
+            "   [non-voting] at estimates: single_ratio="
+            f"{layer2b['identifiability_at_estimates_nonvoting']['single_setting_eigenvalue_ratio']:.3e}"
+        )
 
-        print("\n[LAYER 4] Model-misspecification sensitivity (kappa sweep)")
+        print(
+            "\n[LAYER 3] Model-misspecification sensitivity "
+            "-> certificate.layer3_misspecification_sensitivity"
+        )
         misspecification = misspecification_sensitivity(cfg, operators)
         for name, entry in misspecification.items():
             if not isinstance(entry, dict) or "sweep" not in entry:
@@ -2723,7 +3337,14 @@ def main() -> None:
 
         # ---- bucket 1: protocol-first operational claim -------------------
         operational_gates = {
-            "protocol_frozen_before_outcomes": True,
+            # FIX v6.1 (B6): v6.0 hardcoded this to True -- an unfailable gate,
+            # exactly the defect v3.1 was criticised for.  It now re-reads the
+            # manifest from disk and re-hashes it.  Honest scope: this verifies
+            # that the commitment is reproducible, NOT that no outcome was
+            # computed first; that ordering is enforced by code position.
+            "protocol_commitment_verifies_from_disk": (
+                protocol_commitment_verified
+            ),
             "analytic_DFS_kernel_and_invariance": all(
                 operational["gates"][key]
                 for key in (
@@ -2756,7 +3377,7 @@ def main() -> None:
                 operational["gates"][key]
                 for key in (
                     "finite_zero_cost_family",
-                    "every_positive_epsilon_path_nonconstant",
+                    "every_positive_scale_path_nonconstant",
                     "family_contracts_toward_constant_path",
                 )
             ),
@@ -2806,6 +3427,14 @@ def main() -> None:
                 and l2b["gamma_recovered_jointly"]
                 and l2b["delta0_recovered_jointly"]
             ),
+            "prediction_freezes_verify_from_disk": (
+                l2["frozen_prediction_receipt_verifies_from_disk"]
+                and l2["every_scored_prediction_matches_the_commitment_on_disk"]
+                and l2b["joint_frozen_prediction_receipt_verifies_from_disk"]
+                and l2b[
+                    "every_scored_joint_prediction_matches_the_commitment_on_disk"
+                ]
+            ),
             "misspecification_sensitivity": all(
                 misspecification["gates"].values()
             ),
@@ -2815,6 +3444,18 @@ def main() -> None:
         # These validate the INSTRUMENT.  They are not physical findings and
         # they do not vote on declared model support.
         diagnostic_validation_checks = {
+            "injected_single_qubit_jump_detected": operational_control[
+                "M5_single_qubit_jump_breaks_the_cost_kernel"
+            ]["gate_fires"],
+            "injected_DFS_breaking_hamiltonian_detected": operational_control[
+                "M6_hamiltonian_does_not_preserve_the_DFS"
+            ]["gate_fires"],
+            "trivial_constant_path_rejected": operational_control[
+                "M7_constant_path_is_zero_cost_but_trivial"
+            ]["gate_fires"],
+            "positive_control_inside_DFS_rejected": operational_control[
+                "M8_positive_control_prepared_inside_the_DFS"
+            ]["gate_fires"],
             "injected_ramsey_error_detected": control[
                 "M1_v31_ramsey_pair_and_formula"
             ]["gate_fires"],
@@ -2866,17 +3507,29 @@ def main() -> None:
             ),
             "frozen_protocol": frozen_protocol,
             "frozen_protocol_sha256": frozen_protocol_sha256,
+            "protocol_commitment_verified_from_disk": protocol_commitment_verified,
             "object_hierarchy": operational["object_hierarchy"],
             "operational_gates": operational_gates,
             "model_gates": model_gates,
             "diagnostic_validation_checks": diagnostic_validation_checks,
             "nonvoting_regression_checks": nonvoting_regression_checks,
             "gate_bucket_semantics": {
+                "freezing_semantics": (
+                    "Every commitment in this run is EXECUTION-ORDER FREEZING "
+                    "WITHIN THE EXECUTABLE AUDIT: the payload is serialized and "
+                    "hashed at a point in the code that precedes the "
+                    "corresponding draw or truth evaluation, and the hash is "
+                    "re-verified from disk.  With no external timestamp and no "
+                    "third party this is NOT formal preregistration, and must "
+                    "not be written up as such."
+                ),
                 "operational_gates": (
                     "Vote on the restricted operational statement: the frozen "
                     "two-qubit protocol has a finite nonconstant path with zero "
                     "accumulated declared jump cost, plus a same-meter positive "
-                    "control and a contracting family."
+                    "control and a contracting family.  Every one of them is "
+                    "exercised against an injected defect in "
+                    "`operational_negative_control`."
                 ),
                 "model_gates": (
                     "Vote on declared_model_support.  Each is a falsifiable "
@@ -2903,6 +3556,7 @@ def main() -> None:
             "layer2b_joint_identification": layer2b,
             "layer3_misspecification_sensitivity": misspecification,
             "negative_control": control,
+            "operational_negative_control": operational_control,
             "global_gates": global_gates,
             "changes_from_v31": [
                 "v6: added a protocol-first Layer 0; the preparation, "
@@ -2912,7 +3566,7 @@ def main() -> None:
                 "cost J_Pi, and finite encoded-channel witness E_ch.",
                 "v6: added an algebraic DFS kernel/invariance certificate, a "
                 "finite nonconstant zero-cost trajectory, a same-meter "
-                "positive control, and a contracting H_epsilon family.",
+                "positive control, and a contracting H_s = s H family.",
                 "v6: explicitly records abstract tangent F as NOT_CONSTRUCTED "
                 "and the bridge to universal Principle R as NOT_ESTABLISHED.",
                 "Ramsey observable moved to the H-invariant |00>,|11> pair; "
@@ -2961,21 +3615,88 @@ def main() -> None:
                 "delta <-> -delta parity error.",
                 "Fixed: expected-vs-observed Fisher naming, MLE boundary "
                 "check, CSV field-name union, independent RNG streams.",
+                "v6.1 B1: freeze_and_commit deep-copies, hashes and re-reads "
+                "each payload from disk.  v6.0 hashed an object that aliased "
+                "prediction_rows and was mutated when the truth was revealed, "
+                "so the frozen object stopped matching its own receipt "
+                "(ef985ffa... -> cec041c2...) and nothing re-verified it.",
+                "v6.1 B2: Layer 2B now commits and hashes its two-parameter "
+                "transfer prediction BEFORE the held-out data is drawn.  v6.0 "
+                "wrote that file, unhashed, only after the pulls were computed.",
+                "v6.1 B3: the voting identifiability witness is evaluated at "
+                "the stated design prior, not at cfg.true_gamma/true_delta0; "
+                "the achieved information at the fitted values is reported "
+                "separately and does not vote.",
+                "v6.1 B4: the single-setting rank-deficiency ratio uses "
+                "magnitudes.  v6.0's single[0]/single[-1] was -1.090e-17, so "
+                "the gate passed on sign and would also have passed for an "
+                "indefinite matrix.",
+                "v6.1 B5: added operational_negative_control (M5-M8).  v6.0 "
+                "shipped sixteen voting Layer-0 gates with no mutation able to "
+                "trip any of them.  M7 (H=0) is the tautology check: it shows "
+                "that finite_nonconstant_path really can fail.",
+                "v6.1 B6: replaced the hardcoded "
+                "protocol_frozen_before_outcomes=True with a disk round-trip "
+                "verification, renamed to state only what it checks.",
+                "v6.1 robustness: NumPy 1.x trapezoid fallback; explicit "
+                "errors for offsets that cancel the prior imbalance and for "
+                "coverage sweeps with fewer than two usable replicates; stdout "
+                "layer labels aligned with certificate keys; the positive "
+                "control gated on a cost threshold instead of the "
+                "trace-distance threshold.",
+                "v6.2 item 1: the freezing guarantee is named "
+                "'execution-order freezing within the executable audit' in the "
+                "receipts, the gate-bucket semantics and the claim boundary; "
+                "hashing without an external timestamp is not preregistration.",
+                "v6.2 item 2: one commitment file now covers the "
+                "same-observable held-out points, the cross-observable transfer "
+                "points and the E_ch extrapolation.  Order is calibration fit "
+                "-> build every held-out prediction -> commit -> draw -> score, "
+                "and every scored value is re-checked against the file on disk.",
+                "v6.2 item 3: contraction_epsilons -> contraction_scales, "
+                "epsilon -> scale_s, every_positive_epsilon_path_nonconstant -> "
+                "every_positive_scale_path_nonconstant, to match H_s = s H in "
+                "the manuscript.  This renames a frozen manifest field, so "
+                "protocol_sha256 differs from the v6.0/v6.1 value by "
+                "construction.",
+                "v6.2.1: the E_ch payload is compared point by point against "
+                "the commitment instead of merely counted, and the gate "
+                "requires both the visibility and the encoded-cost deviation "
+                "to be exactly zero; v6.2's gate name was stronger than what "
+                "it verified.",
+                "v6.2.1: commitment coverage is established before any "
+                "deviation is computed, so a scored point missing from the "
+                "commitment fails the gate instead of raising KeyError.",
+                "v6.2.2: Layer 2B now compares every scored joint-transfer "
+                "prediction against its on-disk commitment point by point, and "
+                "checks that the committed (gamma_hat, delta0_hat) are the "
+                "estimates used.  v6.2.1 verified only the receipt hash there, "
+                "so the point-by-point semantics held for Layer 2 alone.",
+                "v6.1 audited and deliberately unchanged: kappa=0 false-alarm "
+                "and kappa_detect are single draws, but over 300 reseeds the "
+                "kappa=0 transfer max-pull had mean 1.87 / p95 2.87 / max 3.88 "
+                "against a 4-sigma threshold, and kappa_detect was 5e-4 in "
+                "40/40 reseeds.",
             ],
             "claim_boundary": (
                 "For the frozen exact two-qubit collective-dephasing protocol, "
                 "a finite nonconstant trajectory remains in the kernel of the "
                 "predeclared local jump rate and has zero accumulated declared "
                 "jump cost; the same frozen meter is positive on a control, "
-                "and a finite epsilon-family contracts toward the constant "
-                "path. The encoded Choi-distance zero is a separate finite "
-                "channel-level statement "
-                "about a leakage-free logical qubit, exact over the tested "
-                "duration sweep.  Symmetry breaking follows E_ch = gamma "
-                "delta^2 t at leading order.  gamma is inferred from "
+                "and a finite s-family (H_s = s H) contracts toward the "
+                "constant path.  That the nonconstancy requirement is not vacuous is "
+                "itself witnessed: an H=0 mutation trips it.  The encoded "
+                "Choi-distance zero is a separate finite channel-level "
+                "statement about a leakage-free logical qubit, exact over the "
+                "tested duration sweep.  Symmetry breaking follows E_ch = "
+                "gamma delta^2 t at leading order.  gamma is inferred from "
                 "finite-shot synthetic data on an H-invariant non-code-space "
                 "coherence and transfers to an unseen observable at unseen "
-                "delta.  With three known control offsets, gamma and an "
+                "delta, and every Layer 2 held-out prediction is written to a "
+                "single commitment file and re-checked against every scored "
+                "value.  All freezing here is execution-order freezing within "
+                "the executable audit, not formal preregistration.  With three "
+                "known control offsets, gamma and an "
                 "unknown intrinsic imbalance delta0 are jointly identifiable, "
                 "and the protocol's sensitivity to unmodelled physics is "
                 "quantified as kappa_detect rather than assumed.  No QPU, no "
@@ -3041,6 +3762,7 @@ def main() -> None:
         failed = [
             k
             for k, v in {
+                **operational["gates"],
                 **layer1["gates"],
                 **layer2["gates"],
                 **layer2b["gates"],
