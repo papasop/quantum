@@ -1,9 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-paper117_path_order_validation_v5.py  (v5)
+paper117_pasqal_local_no_account_v5_2.py  (v5.2.1 local Pulser)
 
-Frozen paper-only validation for Y.Y.N. Li's neutral-atom pulse-ordering
-manuscript.
+Account-free local PASQAL/Pulser validation for Y.Y.N. Li's neutral-atom
+pulse-ordering manuscript.
+
+Execution contract
+------------------
+- LOCAL ONLY: this file never imports pasqal-cloud or pulser-pasqal.
+- NO ACCOUNT: it never requests an email, password, project ID, token, or
+  cloud confirmation.
+- FROZEN LOCAL STACK: the mutually tested NumPy/SciPy/Qutip/Pulser versions
+  are checked in a fresh subprocess before scientific imports. An unhealthy
+  or mixed notebook installation is force-reinstalled and the user is told
+  to restart once; the script never hot-imports a half-upgraded SciPy stack.
+- BOTH BACKENDS ARE REQUIRED: dense SciPy exponentiation remains the primary
+  numerical backend and local Pulser/Qutip must execute the Layer-1 and
+  Layer-2 cross-validation. The script never silently falls back to a
+  SciPy-only certificate.
 
 Changes from v4 (all of them are audit-discipline fixes; none changes the
 physics of the scan):
@@ -21,16 +35,19 @@ physics of the scan):
       schedules, D(perm_i, perm_j) and TVD(perm_i, perm_j), as primary.  The
       v4 statistic was a difference of distances to a common baseline, which
       is only a sufficient condition for the states differing (its null is
-      uninformative) and which understates the effect by more than an order
-      of magnitude on this grid.  The baseline-referenced numbers are kept as
-      a secondary column.
+      uninformative) and which on this grid understates the direct
+      state-distance witness by more than an order of magnitude, and the
+      direct TVD witness by roughly a factor of two.  The
+      baseline-referenced numbers are kept as a secondary column.
 
   F3. Equal-A2 groups are found by single-linkage clustering on the sorted
       coefficient instead of by np.rint(A2/tol) bucketing, which was
       bin-boundary sensitive: two analytically equal values could straddle a
       bucket edge and split the group.  The expected {(2,3),(4,5)} grouping is
-      now a RECORDED regression flag rather than a hard-coded assertion, so
-      the "discovered, not hard-coded" description is accurate.
+      now a RECORDED regression flag rather than a hard-coded assertion.
+      Equal-A2 membership is discovered numerically; the expected count of
+      two nontrivial groups remains a frozen regression gate.  The historical
+      index sets are recorded but not asserted.
 
   F4. make_two_segment_schedules computes both segment fractions as d/T
       instead of using (1 - f).  This makes the signed-gap relabelling
@@ -50,6 +67,27 @@ physics of the scan):
       propagator instead of assuming 2^8.
 
   F8. fixed_commutator_norm takes omega explicitly.
+
+  F10. (v5.1) The baseline-referenced understatement factor is computed PER
+      PAIR.  v5 divided the smallest direct witness by the largest
+      baseline-referenced difference, which on this grid combined the (4,5)
+      numerator with the (2,3) denominator and printed 1.686, a factor
+      belonging to neither pair.  The correct paired factors are reported as
+      a min/max range.
+
+  F11. (v5.1) Pulser cross-validation now covers LAYER 2.  v5 sent only
+      two-segment forward/reverse schedules and the constant-versus-three-
+      identical segmentation control to Pulser, so a PASS certified Layer 1
+      and the segmentation artefact but said nothing about D_23, TVD_23,
+      D_45, TVD_45.  All six non-constant permutations are now evolved in
+      Pulser, their fidelity against SciPy recorded, the direct equal-A2
+      witnesses recomputed on the Pulser states, and the outcome reported as
+      an independent layer_2_pulser_cross_validation status.
+
+  F12. (v5.1) all_permutation_TVD_max_to_min_ratio is renamed
+      all_six_baseline_referenced_TVD_max_to_min_ratio.  It is the max/min of
+      the six permutations' distances to the COMMON CONSTANT BASELINE, not a
+      direct pairwise distinguishability among the six paths.
 
   F9. Per-gap proxy RMSE is additionally reported normalised by that gap's
       observed D range, because the raw per-gap RMSE scales with |g| and is
@@ -76,6 +114,8 @@ Scientific scope
   shape used only to diagnose structured residuals; it is not derived here and
   carries no theoretical status. With one T the scan cannot determine T versus
   T^2 scaling.
+- This script does not test common-full-unitary endpoint fibers or weak-noise
+  path susceptibility; those belong to the separate M2 diagnostic.
 - The proxy comparison is primarily done PER GAP. A pooled fit across gaps
   mixes the f-shape question with the residual g-dependence of D and can
   invert the ranking; the pooled fit is reported only as a sensitivity, and a
@@ -91,8 +131,9 @@ Scientific scope
     L1: matched integrated controls do not determine the ordered output.
     L2: even the single second-order coefficient A2 is insufficient for the
         declared finite-time three-segment comparison.
-  Equal-A2 groups are discovered from the computed coefficient rather than
-  inferred from hard-coded permutation indices.
+  Equal-A2 membership is discovered numerically; the expected count of two
+  nontrivial groups remains a frozen regression gate. The historical index
+  sets are recorded but not asserted.
 
 Numerical discipline
 --------------------
@@ -114,10 +155,9 @@ Numerical discipline
   motivates C_BCH is uniformly small on this grid. It is not a Magnus
   convergence criterion and not a truncation-validity verdict.
 
-Colab install:
-    !pip install -q -U pulser==1.8.0 pulser-simulation==1.8.0 pandas numpy scipy
-Run:
-    python paper117_path_order_validation_v5.py
+Colab:
+    Upload this file, then run:
+    %run paper117_pasqal_local_no_account_v5_2.py
 """
 
 import hashlib
@@ -128,10 +168,171 @@ import subprocess
 import time
 import sys
 import platform
+import importlib
+import warnings
 from collections import Counter
 from importlib import metadata
 from functools import lru_cache
 from pathlib import Path
+
+# ----------------------------------------------------------------------
+# Account-free local Pulser bootstrap
+# ----------------------------------------------------------------------
+LOCAL_STACK_REQUIREMENTS = {
+    "numpy": "2.0.2",
+    "scipy": "1.16.3",
+    "pandas": "2.2.3",
+    "qutip": "5.3.0",
+    "pulser": "1.8.0",
+    "pulser-simulation": "1.8.0",
+}
+
+
+def installed_version(distribution_name):
+    try:
+        return metadata.version(distribution_name)
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def local_stack_probe():
+    """Test the complete stack in a clean interpreter, not this live kernel."""
+    probe = (
+        "import numpy, scipy, scipy.fftpack, pandas, qutip, pulser, "
+        "pulser_simulation; "
+        "from pulser_simulation import QutipEmulator; "
+        "print(numpy.__version__, scipy.__version__, qutip.__version__, "
+        "pulser.__version__, pulser_simulation.__version__)"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", probe],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def ensure_account_free_local_stack():
+    """Establish and independently import-test one coherent local stack."""
+    preloaded_sensitive = sorted(
+        name
+        for name in sys.modules
+        if name.split(".", 1)[0]
+        in {"scipy", "qutip", "pulser", "pulser_simulation"}
+    )
+    if preloaded_sensitive:
+        raise RuntimeError(
+            "A SciPy/Qutip/Pulser module is already loaded in this notebook "
+            "kernel, so package consistency can no longer be guaranteed. "
+            "Restart the runtime once and run this file before importing "
+            "those packages. No account or cloud login is required."
+        )
+
+    versions = {
+        name: installed_version(name) for name in LOCAL_STACK_REQUIREMENTS
+    }
+    mismatches = {
+        name: {"expected": expected, "installed": versions[name]}
+        for name, expected in LOCAL_STACK_REQUIREMENTS.items()
+        if versions[name] != expected
+    }
+    initial_probe = local_stack_probe() if not mismatches else None
+    needs_repair = bool(
+        mismatches or initial_probe is None or initial_probe.returncode != 0
+    )
+
+    if needs_repair:
+        print(
+            "[bootstrap] Repairing the account-free local PASQAL/Pulser "
+            "numerical stack; no cloud credentials will be requested..."
+        )
+        requirements = [
+            f"{name}=={version}"
+            for name, version in LOCAL_STACK_REQUIREMENTS.items()
+        ]
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                "--disable-pip-version-check",
+                "--no-cache-dir",
+                "--force-reinstall",
+                *requirements,
+            ]
+        )
+        importlib.invalidate_caches()
+
+        repaired_probe = local_stack_probe()
+        if repaired_probe.returncode != 0:
+            raise RuntimeError(
+                "The frozen local stack was reinstalled but failed its clean "
+                "subprocess import test.\n"
+                f"stdout:\n{repaired_probe.stdout}\n"
+                f"stderr:\n{repaired_probe.stderr}"
+            )
+
+        loaded_scientific_modules = sorted(
+            name
+            for name in sys.modules
+            if name.split(".", 1)[0]
+            in {
+                "numpy",
+                "scipy",
+                "pandas",
+                "qutip",
+                "pulser",
+                "pulser_simulation",
+            }
+        )
+        if loaded_scientific_modules:
+            raise RuntimeError(
+                "The coherent local stack has now been installed and verified "
+                "in a fresh subprocess, but this notebook kernel had already "
+                "loaded an older NumPy/SciPy/Qutip/Pulser module. Restart the "
+                "runtime once, then rerun this same file. No account or cloud "
+                "login is required."
+            )
+
+    unresolved = {
+        name: {
+            "expected": expected,
+            "installed": installed_version(name),
+        }
+        for name, expected in LOCAL_STACK_REQUIREMENTS.items()
+        if installed_version(name) != expected
+    }
+    if unresolved:
+        raise RuntimeError(
+            "The required local Pulser versions could not be established: "
+            f"{unresolved}. Restart the runtime and rerun this same file."
+        )
+
+    final_probe = local_stack_probe()
+    if final_probe.returncode != 0:
+        raise RuntimeError(
+            "Package metadata matches the frozen versions, but a clean "
+            "subprocess still cannot import the complete stack. Restart the "
+            "runtime; if this persists, use a fresh Colab runtime.\n"
+            f"stderr:\n{final_probe.stderr}"
+        )
+
+
+ensure_account_free_local_stack()
+
+# Hide only known notebook/deprecation chatter; scientific warnings remain.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*datetime\.datetime\.utcnow\(\) is deprecated.*",
+    category=DeprecationWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*QutipBackend.*deprecated.*",
+    category=DeprecationWarning,
+)
 
 import numpy as np
 import pandas as pd
@@ -145,7 +346,7 @@ except ImportError:
     SCIPY_AVAILABLE = False
     expm = None
 
-# ---------- Pulser (optional independent cross-validation layer) ----------
+# ---------- Pulser (required local cross-validation layer) ----------
 try:
     from pulser import Pulse, Sequence, Register
     from pulser.devices import DigitalAnalogDevice
@@ -161,6 +362,12 @@ except ImportError as exc:
     PULSER_AVAILABLE = False
     PULSER_IMPORT_ERROR = repr(exc)
 
+if not PULSER_AVAILABLE:
+    raise RuntimeError(
+        "Local Pulser imports failed after bootstrap. No SciPy-only fallback "
+        f"is allowed in this account-free PASQAL version: {PULSER_IMPORT_ERROR}"
+    )
+
 # ---------- constants ----------
 CLOCK_NS = 4
 MIN_DURATION_NS = 16
@@ -170,8 +377,8 @@ SPACING_UM = 8.0
 AVG_DETUNING = -0.31
 # Frozen Pulser DigitalAnalogDevice value used by the independent dense
 # Hamiltonian.  When Pulser is installed, equality with the live device object
-# is checked at import time.  This keeps the SciPy-primary paper audit runnable
-# without turning the optional cross-validation package into a model input.
+# is checked at import time. SciPy remains the primary solver, while the local
+# Pulser installation supplies an independent implementation cross-check.
 DIGITAL_ANALOG_INTERACTION_COEFF = 5_420_158.53
 if PULSER_AVAILABLE and not math.isclose(
     float(DigitalAnalogDevice.interaction_coeff),
@@ -232,6 +439,11 @@ DIFFERENTIAL_SUPPORT_TOL = 1.0e-12
 # Single-linkage merge distance for equal-A2 clustering. Analytically equal
 # coefficients differ here by O(1e-17); the nearest distinct value is O(1e-1).
 A2_CLUSTER_TOL = 1.0e-12
+GROUPING_PROVENANCE_NOTE = (
+    "Equal-A2 membership is discovered numerically; the expected count of two "
+    "nontrivial groups remains a frozen regression gate. The historical index "
+    "sets are recorded but not asserted."
+)
 
 GRID_CLOSURE_NOTE = (
     "The f-reflection decomposition requires the clock-aligned duration grid "
@@ -249,7 +461,7 @@ if not (MIN_DURATION_NS <= PAPER_TOTAL_NS <= MAX_DURATION_NS):
 
 # ---------- output directory with timestamp ----------
 TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
-OUTDIR = Path(f"paper117_path_order_{TIMESTAMP}")
+OUTDIR = Path(f"paper117_pasqal_local_v5_2_{TIMESTAMP}")
 OUTDIR.mkdir(exist_ok=True)
 
 
@@ -963,6 +1175,169 @@ def cluster_equal_values(values, tol):
     return clusters
 
 
+def run_layer2_pulser_cross_validation(
+    n,
+    permutation_segments,
+    permutation_states,
+    equal_a2_groups,
+    omega=OMEGA,
+):
+    """
+    F11 (v5.1): cross-validate the LAYER-2 objects themselves.
+
+    run_cross_validation() sends only two-segment forward/reverse schedules to
+    Pulser, and the three-segment routine sends only the constant versus
+    three-identical segmentation control. Neither touches the six non-constant
+    permutations, so a PASS there certifies Layer 1 and the segmentation
+    artefact but says nothing about D_23, TVD_23, D_45, TVD_45. This routine
+    closes that gap:
+
+      1. evolves all six permutations in Pulser,
+      2. records each one's fidelity against the SciPy state,
+      3. recomputes the direct equal-A2 witnesses on the Pulser states,
+      4. reports absolute and relative Pulser-versus-SciPy witness error,
+      5. returns an independent status for the Layer-2 claim.
+
+    When Pulser is absent this returns NOT_RUN and the manuscript may not
+    claim any cross-validation of Layer 2.
+    """
+    if not PULSER_AVAILABLE:
+        return {
+            "status": "NOT_RUN",
+            "reason": PULSER_IMPORT_ERROR,
+            "covers": "layer_2_equal_A2_direct_witnesses",
+            "note": (
+                "Layer 2 is certified by the SciPy-expm backend only. No "
+                "Pulser cross-validation of D_23, TVD_23, D_45 or TVD_45 may "
+                "be claimed while this reads NOT_RUN."
+            ),
+        }
+
+    state_rows = []
+    pulser_states = {}
+    for index in sorted(permutation_segments):
+        psi_pulser, branch = final_statevector_from_segments(
+            n, permutation_segments[index], omega=omega
+        )
+        pulser_states[index] = psi_pulser
+        fidelity = state_fidelity(psi_pulser, permutation_states[index])
+        state_rows.append(
+            {
+                "permutation_index": int(index),
+                "segments": repr(permutation_segments[index]),
+                "fidelity": float(fidelity),
+                "infidelity": float(abs(1.0 - fidelity)),
+                "projective_residual": projective_residual(
+                    psi_pulser, permutation_states[index]
+                ),
+                "pulser_branch": branch,
+            }
+        )
+    state_df = pd.DataFrame(state_rows)
+    max_infidelity = float(state_df["infidelity"].max())
+    state_level_pass = bool(max_infidelity <= CROSS_VALIDATION_MAX_INFIDELITY)
+
+    witness_rows = []
+    for group in equal_a2_groups:
+        for pair in group["pairwise_primary"]:
+            left, right = pair["permutation_pair"]
+            metrics = pair_metrics(
+                pulser_states[left],
+                pulser_states[right],
+                f"pulser_permutation_{left}_vs_{right}",
+            )
+            d_abs = abs(metrics["pure_trace_distance"] - pair["direct_D"])
+            tvd_abs = abs(metrics["TVD_distribution"] - pair["direct_TVD"])
+            d_rel = d_abs / pair["direct_D"] if pair["direct_D"] > 0 else None
+            tvd_rel = (
+                tvd_abs / pair["direct_TVD"]
+                if pair["direct_TVD"] > 0
+                else None
+            )
+            d_ok = bool(
+                d_abs <= WITNESS_CROSS_VALIDATION_MAX_ABS_ERROR
+                or (
+                    d_rel is not None
+                    and d_rel <= WITNESS_CROSS_VALIDATION_MAX_REL_ERROR
+                )
+            )
+            tvd_ok = bool(
+                tvd_abs <= WITNESS_CROSS_VALIDATION_MAX_ABS_ERROR
+                or (
+                    tvd_rel is not None
+                    and tvd_rel <= WITNESS_CROSS_VALIDATION_MAX_REL_ERROR
+                )
+            )
+            witness_rows.append(
+                {
+                    "permutation_pair": f"{left}-{right}",
+                    "group_A2": float(group["A2_signed"]),
+                    "D_expm": float(pair["direct_D"]),
+                    "D_pulser": float(metrics["pure_trace_distance"]),
+                    "D_abs_error": float(d_abs),
+                    "D_relative_error": d_rel,
+                    "D_pass": d_ok,
+                    "TVD_expm": float(pair["direct_TVD"]),
+                    "TVD_pulser": float(metrics["TVD_distribution"]),
+                    "TVD_abs_error": float(tvd_abs),
+                    "TVD_relative_error": tvd_rel,
+                    "TVD_pass": tvd_ok,
+                }
+            )
+    witness_df = pd.DataFrame(witness_rows)
+    witness_level_pass = bool(
+        witness_df["D_pass"].all() and witness_df["TVD_pass"].all()
+    )
+    max_witness_abs = float(
+        max(
+            witness_df["D_abs_error"].max(),
+            witness_df["TVD_abs_error"].max(),
+        )
+    )
+
+    state_df.to_csv(
+        OUTDIR / "layer2_cross_validation_states.csv", index=False
+    )
+    witness_df.to_csv(
+        OUTDIR / "layer2_cross_validation_witnesses.csv", index=False
+    )
+    return {
+        "status": (
+            "PASS" if (state_level_pass and witness_level_pass) else "FAIL"
+        ),
+        "fail_fast": False,
+        "covers": "layer_2_equal_A2_direct_witnesses",
+        "permutations_evolved_in_pulser": int(len(state_df)),
+        "state_level": {
+            "points": state_df.to_dict(orient="records"),
+            "max_infidelity": max_infidelity,
+            "max_allowed_infidelity": CROSS_VALIDATION_MAX_INFIDELITY,
+            "pass": state_level_pass,
+        },
+        "witness_level": {
+            "points": witness_df.to_dict(orient="records"),
+            "criterion": (
+                "A pair passes if its absolute OR relative Pulser-versus-expm "
+                "witness disagreement is within tolerance."
+            ),
+            "max_absolute_error": max_witness_abs,
+            "max_allowed_absolute_error": (
+                WITNESS_CROSS_VALIDATION_MAX_ABS_ERROR
+            ),
+            "max_allowed_relative_error": (
+                WITNESS_CROSS_VALIDATION_MAX_REL_ERROR
+            ),
+            "pass": witness_level_pass,
+        },
+        "note": (
+            "These are the quantities the Layer-2 claim is stated in. A PASS "
+            "here is what licenses saying that the equal-A2 result is "
+            "backend-cross-validated; the two-segment cross-validation does "
+            "not license that statement."
+        ),
+    }
+
+
 def run_3segment_magnus_diagnostic(
     n=8,
     omega=OMEGA,
@@ -984,10 +1359,12 @@ def run_3segment_magnus_diagnostic(
     the two schedules in a group. The v4 statistic, the difference of their
     distances to a common constant-detuning baseline, is retained as a
     secondary column; it is only a sufficient condition for the states
-    differing, so its null is uninformative, and it understates the effect.
-    Both understatement ratios are measured and reported below rather than
-    asserted here (they are not equal: the D statistic is affected far more
-    than the TVD statistic).
+    differing, so its null is uninformative, and it understates the effect by
+    an amount that differs sharply between the two witnesses. On this grid the
+    baseline-referenced statistic understates the direct state-distance
+    witness by factors of about 30.5 to 33.2, and the direct TVD witness by
+    only about 1.88 to 2.24. Those factors are recomputed per pair at run time
+    and written to the certificate; the numbers quoted here are descriptive.
     """
     if nominal_total_ns is None:
         nominal_total_ns = paper_total_ns(n)
@@ -1073,6 +1450,7 @@ def run_3segment_magnus_diagnostic(
     reference_area = integrated_rabi_area(constant_single, omega)
     rows = []
     permutation_states = {}
+    permutation_segments = {}
     low_detuning, middle_detuning, high_detuning = detunings
     detuning_role = {
         low_detuning: "lo",
@@ -1095,6 +1473,7 @@ def run_3segment_magnus_diagnostic(
 
         psi = exact_state_from_segments(n, segments, omega=omega)
         permutation_states[permutation_index] = psi
+        permutation_segments[permutation_index] = list(segments)
         metrics = pair_metrics(
             psi, psi_constant, f"permutation_{permutation_index}_vs_constant"
         )
@@ -1188,6 +1567,20 @@ def run_3segment_magnus_diagnostic(
                     ),
                 }
             )
+            # F10: the understatement factor is a property of ONE pair. It is
+            # formed here, from that pair's own numerator and denominator.
+            baseline_d = pairwise[-1]["baseline_referenced_D_difference"]
+            baseline_tvd = pairwise[-1]["baseline_referenced_TVD_difference"]
+            pairwise[-1]["D_understatement_factor"] = (
+                float(pairwise[-1]["direct_D"] / baseline_d)
+                if baseline_d > 0.0
+                else None
+            )
+            pairwise[-1]["TVD_understatement_factor"] = (
+                float(pairwise[-1]["direct_TVD"] / baseline_tvd)
+                if baseline_tvd > 0.0
+                else None
+            )
         equal_a2_groups.append(
             {
                 "permutation_indices": [
@@ -1243,19 +1636,30 @@ def run_3segment_magnus_diagnostic(
             f"{len(equal_a2_groups)}."
         )
 
-    # F3: the historical {(2,3),(4,5)} labelling is now a RECORDED regression
-    # flag, not an assertion, so the grouping really is discovered.
+    # F3: equal-A2 membership is discovered numerically; the expected count
+    # of two nontrivial groups remains a frozen regression gate (the raise
+    # above). The historical {(2,3),(4,5)} index sets are recorded but not
+    # asserted.
     discovered_index_sets = sorted(
         tuple(group["permutation_indices"]) for group in equal_a2_groups
     )
     reference_grouping_matches = discovered_index_sets == [(2, 3), (4, 5)]
 
-    pairwise_records = [
+    pairwise_records_source = [
         dict(pair, group_A2=group["A2_signed"])
         for group in equal_a2_groups
         for pair in group["pairwise_primary"]
     ]
-    pairwise_df = pd.DataFrame(pairwise_records)
+    pairwise_df = pd.DataFrame(pairwise_records_source)
+
+    layer2_cross_validation = run_layer2_pulser_cross_validation(
+        n,
+        permutation_segments,
+        permutation_states,
+        equal_a2_groups,
+        omega=omega,
+    )
+
 
     decision_threshold_D = max(
         MIN_SIGNAL_TO_FLOOR * float(numerical_floor_D),
@@ -1277,17 +1681,53 @@ def run_3segment_magnus_diagnostic(
     max_baseline_TVD_difference = float(
         pairwise_df["baseline_referenced_TVD_difference"].max()
     )
-    direct_to_baseline_TVD_ratio = (
-        float(min_direct_TVD / max_baseline_TVD_difference)
-        if max_baseline_TVD_difference > 0.0
-        else None
+    # F10: paired factors only. Dividing the smallest direct witness by the
+    # largest baseline-referenced difference mixes numerator and denominator
+    # from DIFFERENT pairs and yields a number belonging to neither.
+    paired_d_factors = [
+        p["D_understatement_factor"]
+        for p in pairwise_records_source
+        if p["D_understatement_factor"] is not None
+    ]
+    paired_tvd_factors = [
+        p["TVD_understatement_factor"]
+        for p in pairwise_records_source
+        if p["TVD_understatement_factor"] is not None
+    ]
+    paired_understatement = {
+        "definition": (
+            "For each equal-A2 pair, direct witness divided by that SAME "
+            "pair's baseline-referenced difference. Numerator and denominator "
+            "always come from the same pair."
+        ),
+        "D_min_factor": float(min(paired_d_factors)) if paired_d_factors else None,
+        "D_max_factor": float(max(paired_d_factors)) if paired_d_factors else None,
+        "TVD_min_factor": (
+            float(min(paired_tvd_factors)) if paired_tvd_factors else None
+        ),
+        "TVD_max_factor": (
+            float(max(paired_tvd_factors)) if paired_tvd_factors else None
+        ),
+        "per_pair": [
+            {
+                "permutation_pair": p["permutation_pair"],
+                "D_understatement_factor": p["D_understatement_factor"],
+                "TVD_understatement_factor": p["TVD_understatement_factor"],
+            }
+            for p in pairwise_records_source
+        ],
+    }
+    paired_understatement["statement"] = (
+        "On this grid the baseline-referenced statistic understates the "
+        "direct state-distance witness by factors "
+        f"{paired_understatement['D_min_factor']:.3f}-"
+        f"{paired_understatement['D_max_factor']:.3f}, and the direct TVD "
+        "witness by factors "
+        f"{paired_understatement['TVD_min_factor']:.3f}-"
+        f"{paired_understatement['TVD_max_factor']:.3f}."
     )
-    direct_to_baseline_D_ratio = (
-        float(min_direct_D / max_baseline_D_difference)
-        if max_baseline_D_difference > 0.0
-        else None
-    )
-    all_permutation_TVD_ratio = float(
+    # F12: this is a max/min over distances to the COMMON CONSTANT BASELINE.
+    all_six_baseline_referenced_TVD_ratio = float(
         df["TVD_distribution"].max() / df["TVD_distribution"].min()
     )
 
@@ -1330,10 +1770,7 @@ def run_3segment_magnus_diagnostic(
             "matches_historical_reference_grouping": bool(
                 reference_grouping_matches
             ),
-            "note": (
-                "Recorded regression flag only. The grouping is computed from "
-                "A2; it is not asserted against hard-coded indices."
-            ),
+            "note": GROUPING_PROVENANCE_NOTE,
         },
         "segmentation_artifact_expm": segmentation_exact,
         "segmentation_expm_state_floor": segmentation_expm_state_floor,
@@ -1353,17 +1790,22 @@ def run_3segment_magnus_diagnostic(
         "max_equal_A2_baseline_referenced_TVD_difference": (
             max_baseline_TVD_difference
         ),
-        "direct_to_baseline_referenced_TVD_ratio": (
-            direct_to_baseline_TVD_ratio
-        ),
-        "direct_to_baseline_referenced_D_ratio": direct_to_baseline_D_ratio,
+        "layer_2_pulser_cross_validation": layer2_cross_validation,
+        "paired_understatement_factors": paired_understatement,
         "understatement_note": (
-            "Ratio of the weakest DIRECT pairwise witness to the largest "
-            "baseline-referenced difference. Values above one quantify how "
-            "much the v4 statistic understated the effect. The two witnesses "
-            "are affected by different amounts, so both ratios are reported."
+            "Each factor divides a pair's direct witness by that SAME pair's "
+            "baseline-referenced difference. Cross-pair ratios (smallest "
+            "direct witness over largest baseline difference) are NOT "
+            "reported: they belong to no pair and were an error in v5."
         ),
-        "all_permutation_TVD_max_to_min_ratio": all_permutation_TVD_ratio,
+        "all_six_baseline_referenced_TVD_max_to_min_ratio": (
+            all_six_baseline_referenced_TVD_ratio
+        ),
+        "all_six_ratio_note": (
+            "Max/min over the six permutations of their TVD to the COMMON "
+            "CONSTANT-DETUNING BASELINE. It is not a direct pairwise "
+            "distinguishability among the six paths."
+        ),
         "D_decision_threshold": decision_threshold_D,
         "TVD_decision_threshold": decision_threshold_TVD,
         "TVD_resolved_above_threshold": bool(
@@ -1431,15 +1873,36 @@ def run_3segment_magnus_diagnostic(
                 f"| secondary |dTVD_baseline|="
                 f"{pair['baseline_referenced_TVD_difference']:.6f}"
             )
+    print("Per-pair baseline-referenced understatement factors:")
+    for entry in paired_understatement["per_pair"]:
+        print(
+            f"  pair={entry['permutation_pair']} "
+            f"D x{entry['D_understatement_factor']:.3f}  "
+            f"TVD x{entry['TVD_understatement_factor']:.3f}"
+        )
     print(
-        f"Weakest direct equal-A2 TVD={min_direct_TVD:.6f} vs largest "
-        f"baseline-referenced |dTVD|={max_baseline_TVD_difference:.6f} "
-        f"-> understated x{direct_to_baseline_TVD_ratio:.2f}"
+        "  minimum paired TVD understatement factor = "
+        f"{paired_understatement['TVD_min_factor']:.3f}"
     )
     print(
-        f"Weakest direct equal-A2 D  ={min_direct_D:.6f} vs largest "
-        f"baseline-referenced |dD|  ={max_baseline_D_difference:.6f} "
-        f"-> understated x{direct_to_baseline_D_ratio:.2f}"
+        "  maximum paired TVD understatement factor = "
+        f"{paired_understatement['TVD_max_factor']:.3f}"
+    )
+    print(
+        "  minimum paired D   understatement factor = "
+        f"{paired_understatement['D_min_factor']:.3f}"
+    )
+    print(
+        "  maximum paired D   understatement factor = "
+        f"{paired_understatement['D_max_factor']:.3f}"
+    )
+    print(
+        f"Weakest direct equal-A2 D={min_direct_D:.6f}, "
+        f"TVD={min_direct_TVD:.6f}"
+    )
+    print(
+        "Layer-2 Pulser cross-validation:",
+        layer2_cross_validation["status"],
     )
     print(
         "Thresholds  D:",
@@ -2610,14 +3073,21 @@ def write_provenance():
 def main():
     print(
         "\n" + "=" * 88
-        + "\nPAPER117 NEUTRAL-ATOM PULSE-ORDER VALIDATION (v5)\n"
+        + "\nPAPER117 PASQAL/PULSER LOCAL VALIDATION "
+        "(v5.2.1, NO ACCOUNT)\n"
         + "=" * 88
     )
     print("output:", OUTDIR)
     print(
+        "backend: scipy_expm + local Pulser/Qutip | "
+        "cloud access: none | credentials: not requested"
+    )
+    print(
         "scope: fixed-T multi-proxy scan + f-reflection decomposition + "
         "algebraic signed-gap schedule check + six equal-duration "
-        "permutations + state- and witness-level Pulser cross-validation"
+        "permutations + required local Pulser cross-validation of both "
+        "layers (two-segment forward/reverse for Layer 1, all six "
+        "permutations for Layer 2)"
     )
     started = time.perf_counter()
 
@@ -2628,25 +3098,7 @@ def main():
         )
 
     provenance = write_provenance()
-    if PULSER_AVAILABLE:
-        _, _, cv_cert = run_cross_validation()
-    else:
-        print(
-            "\nC) CROSS-VALIDATION: NOT RUN — Pulser unavailable\n"
-            f"   import error: {PULSER_IMPORT_ERROR}"
-        )
-        cv_cert = {
-            "status": "NOT_RUN",
-            "reason": PULSER_IMPORT_ERROR,
-            "state_level": {"max_infidelity": None, "pass": None},
-            "witness_level": {
-                "all_points_pass": None,
-                "max_absolute_error": None,
-                "max_relative_error_all_rows": None,
-                "max_nondegenerate_relative_error": None,
-                "witness_magnitude_for_one_percent_agreement": None,
-            },
-        }
+    _, _, cv_cert = run_cross_validation()
     (
         scan_df,
         _,
@@ -2710,7 +3162,7 @@ def main():
             < three_segment["min_equal_A2_direct_TVD"] / 1.0e5
         ),
     }
-    optional_validation_checks = {
+    local_pulser_validation_checks = {
         "pulser_state_cross_validation": {
             "status": (
                 "NOT_RUN"
@@ -2731,10 +3183,29 @@ def main():
             ),
             "value": cv_cert["witness_level"]["all_points_pass"],
         },
+        "layer_2_pulser_cross_validation": {
+            "status": three_segment["layer_2_pulser_cross_validation"][
+                "status"
+            ],
+            "covers": (
+                "direct equal-A2 witnesses D_23, TVD_23, D_45, TVD_45"
+            ),
+            "value": three_segment["layer_2_pulser_cross_validation"].get(
+                "witness_level", {}
+            ).get("max_absolute_error"),
+        },
+        "coverage_note": (
+            "pulser_state_cross_validation and pulser_witness_cross_validation "
+            "use two-segment forward/reverse schedules and therefore certify "
+            "LAYER 1 only. Layer 2 is covered exclusively by "
+            "layer_2_pulser_cross_validation, which evolves all six "
+            "permutations."
+        ),
         "note": (
-            "Optional checks never abort the run and never enter the VALID / "
-            "INVALID status; a FAIL here means the Pulser backend disagreed "
-            "and must be reported, not that the SciPy-primary scan is void."
+            "These local Pulser checks are required to run in this version. "
+            "They do not enter the SciPy numerical-validity status: a FAIL "
+            "means the two local implementations disagree and must be "
+            "reported, not that the SciPy-primary scan silently disappears."
         ),
     }
 
@@ -2812,11 +3283,8 @@ def main():
             "max_observed_difference": three_segment[
                 "max_equal_A2_baseline_referenced_TVD_difference"
             ],
-            "direct_to_baseline_TVD_ratio": three_segment[
-                "direct_to_baseline_referenced_TVD_ratio"
-            ],
-            "direct_to_baseline_D_ratio": three_segment[
-                "direct_to_baseline_referenced_D_ratio"
+            "paired_understatement_factors": three_segment[
+                "paired_understatement_factors"
             ],
             "why_secondary": (
                 "Only a sufficient condition for the two ordered states "
@@ -2909,14 +3377,14 @@ def main():
             "secondary_baseline_referenced_TVD_difference": three_segment[
                 "max_equal_A2_baseline_referenced_TVD_difference"
             ],
-            "direct_to_baseline_referenced_TVD_ratio": three_segment[
-                "direct_to_baseline_referenced_TVD_ratio"
+            "paired_understatement_factors": three_segment[
+                "paired_understatement_factors"
             ],
-            "direct_to_baseline_referenced_D_ratio": three_segment[
-                "direct_to_baseline_referenced_D_ratio"
+            "all_six_baseline_referenced_TVD_max_to_min_ratio": three_segment[
+                "all_six_baseline_referenced_TVD_max_to_min_ratio"
             ],
-            "all_six_permutation_TVD_ratio": three_segment[
-                "all_permutation_TVD_max_to_min_ratio"
+            "pulser_cross_validation": three_segment[
+                "layer_2_pulser_cross_validation"
             ],
             "decision_threshold": three_segment["TVD_decision_threshold"],
             "segmentation_TVD_floor": segmentation_expm["TVD_distribution"],
@@ -2937,6 +3405,15 @@ def main():
     }
 
     status = "VALID" if all(validation_gates.values()) else "INVALID"
+    local_pulser_status = (
+        "PASS"
+        if (
+            cv_cert.get("status") == "PASS"
+            and three_segment["layer_2_pulser_cross_validation"]["status"]
+            == "PASS"
+        )
+        else "FAIL"
+    )
     summary = {
         "status": status,
         "status_meaning": (
@@ -2950,12 +3427,18 @@ def main():
             "variable-partition claim is included."
         ),
         "primary_backend": "scipy_expm",
-        "execution_mode": (
-            "SCIPY_PRIMARY_PLUS_PULSER_CROSSCHECK"
-            if PULSER_AVAILABLE
-            else "SCIPY_PRIMARY_ONLY"
-        ),
+        "local_pasqal_stack": {
+            "pulser_version": installed_version("pulser"),
+            "pulser_simulation_version": installed_version(
+                "pulser-simulation"
+            ),
+            "cloud_access": "none",
+            "credentials_requested": False,
+            "pasqal_cloud_imported": False,
+        },
+        "execution_mode": "SCIPY_PRIMARY_PLUS_REQUIRED_LOCAL_PULSER_CROSSCHECK",
         "cross_validation_status": cv_cert.get("status", "RECORDED"),
+        "local_pulser_two_layer_status": local_pulser_status,
         "total_duration_ns": scan_cert["total_duration_ns"],
         "scan_points": int(len(scan_df)),
         "nonzero_gap_points": int((scan_df["gap"] > 0).sum()),
@@ -3002,9 +3485,15 @@ def main():
             "max_TVD_difference": three_segment[
                 "max_equal_A2_baseline_referenced_TVD_difference"
             ],
+            "paired_understatement_factors": three_segment[
+                "paired_understatement_factors"
+            ],
         },
+        "layer_2_pulser_cross_validation_status": three_segment[
+            "layer_2_pulser_cross_validation"
+        ]["status"],
         "validation_gates": validation_gates,
-        "optional_validation_checks": optional_validation_checks,
+        "local_pulser_validation_checks": local_pulser_validation_checks,
         "scientific_tests": scientific_tests,
         "two_layer_certificate": two_layer_certificate,
         "implementation_checks": implementation_checks,
@@ -3016,7 +3505,9 @@ def main():
             "The scan compares schedule-shape proxies at one fixed total "
             "duration. It does not determine T versus T^2 scaling, validate "
             "QPU hardware, establish a universal path-area law, or test a "
-            "Hamiltonian-learning model."
+            "Hamiltonian-learning model. This script does not test "
+            "common-full-unitary endpoint fibers or weak-noise path "
+            "susceptibility; those belong to the separate M2 diagnostic."
         ),
     }
     with open(OUTDIR / "run_summary.json", "w", encoding="utf-8") as handle:
