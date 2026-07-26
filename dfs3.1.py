@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DFS CHANNEL-COST + BLIND-CALIBRATION v3
+DFS CHANNEL-COST + SYNTHETIC CALIBRATION v3.3
 =======================================
 
-Layer 1 — representation-invariant channel cost
+Layer 1 — encoded-channel witness and numerical channel audit
 ------------------------------------------------
 For a logical qubit encoded in span{|01>,|10>}, compare the finite-time noisy
 channel with the ideal unitary channel using normalized Choi-state trace
@@ -21,29 +21,40 @@ unravelling.  The script checks:
   * a controlled coupling imbalance
         L_delta = sqrt(gamma)[Z1 + (1+delta)Z2]
     opens a positive encoded-channel loss;
-  * the channel result is invariant under a unitary mixing/phase change of an
-    equivalent jump-operator representation.
+  * CPTP conditions are checked before any Choi Hermitian symmetrization;
+  * nontrivial Lindblad representation changes are regression-tested.
 
-Layer 2 — independently separated synthetic calibration
+Layer 2 — separated synthetic calibration
 --------------------------------------------------------
 The true gamma is used only by a data generator.  A calibration module sees
-Ramsey counts from a non-DFS coherence and estimates gamma by binomial maximum
-likelihood.  The fitted gamma is then frozen and used to predict:
+Ramsey counts from (|00>+|11>)/sqrt(2), propagated by the same full
+Liouvillian used in Layer 1, and estimates gamma by binomial maximum
+likelihood.  Both basis states are annihilated by the exchange Hamiltonian, so
+the exact visibility exp(-8 gamma t) remains valid with H switched on.  The
+fitted gamma is then frozen and used to predict disjoint held-out Ramsey data.
 
-  * disjoint held-out Ramsey times;
-  * encoded Choi losses for an unseen delta grid.
+Layer 3 — falsifiable symmetry-breaking law
+--------------------------------------------------------
+The encoded Choi witness is scanned over disjoint gamma, |delta|, and time
+grids.  The audit tests the finite-range log-log delta exponent, reflection
+evenness, and the independently derived weak-imbalance coefficient
+
+    E_ch / (gamma delta^2 t) -> 1.
+
+This replaces the v3.1 channel-relative-error gate, which was algebraically
+redundant with gamma recovery in the linear regime.
 
 The prediction module is passed gamma_hat only; it does not receive gamma_true.
 
 Boundary
 --------
-This is exact NumPy/SciPy model evidence plus a finite-shot synthetic blind
+This is exact NumPy/SciPy model evidence plus finite-shot synthetic
 calibration.  It is not QPU data, not an experimentally calibrated cost, not
 zero total energy, and not a universal realizability or Lorentzian theorem.
 
 Run:
     pip install -U numpy scipy matplotlib
-    python dfs_channel_cost_calibration_v3_1.py
+    python dfs_channel_cost_calibration_v3_3.py
 
 Jupyter/Colab ``-f kernel.json`` arguments are ignored.
 """
@@ -76,7 +87,7 @@ from scipy.linalg import expm
 from scipy.optimize import minimize_scalar
 
 
-VERSION = "DFS-CHANNEL-COST-CALIBRATION-v3.1"
+VERSION = "DFS-CHANNEL-COST-CALIBRATION-v3.3"
 
 
 @dataclass(frozen=True)
@@ -86,7 +97,8 @@ class Config:
     target_duration: float = math.pi / 2.0
 
     calibration_shots_per_time: int = 50_000
-    calibration_seed: int = 20260726
+    master_seed: int = 20260726
+    coverage_repetitions: int = 256
     calibration_times: tuple[float, ...] = (
         0.20, 0.40, 0.65, 0.90, 1.20, 1.55, 1.95, 2.40
     )
@@ -94,17 +106,26 @@ class Config:
     heldout_shots_per_time: int = 50_000
 
     selection_deltas: tuple[float, ...] = (-0.08, -0.04, 0.0, 0.04, 0.08)
-    heldout_deltas: tuple[float, ...] = (
-        -0.12, -0.06, -0.03, -0.015,
-        0.015, 0.03, 0.06, 0.12,
+    scaling_abs_deltas: tuple[float, ...] = (
+        0.005, 0.008, 0.012, 0.018, 0.027, 0.040,
     )
+    scaling_gammas: tuple[float, ...] = (0.05, 0.10, 0.20, 0.40, 0.80)
+    scaling_times: tuple[float, ...] = (0.50, 1.00, math.pi / 2.0, 2.00)
 
     zero_channel_tolerance: float = 3.0e-13
     positive_channel_minimum: float = 1.0e-8
     representation_invariance_tolerance: float = 3.0e-13
+    choi_hermiticity_tolerance: float = 3.0e-13
+    choi_cp_eigenvalue_tolerance: float = 3.0e-13
+    choi_tp_tolerance: float = 3.0e-13
     gamma_relative_error_tolerance: float = 0.03
     heldout_visibility_rmse_tolerance: float = 0.012
-    heldout_channel_max_relative_error_tolerance: float = 0.06
+    coverage_lower: float = 0.90
+    coverage_upper: float = 0.99
+    delta_exponent_lower: float = 1.98
+    delta_exponent_upper: float = 2.02
+    weak_coefficient_relative_tolerance: float = 0.01
+    reflection_evenness_tolerance: float = 3.0e-12
     likelihood_bounds: tuple[float, float] = (1.0e-6, 2.0)
 
 
@@ -153,7 +174,16 @@ def save_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
     with path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        fieldnames: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            for key in row:
+                if key not in seen:
+                    fieldnames.append(key)
+                    seen.add(key)
+        writer = csv.DictWriter(
+            stream, fieldnames=fieldnames, extrasaction="raise"
+        )
         writer.writeheader()
         writer.writerows(clean(rows))
 
@@ -161,7 +191,7 @@ def save_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def create_unique_output_dir(requested: str | None) -> Path:
     base = Path(
         requested
-        or f"dfs_channel_calibration_v3_1_{time.strftime('%Y%m%d_%H%M%S')}"
+        or f"dfs_channel_calibration_v3_3_{time.strftime('%Y%m%d_%H%M%S')}"
     )
     candidates = [base]
     candidates.extend(
@@ -268,7 +298,9 @@ def encoded_choi(
             )
             output = apply_superoperator(superoperator, physical_basis)
             choi += np.kron(logical_basis, output) / logical_dimension
-    return 0.5 * (choi + choi.conj().T)
+    # Return the raw matrix.  Diagnostics must see any anti-Hermitian defect;
+    # silently symmetrizing here would hide propagation/reshaping bugs.
+    return choi
 
 
 def full_choi(superoperator: np.ndarray, dimension: int = 4) -> np.ndarray:
@@ -278,6 +310,45 @@ def full_choi(superoperator: np.ndarray, dimension: int = 4) -> np.ndarray:
 def trace_distance(left: np.ndarray, right: np.ndarray) -> float:
     difference = 0.5 * ((left - right) + (left - right).conj().T)
     return float(0.5 * np.sum(np.abs(np.linalg.eigvalsh(difference))))
+
+
+def partial_trace_output_choi(
+    choi: np.ndarray,
+    input_dimension: int,
+    output_dimension: int,
+) -> np.ndarray:
+    """Trace normalized Choi state over output; TP target is I/d_in."""
+    tensor = choi.reshape(
+        input_dimension,
+        output_dimension,
+        input_dimension,
+        output_dimension,
+    )
+    return np.einsum("iaja->ij", tensor)
+
+
+def choi_cptp_diagnostics(
+    choi: np.ndarray,
+    input_dimension: int,
+    output_dimension: int,
+) -> dict[str, float]:
+    hermiticity = float(
+        np.linalg.norm(choi - choi.conj().T, ord="fro")
+    )
+    hermitian_copy = 0.5 * (choi + choi.conj().T)
+    minimum_eigenvalue = float(np.min(np.linalg.eigvalsh(hermitian_copy)))
+    reduced = partial_trace_output_choi(
+        choi, input_dimension, output_dimension
+    )
+    tp_target = np.eye(input_dimension, dtype=complex) / input_dimension
+    tp_residual = float(np.linalg.norm(reduced - tp_target, ord="fro"))
+    trace_residual = float(abs(np.trace(choi) - 1.0))
+    return {
+        "hermiticity_residual": hermiticity,
+        "minimum_eigenvalue": minimum_eigenvalue,
+        "trace_preservation_residual": tp_residual,
+        "normalized_trace_residual": trace_residual,
+    }
 
 
 def jump_for_delta(
@@ -336,10 +407,12 @@ def layer1_channel_audit(
         / noisy_zero.shape[0]
     )
 
-    # Embed the same dissipator into two equivalent jump components and apply
-    # a nontrivial 2x2 unitary mixing.  Lindblad sums are invariant under
-    # L'_a = sum_b U_ab L_b for unitary U.
-    split_jumps = [jump_zero / math.sqrt(2.0)] * 2
+    # Regression 2: mix two linearly independent jump operators.  This avoids
+    # the degenerate v3.1 test that mixed two identical copies of one jump.
+    distinct_jumps = [
+        math.sqrt(cfg.true_gamma) * operators["Z1"],
+        math.sqrt(0.37 * cfg.true_gamma) * operators["Z2"],
+    ]
     mixing_theta = 0.417
     mixing_phase = 0.913
     c_mix = math.cos(mixing_theta)
@@ -354,25 +427,21 @@ def layer1_channel_audit(
     mixed_jumps = [
         sum(
             (
-                unitary_mix[a, b] * split_jumps[b]
+                unitary_mix[a, b] * distinct_jumps[b]
                 for b in range(2)
             ),
             np.zeros_like(jump_zero),
         )
         for a in range(2)
     ]
-    noisy_split = channel_superoperator(
-        h, split_jumps, cfg.target_duration
+    noisy_distinct = channel_superoperator(
+        h, distinct_jumps, cfg.target_duration
     )
     noisy_mixed = channel_superoperator(
         h, mixed_jumps, cfg.target_duration
     )
-    split_matches_single = float(
-        np.linalg.norm(noisy_zero - noisy_split, ord="fro")
-        / noisy_zero.shape[0]
-    )
     unitary_mixing_change = float(
-        np.linalg.norm(noisy_split - noisy_mixed, ord="fro")
+        np.linalg.norm(noisy_distinct - noisy_mixed, ord="fro")
         / noisy_zero.shape[0]
     )
     mixing_unitarity_residual = float(
@@ -381,6 +450,62 @@ def layer1_channel_audit(
             - np.eye(2, dtype=complex),
             ord="fro",
         )
+    )
+
+    # Regression 3: inhomogeneous Lindblad gauge freedom
+    # L' = L + c I,
+    # H' = H + (c* L - c L^dagger)/(2 i).
+    # The Hamiltonian correction is essential and its sign follows the
+    # master-equation convention implemented in liouvillian().
+    gauge_c = 0.231 + 0.173j
+    identity4 = np.eye(h.shape[0], dtype=complex)
+    gauge_jump = jump_zero + gauge_c * identity4
+    gauge_h = h + (
+        gauge_c.conjugate() * jump_zero
+        - gauge_c * jump_zero.conj().T
+    ) / (2.0j)
+    gauge_generator_difference = float(
+        np.linalg.norm(
+            liouvillian(h, [jump_zero])
+            - liouvillian(gauge_h, [gauge_jump]),
+            ord="fro",
+        )
+        / noisy_zero.shape[0]
+    )
+    noisy_gauge = channel_superoperator(
+        gauge_h, [gauge_jump], cfg.target_duration
+    )
+    gauge_channel_difference = float(
+        np.linalg.norm(noisy_zero - noisy_gauge, ord="fro")
+        / noisy_zero.shape[0]
+    )
+
+    # CPTP diagnostics are performed on raw Choi matrices before any
+    # Hermitian projection.  We test ideal/noisy encoded and full channels.
+    choi_cases = {
+        "encoded_ideal": (
+            encoded_choi(ideal, operators["V"]), 2, 4
+        ),
+        "encoded_collective_noisy": (
+            encoded_choi(noisy_zero, operators["V"]), 2, 4
+        ),
+        "full_ideal": (full_choi(ideal), 4, 4),
+        "full_collective_noisy": (full_choi(noisy_zero), 4, 4),
+    }
+    cptp = {
+        name: choi_cptp_diagnostics(choi, d_in, d_out)
+        for name, (choi, d_in, d_out) in choi_cases.items()
+    }
+    cptp_gate = all(
+        values["hermiticity_residual"]
+        <= cfg.choi_hermiticity_tolerance
+        and values["minimum_eigenvalue"]
+        >= -cfg.choi_cp_eigenvalue_tolerance
+        and values["trace_preservation_residual"]
+        <= cfg.choi_tp_tolerance
+        and values["normalized_trace_residual"]
+        <= cfg.choi_tp_tolerance
+        for values in cptp.values()
     )
 
     rows: list[dict[str, Any]] = []
@@ -400,7 +525,7 @@ def layer1_channel_audit(
         if x["delta"] != 0.0
     ]
     zero_row = next(x for x in rows if x["delta"] == 0.0)
-    gates = {
+    model_gates = {
         "encoded_DFS_channel_exactly_ideal": (
             encoded_zero <= cfg.zero_channel_tolerance
             and zero_row["encoded_choi_trace_distance"]
@@ -412,26 +537,37 @@ def layer1_channel_audit(
         "symmetry_breaking_opens_encoded_channel_loss": all(
             x >= cfg.positive_channel_minimum for x in nonzero
         ),
+        "raw_choi_channels_are_CPTP": cptp_gate,
+    }
+    regression_checks = {
         "jump_phase_representation_invariance": (
             phase_representation_change
             <= cfg.representation_invariance_tolerance
         ),
-        "split_jump_representation_matches_single_jump": (
-            split_matches_single
-            <= cfg.representation_invariance_tolerance
-        ),
-        "two_jump_unitary_mixing_invariance": (
+        "distinct_two_jump_unitary_mixing_regression": (
             unitary_mixing_change
             <= cfg.representation_invariance_tolerance
             and mixing_unitarity_residual
             <= cfg.representation_invariance_tolerance
         ),
+        "inhomogeneous_lindblad_gauge_regression": (
+            gauge_generator_difference
+            <= cfg.representation_invariance_tolerance
+            and gauge_channel_difference
+            <= cfg.representation_invariance_tolerance
+        ),
     }
+    regression_checks_pass = all(regression_checks.values())
     return {
         "status": (
-            "REPRESENTATION_INVARIANT_ENCODED_CHANNEL_ZERO_SUPPORTED"
-            if all(gates.values())
+            "ENCODED_CHANNEL_ZERO_AND_CPTP_AUDIT_SUPPORTED"
+            if all(model_gates.values())
             else "CHANNEL_LEVEL_DFS_AUDIT_FAILED"
+        ),
+        "regression_status": (
+            "NUMERICAL_REPRESENTATION_REGRESSIONS_PASS"
+            if regression_checks_pass
+            else "NUMERICAL_REPRESENTATION_REGRESSION_WARNING"
         ),
         "cost_definition": (
             "E_ch=1/2||J(encoded noisy channel)"
@@ -441,22 +577,49 @@ def layer1_channel_audit(
         "full_physical_space_collective_point_cost": full_space_cost,
         "equivalent_jump_phase_superoperator_difference":
             phase_representation_change,
-        "equivalent_split_vs_single_superoperator_difference":
-            split_matches_single,
-        "equivalent_two_jump_unitary_mixing_superoperator_difference":
+        "distinct_two_jump_unitary_mixing_superoperator_difference":
             unitary_mixing_change,
         "jump_mixing_unitarity_residual": mixing_unitarity_residual,
-        "gates": gates,
+        "inhomogeneous_gauge_generator_difference":
+            gauge_generator_difference,
+        "inhomogeneous_gauge_channel_difference":
+            gauge_channel_difference,
+        "raw_choi_CPTP_diagnostics": cptp,
+        "model_gates": model_gates,
+        "nonvoting_regression_checks": regression_checks,
+        "nonvoting_regression_checks_pass": regression_checks_pass,
         "interpretation": (
             "The zero is an encoded-channel statement, not a claim that the "
-            "full physical channel is noiseless."
+            "full physical channel is noiseless. Representation changes are "
+            "non-voting numerical regression tests because E_ch is defined "
+            "from the channel itself."
         ),
     }, rows
 
 
 def ramsey_visibility(gamma: float, time_value: float) -> float:
-    # Coherence between L eigenvalues 2 sqrt(gamma) and 0.
-    return float(np.exp(-2.0 * gamma * time_value))
+    # Coherence between |00> and |11>.  Their collective-jump eigenvalue
+    # difference is 4 sqrt(gamma), hence exp[-(difference^2/2)t].
+    return float(np.exp(-8.0 * gamma * time_value))
+
+
+def ramsey_probability_from_liouvillian(
+    gamma: float,
+    time_value: float,
+    operators: dict[str, np.ndarray],
+) -> float:
+    """Full-model Ramsey return probability with exchange H kept on."""
+    psi = (ket(0) + ket(3)) / math.sqrt(2.0)
+    rho0 = np.outer(psi, psi.conj())
+    projector_plus = rho0
+    channel = channel_superoperator(
+        operators["H"],
+        [jump_for_delta(gamma, 0.0, operators)],
+        time_value,
+    )
+    rho_t = apply_superoperator(channel, rho0)
+    probability = float(np.real(np.trace(projector_plus @ rho_t)))
+    return float(np.clip(probability, 0.0, 1.0))
 
 
 def generate_ramsey_rows(
@@ -465,11 +628,15 @@ def generate_ramsey_rows(
     shots: int,
     rng: np.random.Generator,
     role: str,
+    operators: dict[str, np.ndarray],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for time_value in times:
-        visibility = ramsey_visibility(gamma_true, time_value)
-        probability_plus = 0.5 * (1.0 + visibility)
+        probability_plus = ramsey_probability_from_liouvillian(
+            gamma_true, time_value, operators
+        )
+        visibility = 2.0 * probability_plus - 1.0
+        analytic_visibility = ramsey_visibility(gamma_true, time_value)
         plus_counts = int(rng.binomial(shots, probability_plus))
         measured_visibility = 2.0 * plus_counts / shots - 1.0
         rows.append({
@@ -478,6 +645,10 @@ def generate_ramsey_rows(
             "plus_counts": plus_counts,
             "minus_counts": shots - plus_counts,
             "measured_visibility": measured_visibility,
+            "liouvillian_visibility": visibility,
+            "analytic_visibility": analytic_visibility,
+            "liouvillian_vs_analytic_error":
+                abs(visibility - analytic_visibility),
             "data_role": role,
         })
     return rows
@@ -516,7 +687,8 @@ def fit_gamma_mle(
         time_value = row["time"]
         visibility = ramsey_visibility(gamma_hat, time_value)
         probability = 0.5 * (1.0 + visibility)
-        derivative = -time_value * visibility
+        # p=(1+exp(-8 gamma t))/2, so dp/dgamma=-4 t visibility.
+        derivative = -4.0 * time_value * visibility
         fisher += (
             row["shots"]
             * derivative**2
@@ -526,7 +698,7 @@ def fit_gamma_mle(
     diagnostics = {
         "optimizer_success": bool(result.success),
         "negative_log_likelihood": float(result.fun),
-        "observed_fisher_information": fisher,
+        "expected_fisher_information_at_mle": fisher,
         "asymptotic_standard_error": standard_error,
         "asymptotic_95_percent_interval": [
             max(0.0, gamma_hat - 1.96 * standard_error),
@@ -536,54 +708,66 @@ def fit_gamma_mle(
     return gamma_hat, standard_error, diagnostics
 
 
-def predict_heldout_channels(
-    gamma_hat: float,
-    deltas: tuple[float, ...],
-    duration: float,
-    operators: dict[str, np.ndarray],
-) -> list[dict[str, Any]]:
-    """Prediction interface deliberately receives gamma_hat, not gamma_true."""
-    rows: list[dict[str, Any]] = []
-    for delta in deltas:
-        rows.append({
-            "delta": delta,
-            "predicted_encoded_choi_trace_distance":
-                encoded_channel_cost(gamma_hat, delta, duration, operators),
-            "data_role": "heldout_channel_prediction",
-        })
-    return rows
-
-
-def layer2_blind_calibration(
+def layer2_synthetic_calibration(
     cfg: Config,
     operators: dict[str, np.ndarray],
+    output: Path,
 ) -> tuple[
     dict[str, Any],
     list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
 ]:
-    rng = np.random.default_rng(cfg.calibration_seed)
+    seed_sequence = np.random.SeedSequence(cfg.master_seed)
+    primary_cal_seed, primary_heldout_seed, coverage_root = (
+        seed_sequence.spawn(3)
+    )
+    calibration_rng = np.random.default_rng(primary_cal_seed)
+    heldout_rng = np.random.default_rng(primary_heldout_seed)
     calibration_rows = generate_ramsey_rows(
         cfg.true_gamma,
         cfg.calibration_times,
         cfg.calibration_shots_per_time,
-        rng,
+        calibration_rng,
         "calibration_fit",
-    )
-    heldout_rows = generate_ramsey_rows(
-        cfg.true_gamma,
-        cfg.heldout_times,
-        cfg.heldout_shots_per_time,
-        rng,
-        "heldout_ramsey_test",
+        operators,
     )
 
     gamma_hat, standard_error, fit_diagnostics = fit_gamma_mle(
         calibration_rows, cfg.likelihood_bounds
     )
+    lower_bound, upper_bound = cfg.likelihood_bounds
+    mle_is_interior = (
+        lower_bound * 1.001 < gamma_hat < upper_bound * 0.999
+    )
     gamma_relative_error = abs(gamma_hat - cfg.true_gamma) / cfg.true_gamma
 
+    # Freeze predictions on disk before the held-out generator is invoked.
+    frozen_payload = {
+        "version": VERSION,
+        "master_seed": cfg.master_seed,
+        "gamma_hat": gamma_hat,
+        "heldout_times": list(cfg.heldout_times),
+        "predicted_visibilities": [
+            ramsey_visibility(gamma_hat, value)
+            for value in cfg.heldout_times
+        ],
+        "statement": (
+            "Written before held-out synthetic counts are generated."
+        ),
+    }
+    frozen_path = output / "frozen_predictions_pretruth.json"
+    save_json(frozen_path, frozen_payload)
+    frozen_hash = sha256(frozen_path)
+
+    heldout_rows = generate_ramsey_rows(
+        cfg.true_gamma,
+        cfg.heldout_times,
+        cfg.heldout_shots_per_time,
+        heldout_rng,
+        "heldout_ramsey_test",
+        operators,
+    )
     heldout_visibility_errors: list[float] = []
     for row in heldout_rows:
         prediction = ramsey_visibility(gamma_hat, row["time"])
@@ -596,72 +780,223 @@ def layer2_blind_calibration(
         np.sqrt(np.mean(np.square(heldout_visibility_errors)))
     )
 
-    predicted_channels = predict_heldout_channels(
-        gamma_hat,
-        cfg.heldout_deltas,
-        cfg.target_duration,
-        operators,
-    )
-    channel_relative_errors: list[float] = []
-    for row in predicted_channels:
-        # Truth is revealed only after predictions have been constructed.
-        truth = encoded_channel_cost(
+    # Empirical interval coverage and held-out calibration over independent
+    # repetitions.  Calibration and held-out streams are separate per seed.
+    coverage_rows: list[dict[str, Any]] = []
+    covered_count = 0
+    coverage_children = coverage_root.spawn(cfg.coverage_repetitions)
+    for repetition, repetition_seed in enumerate(coverage_children):
+        cal_seed, test_seed = repetition_seed.spawn(2)
+        cal_rows = generate_ramsey_rows(
             cfg.true_gamma,
-            row["delta"],
-            cfg.target_duration,
+            cfg.calibration_times,
+            cfg.calibration_shots_per_time,
+            np.random.default_rng(cal_seed),
+            "coverage_calibration",
             operators,
         )
-        row["truth_encoded_choi_trace_distance"] = truth
-        row["absolute_error"] = abs(
-            row["predicted_encoded_choi_trace_distance"] - truth
+        rep_hat, rep_se, rep_diag = fit_gamma_mle(
+            cal_rows, cfg.likelihood_bounds
         )
-        row["relative_error"] = row["absolute_error"] / max(truth, 1.0e-15)
-        channel_relative_errors.append(row["relative_error"])
-
-    maximum_channel_relative_error = max(channel_relative_errors)
+        rep_interval = rep_diag["asymptotic_95_percent_interval"]
+        covered = rep_interval[0] <= cfg.true_gamma <= rep_interval[1]
+        covered_count += int(covered)
+        test_rows = generate_ramsey_rows(
+            cfg.true_gamma,
+            cfg.heldout_times,
+            cfg.heldout_shots_per_time,
+            np.random.default_rng(test_seed),
+            "coverage_heldout",
+            operators,
+        )
+        residuals = [
+            row["measured_visibility"]
+            - ramsey_visibility(rep_hat, row["time"])
+            for row in test_rows
+        ]
+        coverage_rows.append({
+            "repetition": repetition,
+            "gamma_hat": rep_hat,
+            "gamma_standard_error": rep_se,
+            "interval_low": rep_interval[0],
+            "interval_high": rep_interval[1],
+            "covers_true_gamma": covered,
+            "gamma_relative_error":
+                abs(rep_hat - cfg.true_gamma) / cfg.true_gamma,
+            "heldout_visibility_rmse":
+                float(np.sqrt(np.mean(np.square(residuals)))),
+        })
+    empirical_coverage = covered_count / cfg.coverage_repetitions
+    mean_coverage_rmse = float(np.mean([
+        row["heldout_visibility_rmse"] for row in coverage_rows
+    ]))
+    maximum_model_formula_error = max(
+        row["liouvillian_vs_analytic_error"]
+        for row in calibration_rows + heldout_rows
+    )
     interval = fit_diagnostics["asymptotic_95_percent_interval"]
     gates = {
         "calibration_optimizer_succeeded":
             fit_diagnostics["optimizer_success"],
+        "mle_is_strictly_inside_bounds": mle_is_interior,
+        "full_liouvillian_matches_ramsey_formula": (
+            maximum_model_formula_error <= 3.0e-13
+        ),
         "gamma_recovered_from_calibration_only": (
             gamma_relative_error <= cfg.gamma_relative_error_tolerance
-        ),
-        "true_gamma_inside_asymptotic_95_percent_interval": (
-            interval[0] <= cfg.true_gamma <= interval[1]
         ),
         "disjoint_heldout_ramsey_prediction": (
             heldout_visibility_rmse
             <= cfg.heldout_visibility_rmse_tolerance
         ),
-        "frozen_gamma_predicts_unseen_channel_grid": (
-            maximum_channel_relative_error
-            <= cfg.heldout_channel_max_relative_error_tolerance
+        "empirical_95_percent_interval_coverage": (
+            cfg.coverage_lower
+            <= empirical_coverage
+            <= cfg.coverage_upper
         ),
+        "prediction_frozen_before_heldout_generation":
+            frozen_hash is not None,
     }
     return {
         "status": (
-            "SYNTHETIC_BLIND_CALIBRATION_AND_HELDOUT_PREDICTION_SUPPORTED"
+            "SYNTHETIC_SEPARATED_CALIBRATION_AND_COVERAGE_SUPPORTED"
             if all(gates.values())
-            else "BLIND_CALIBRATION_AUDIT_FAILED"
+            else "SYNTHETIC_CALIBRATION_AUDIT_FAILED"
         ),
         "calibration_protocol": (
-            "Binomial MLE on non-DFS Ramsey counts; gamma_hat frozen before "
-            "held-out Ramsey and encoded-channel evaluation."
+            "Full-Liouvillian counts for (|00>+|11>)/sqrt(2); one fitted "
+            "parameter gamma in a declared response family; gamma_hat and "
+            "held-out predictions written before held-out generation."
         ),
-        "gamma_true_hidden_from_fit": cfg.true_gamma,
+        "ramsey_state": "(|00>+|11>)/sqrt(2)",
+        "ramsey_visibility_formula": "V(t)=exp(-8 gamma t), with H on",
+        "gamma_true_used_only_by_synthetic_generator": cfg.true_gamma,
         "gamma_hat": gamma_hat,
         "gamma_relative_error": gamma_relative_error,
         "gamma_standard_error": standard_error,
         "fit_diagnostics": fit_diagnostics,
         "heldout_visibility_rmse": heldout_visibility_rmse,
-        "maximum_heldout_channel_relative_error":
-            maximum_channel_relative_error,
+        "maximum_liouvillian_vs_formula_error":
+            maximum_model_formula_error,
+        "coverage_repetitions": cfg.coverage_repetitions,
+        "empirical_95_percent_interval_coverage": empirical_coverage,
+        "mean_repeated_heldout_visibility_rmse": mean_coverage_rmse,
+        "frozen_prediction_file": frozen_path.name,
+        "frozen_prediction_sha256": frozen_hash,
         "gates": gates,
         "boundary": (
-            "The separation is enforced in software, but the counts are "
-            "synthetic; this is not independent laboratory calibration."
+            "Generator and estimator are separated in software, but counts "
+            "are synthetic. This is parameter-recovery and predictive-"
+            "calibration evidence, not independent laboratory calibration "
+            "or a blind model-discovery test."
         ),
-    }, calibration_rows, heldout_rows, predicted_channels
+    }, calibration_rows, heldout_rows, coverage_rows
+
+
+def layer3_symmetry_breaking_scaling(
+    cfg: Config,
+    operators: dict[str, np.ndarray],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    per_slice: list[dict[str, Any]] = []
+    maximum_evenness_error = 0.0
+    for gamma in cfg.scaling_gammas:
+        for duration in cfg.scaling_times:
+            positive_costs: list[float] = []
+            for delta in cfg.scaling_abs_deltas:
+                positive = encoded_channel_cost(
+                    gamma, delta, duration, operators
+                )
+                negative = encoded_channel_cost(
+                    gamma, -delta, duration, operators
+                )
+                evenness = abs(positive - negative) / max(
+                    positive, negative, 1.0e-15
+                )
+                maximum_evenness_error = max(
+                    maximum_evenness_error, evenness
+                )
+                positive_costs.append(positive)
+                rows.append({
+                    "gamma": gamma,
+                    "duration": duration,
+                    "abs_delta": delta,
+                    "positive_delta_cost": positive,
+                    "negative_delta_cost": negative,
+                    "reflection_evenness_relative_error": evenness,
+                    "cost_over_gamma_delta2_time":
+                        positive / (gamma * delta**2 * duration),
+                    "data_role": "symmetry_breaking_scaling",
+                })
+            exponent, log_prefactor = np.polyfit(
+                np.log(np.asarray(cfg.scaling_abs_deltas)),
+                np.log(np.asarray(positive_costs)),
+                1,
+            )
+            # The smallest delta is the declared weak-imbalance coefficient
+            # check; larger deltas test finite-range exponent stability.
+            weak_ratio = (
+                positive_costs[0]
+                / (
+                    gamma
+                    * cfg.scaling_abs_deltas[0] ** 2
+                    * duration
+                )
+            )
+            per_slice.append({
+                "gamma": gamma,
+                "duration": duration,
+                "delta_loglog_exponent": float(exponent),
+                "fitted_prefactor": float(np.exp(log_prefactor)),
+                "small_delta_cost_over_gamma_delta2_time": weak_ratio,
+                "small_delta_coefficient_relative_error":
+                    abs(weak_ratio - 1.0),
+            })
+
+    exponents = [row["delta_loglog_exponent"] for row in per_slice]
+    coefficient_errors = [
+        row["small_delta_coefficient_relative_error"]
+        for row in per_slice
+    ]
+    gates = {
+        "delta_squared_exponent_on_all_gamma_time_slices": all(
+            cfg.delta_exponent_lower <= value <= cfg.delta_exponent_upper
+            for value in exponents
+        ),
+        "weak_imbalance_coefficient_matches_gamma_delta2_time": (
+            max(coefficient_errors)
+            <= cfg.weak_coefficient_relative_tolerance
+        ),
+        "delta_reflection_evenness": (
+            maximum_evenness_error
+            <= cfg.reflection_evenness_tolerance
+        ),
+        "gamma_time_grid_is_nontrivial": (
+            len(cfg.scaling_gammas) >= 3
+            and len(cfg.scaling_times) >= 3
+        ),
+    }
+    return {
+        "status": (
+            "ENCODED_CHANNEL_DELTA_SQUARED_OPENING_SUPPORTED"
+            if all(gates.values())
+            else "SYMMETRY_BREAKING_SCALING_AUDIT_FAILED"
+        ),
+        "tested_relation": (
+            "E_ch(delta)=gamma*delta^2*t+o(delta^2)"
+        ),
+        "gamma_grid": cfg.scaling_gammas,
+        "duration_grid": cfg.scaling_times,
+        "absolute_delta_grid": cfg.scaling_abs_deltas,
+        "minimum_delta_loglog_exponent": min(exponents),
+        "maximum_delta_loglog_exponent": max(exponents),
+        "maximum_weak_coefficient_relative_error":
+            max(coefficient_errors),
+        "maximum_delta_reflection_evenness_relative_error":
+            maximum_evenness_error,
+        "slice_fits": per_slice,
+        "gates": gates,
+    }, rows
 
 
 def save_plot(
@@ -669,7 +1004,7 @@ def save_plot(
     selection_rows: list[dict[str, Any]],
     calibration_rows: list[dict[str, Any]],
     heldout_rows: list[dict[str, Any]],
-    channel_rows: list[dict[str, Any]],
+    scaling_rows: list[dict[str, Any]],
     gamma_hat: float,
 ) -> str | None:
     figure = None
@@ -710,32 +1045,34 @@ def save_plot(
             marker="x",
             label="held out",
         )
-        axes[1].set_title("Blind Ramsey calibration")
+        axes[1].set_title("Separated synthetic calibration")
         axes[1].set_xlabel("time")
         axes[1].set_ylabel("visibility")
         axes[1].legend()
 
-        axes[2].plot(
-            [x["delta"] for x in channel_rows],
-            [
-                x["truth_encoded_choi_trace_distance"]
-                for x in channel_rows
-            ],
+        selected_scaling = [
+            row for row in scaling_rows
+            if abs(row["gamma"] - 0.20) < 1.0e-15
+            and abs(row["duration"] - math.pi / 2.0) < 1.0e-15
+        ]
+        axes[2].loglog(
+            [x["abs_delta"] for x in selected_scaling],
+            [x["positive_delta_cost"] for x in selected_scaling],
             "o-",
-            label="hidden truth",
+            label=r"exact $E_{\rm ch}$",
         )
-        axes[2].plot(
-            [x["delta"] for x in channel_rows],
+        axes[2].loglog(
+            [x["abs_delta"] for x in selected_scaling],
             [
-                x["predicted_encoded_choi_trace_distance"]
-                for x in channel_rows
+                x["gamma"] * x["abs_delta"] ** 2 * x["duration"]
+                for x in selected_scaling
             ],
-            "x--",
-            label="frozen prediction",
+            "--",
+            label=r"$\gamma\delta^2t$",
         )
-        axes[2].set_title("Unseen channel grid")
-        axes[2].set_xlabel(r"$\delta$")
-        axes[2].set_ylabel("Choi trace distance")
+        axes[2].set_title("Symmetry-breaking opening")
+        axes[2].set_xlabel(r"$|\delta|$")
+        axes[2].set_ylabel("encoded Choi witness")
         axes[2].legend()
 
         for axis in axes:
@@ -805,7 +1142,7 @@ def main() -> None:
     save_json(output / "summary.json", summary)
 
     print("\n" + "=" * 100)
-    print("DFS CHANNEL-COST + SYNTHETIC BLIND-CALIBRATION v3.1")
+    print("DFS CHANNEL-COST + SYNTHETIC CALIBRATION v3.3")
     print("=" * 100)
     print("backend=exact NumPy/SciPy | cloud access=none")
 
@@ -813,79 +1150,102 @@ def main() -> None:
         cfg = Config()
         operators = build_operators(cfg)
 
-        print("\n[LAYER 1] Representation-invariant encoded-channel cost")
+        print("\n[LAYER 1] Encoded-channel witness, CPTP, regressions")
         layer1, selection_rows = layer1_channel_audit(cfg, operators)
         print(json.dumps(clean(layer1), indent=2, ensure_ascii=False))
 
-        print("\n[LAYER 2] Calibration-only fit and frozen held-out prediction")
+        print("\n[LAYER 2] Full-Liouvillian synthetic calibration")
         (
             layer2,
             calibration_rows,
             heldout_rows,
-            channel_rows,
-        ) = layer2_blind_calibration(cfg, operators)
+            coverage_rows,
+        ) = layer2_synthetic_calibration(cfg, operators, output)
         print(json.dumps(clean(layer2), indent=2, ensure_ascii=False))
 
+        print("\n[LAYER 3] Multi-gamma/time delta-squared opening")
+        layer3, scaling_rows = layer3_symmetry_breaking_scaling(
+            cfg, operators
+        )
+        print(json.dumps(clean(layer3), indent=2, ensure_ascii=False))
+
         global_gates = {
-            "representation_invariant_channel_cost":
+            "encoded_channel_zero_and_CPTP":
                 layer1["status"]
-                == "REPRESENTATION_INVARIANT_ENCODED_CHANNEL_ZERO_SUPPORTED",
-            "synthetic_blind_calibration_and_heldout_prediction":
+                == "ENCODED_CHANNEL_ZERO_AND_CPTP_AUDIT_SUPPORTED",
+            "synthetic_separated_calibration_and_coverage":
                 layer2["status"]
                 == (
-                    "SYNTHETIC_BLIND_CALIBRATION_AND_"
-                    "HELDOUT_PREDICTION_SUPPORTED"
+                    "SYNTHETIC_SEPARATED_CALIBRATION_AND_"
+                    "COVERAGE_SUPPORTED"
                 ),
+            "delta_squared_symmetry_breaking_opening":
+                layer3["status"]
+                == "ENCODED_CHANNEL_DELTA_SQUARED_OPENING_SUPPORTED",
         }
-        physical_support = all(global_gates.values())
+        declared_model_support = all(global_gates.values())
+        nonvoting_regression_checks_pass = bool(
+            layer1["nonvoting_regression_checks_pass"]
+        )
         scientific_status = (
-            "DFS_CHANNEL_ZERO_AND_BLIND_CALIBRATION_SUPPORTED"
-            if physical_support
+            "DFS_CHANNEL_ZERO_CALIBRATION_AND_SCALING_SUPPORTED"
+            if declared_model_support
             else "DFS_CHANNEL_CALIBRATION_AUDIT_FAILED"
         )
         certificate = {
             "version": VERSION,
             "scientific_status": scientific_status,
-            "physical_support": physical_support,
+            "declared_model_support": declared_model_support,
+            "nonvoting_regression_checks_pass":
+                nonvoting_regression_checks_pass,
             "frozen_config": asdict(cfg),
             "layer1_channel_cost": layer1,
-            "layer2_blind_calibration": layer2,
+            "layer2_synthetic_calibration": layer2,
+            "layer3_symmetry_breaking_scaling": layer3,
             "global_gates": global_gates,
             "claim_boundary": (
-                "The encoded Choi-distance zero is a channel-level statement "
-                "and is unchanged under the tested equivalent single-jump "
-                "phase and two-jump unitary-mixing representations. Gamma is "
-                "estimated from disjoint finite-shot synthetic Ramsey data and "
-                "then frozen for held-out predictions. No QPU, laboratory "
-                "calibration, zero-total-energy, universal realizability, or "
-                "Lorentzian claim is made."
+                "The normalized encoded Choi-state trace-distance zero is a "
+                "channel-level witness, not a diamond-distance estimate. "
+                "Raw Choi CPTP conditions are audited. Representation changes "
+                "are regression tests, not physical evidence. Gamma is the "
+                "only fitted parameter in a declared synthetic Ramsey family; "
+                "predictions are frozen before held-out generation. The "
+                "delta-squared opening is tested over multiple gamma and time "
+                "values. No QPU, laboratory calibration, zero-total-energy, "
+                "universal realizability, or Lorentzian claim is made."
             ),
         }
 
-        save_json(output / "dfs_channel_v3_certificate.json", certificate)
+        save_json(output / "dfs_channel_v3_3_certificate.json", certificate)
         save_csv(output / "layer1_channel_selection.csv", selection_rows)
         save_csv(output / "calibration_ramsey_counts.csv", calibration_rows)
         save_csv(output / "heldout_ramsey_counts.csv", heldout_rows)
-        save_csv(output / "heldout_channel_predictions.csv", channel_rows)
+        save_csv(output / "coverage_repetitions.csv", coverage_rows)
+        save_csv(output / "symmetry_breaking_scaling.csv", scaling_rows)
         figure = save_plot(
-            output / "dfs_channel_v3_diagnostic.png",
+            output / "dfs_channel_v3_3_diagnostic.png",
             selection_rows,
             calibration_rows,
             heldout_rows,
-            channel_rows,
+            scaling_rows,
             layer2["gamma_hat"],
         )
 
         summary.update({
             "status": "COMPLETE",
             "scientific_status": scientific_status,
-            "physical_support": physical_support,
+            "declared_model_support": declared_model_support,
+            "nonvoting_regression_checks_pass":
+                nonvoting_regression_checks_pass,
             "outputs": {
-                "certificate": "dfs_channel_v3_certificate.json",
+                "certificate": "dfs_channel_v3_3_certificate.json",
                 "layer1": "layer1_channel_selection.csv",
                 "calibration": "calibration_ramsey_counts.csv",
                 "heldout_ramsey": "heldout_ramsey_counts.csv",
-                "heldout_channels": "heldout_channel_predictions.csv",
+                "coverage": "coverage_repetitions.csv",
+                "scaling": "symmetry_breaking_scaling.csv",
+                "frozen_predictions":
+                    "frozen_predictions_pretruth.json",
                 "figure": figure,
             },
         })
@@ -895,13 +1255,16 @@ def main() -> None:
         print("=" * 100)
         print(json.dumps(clean({
             "scientific_status": scientific_status,
-            "physical_support": physical_support,
+            "declared_model_support": declared_model_support,
+            "nonvoting_regression_checks_pass":
+                nonvoting_regression_checks_pass,
             "global_gates": global_gates,
             "claim_boundary": certificate["claim_boundary"],
         }), indent=2, ensure_ascii=False))
-        if not physical_support:
+        if not declared_model_support:
             raise AssertionError(
-                "At least one frozen v3 gate failed; inspect certificate."
+                "At least one frozen v3.3 model gate failed; inspect "
+                "certificate."
             )
     except Exception as exc:
         summary.update({
