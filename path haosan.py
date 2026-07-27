@@ -103,6 +103,41 @@ Each item below is a defect of v1.1, not a preference.
 (i) The unitary cache key rounded z to 13 decimals, so two controls closer than
     5e-14 aliased to the same cached unitary. The key is now the exact bytes.
 
+WHAT v1.4 ADDS, AND THE MEASUREMENT THAT FORCED ITS DESIGN
+----------------------------------------------------------
+v1.3 reported that CW and CCW are the same loop reversed, hence correlated, and
+asserted that "a loop of a different shape or scale in the task plane" would be
+an independent test. That assertion was WRONG, and the first v1.4 build failed
+its own new gate proving it: a triangle at a different scale in the (X, Y) plane
+landed with control overlap +0.99985 against the square, and the ratio of the
+two landing-point norms was 1.1311 against an enclosed-area ratio of 1.125.
+
+For a small loop the holonomy is the curvature two-form contracted with the
+enclosed area, so the DIRECTION of the landing point in control space is fixed
+by the plane; only the magnitude tracks the area. No reshaping or rescaling
+within one task plane can reach a different point of the fiber.
+
+v1.4 therefore makes the task space three dimensional, with generators X, Y and
+N, and puts the second loop in the (X, N) plane. The reachability of all three
+generators is checked by the same lift diagnostic as before. A same-plane
+reshaped loop is still transported as a NEGATIVE CONTROL, so the certificate
+contains the evidence for why the plane had to change rather than the shape.
+
+v1.4.1 adds a cap on the quoted precision. Two v1.4 runs of identical source on
+different platforms produced identical VALUES but different BUDGETS for the ALT
+residual exponents: their -log10(drift) landed at 7.999 and 7.663, and the drift
+is a difference of two nearly equal numbers, so a BLAS-level factor-of-two change
+moves it across the decade boundary. A platform-dependent precision claim is not
+defensible in a paper, so budgets are capped at six significant figures and every
+budget whose -log10(drift) sits within 0.3 of a decade boundary is flagged
+marginal_budget in the certificate. The flag is reported, not acted on: forcing
+the lower count would reduce ||dK|| to one significant figure for no gain.
+
+The collinearity gate is applied to the CONTROL overlap. The response overlap
+stays high (about 0.94) even for clearly distinct landing points, because K is
+approximately linear in z near the reference and its derivative is dominated by
+one direction; that is reported, not gated.
+
 Model and endpoint-fiber lift are the physical-z part of M2: exact two-atom
 Rydberg dynamics, six global piecewise-constant controls, 18 physical control
 coordinates, and a Euclidean minimum-norm endpoint lift.
@@ -139,7 +174,7 @@ from scipy.linalg import expm, expm_frechet
 from scipy.optimize import least_squares
 
 
-VERSION = "M2-P4-v1.3.2"
+VERSION = "M2-P4-v1.4.1"
 C6 = 5_420_158.53  # rad um^6 / us
 FLOOR = 1e-14
 INVALID_CONTROL_PENALTY = 1e3
@@ -190,6 +225,44 @@ class Cfg:
     # Step 1 distinctness. Without this, a zero-holonomy loop would satisfy
     # "same endpoint" trivially with z = z0.
     minimum_control_separation: float = 1e-6
+
+    # Second, genuinely different loop. v1.3 reported that CW and CCW are the
+    # same loop reversed and therefore correlated, then did nothing about it.
+    # ALT is a triangle at a different scale, so its landing point has no
+    # construction-level relation to the CW one.
+    # Task space is three dimensional: generators X, Y and N. The primary loop
+    # lives in the (X, Y) coordinate plane; ALT lives in (X, N).
+    loop_plane: tuple = (0, 1)
+    alt_loop_plane: tuple = (0, 2)
+    alt_loop_epsilon: float = 0.120
+    # ALT needs its own transport step. Measured: the ABSOLUTE discretization
+    # error of a landing point scales as the loop scale epsilon, while the
+    # holonomy itself scales as the enclosed area, i.e. epsilon^2. The RELATIVE
+    # step-halving drift therefore scales as step/epsilon, and a loop in a
+    # different plane does not inherit CW's step.
+    alt_transport_step: float = 0.0005
+    # Negative control: a reshaped loop of similar enclosed area IN THE SAME
+    # PLANE, transported only to demonstrate that reshaping cannot produce a
+    # different landing point.
+    same_plane_control_epsilon: float = 0.060
+    # Cap on the quoted precision of any scalar. The step-halving drift is a
+    # difference of two nearly equal numbers, so it is itself reproducible only
+    # to a factor of a few across BLAS implementations. Two v1.4 runs of the
+    # same source on different platforms produced identical values but DIFFERENT
+    # budgets for the ALT residual exponents, because their -log10(drift) landed
+    # at 7.999 and 7.663, i.e. on and just under a decade boundary. Capping the
+    # budget removes that platform dependence, and no quantity in this
+    # construction is worth more than six significant figures in a paper.
+    maximum_quoted_digits: int = 6
+    # A budget is flagged marginal when -log10(drift) sits within this fraction
+    # of a decade boundary, i.e. when a factor-2 change in the drift would move
+    # it. Reported, not acted on.
+    decade_margin_warning: float = 0.30
+
+    # |cos| between two landing points, applied to the CONTROL vectors. This does
+    # NOT establish independence; it rules out the degenerate case where the
+    # "second" loop lands on the same ray as the first and re-tests nothing.
+    landing_point_collinearity_max: float = 0.9
 
     # G2b: the discarded singular values must behave as central-difference
     # truncation error, i.e. shrink by ~4 when control_fd is halved.
@@ -321,7 +394,11 @@ def format_quoted(value: float, digits: int) -> str:
 
 
 def quantity_convergence(
-    coarse: dict, fine: dict, floor: float = NUMERICAL_FLOOR
+    coarse: dict,
+    fine: dict,
+    maximum_digits: int,
+    decade_margin_warning: float,
+    floor: float = NUMERICAL_FLOOR,
 ) -> dict[str, Any]:
     """Per-quantity digit budget from the transport step-halving audit.
 
@@ -365,14 +442,29 @@ def quantity_convergence(
             }
             continue
         drift = abs(a - b) / max(abs(a), FLOOR)
-        digits = justified_digits(drift)
+        raw_digits = justified_digits(drift)
+        digits = int(min(raw_digits, maximum_digits))
+        decade_position = (
+            -math.log10(drift) if drift > 0 and math.isfinite(drift) else float("inf")
+        )
+        margin = (
+            decade_position - math.floor(decade_position)
+            if math.isfinite(decade_position)
+            else float("inf")
+        )
         out[dotted] = {
             "macro_stem": macro,
             "coarse_step_value": a,
             "fine_step_value": b,
             "regime": "CONVERGENCE_LIMITED",
             "relative_drift": drift,
+            "unconstrained_digits": raw_digits,
             "digits": digits,
+            "capped_by_maximum": bool(raw_digits > maximum_digits),
+            "decade_margin": margin,
+            "marginal_budget": bool(
+                raw_digits <= maximum_digits and margin < decade_margin_warning
+            ),
             "quoted": format_quoted(a, digits),
         }
     return out
@@ -408,6 +500,11 @@ class Model:
         self.omega0 = twopi * np.array([2.0, 1.7, 2.3, 1.5, 2.1, 1.8])
         self.delta0 = twopi * np.array([-2.3, -1.2, 0.4, 1.4, 2.0, 0.8])
         self.phase0 = np.array([0.0, 0.4, 1.1, 2.0, 2.7, -2.4])
+
+        # Three task generators. v1.4 needed a task direction outside the (X, Y)
+        # plane: see the module docstring on the small-loop area law.
+        self.task_generators = [self.X, self.Y, self.N]
+        self.task_dimension = len(self.task_generators)
 
         self.I = np.eye(self.d, dtype=complex)
         self.IL = np.eye(self.liouville_d, dtype=complex)
@@ -461,7 +558,10 @@ class Model:
         return u
 
     def target(self, task: np.ndarray) -> np.ndarray:
-        return expm(-0.25j * (task[0] * self.X + task[1] * self.Y)) @ self.U0
+        generator = sum(
+            float(t) * g for t, g in zip(np.asarray(task, float), self.task_generators)
+        )
+        return expm(-0.25j * generator) @ self.U0
 
     def endpoint_residual_vector(self, z: np.ndarray, task: np.ndarray) -> np.ndarray:
         u = self.unitary(z)
@@ -543,8 +643,8 @@ def jacobian_control(model: Model, z: np.ndarray, task: np.ndarray, h: float) ->
 
 def jacobian_task(model: Model, z: np.ndarray, task: np.ndarray, h: float) -> np.ndarray:
     columns = []
-    for k in range(2):
-        ds = np.zeros(2)
+    for k in range(model.task_dimension):
+        ds = np.zeros(model.task_dimension)
         ds[k] = h
         columns.append(
             (
@@ -680,27 +780,52 @@ def lift_and_correct(cfg: Cfg, model: Model, z, task, d_task, rank):
     }
 
 
-def task_vertices(kind: str, epsilon: float) -> list[np.ndarray]:
-    origin = np.zeros(2)
-    x = np.array([epsilon, 0.0])
-    y = np.array([0.0, epsilon])
-    xy = np.array([epsilon, epsilon])
+def task_vertices(
+    kind: str, epsilon: float, plane: tuple, dimension: int
+) -> list[np.ndarray]:
+    """Closed loop in one coordinate plane of the task space."""
+    first, second = plane
+    if first == second or not {first, second} <= set(range(dimension)):
+        raise ValueError(f"invalid task plane {plane} for dimension {dimension}")
+
+    def point(a: float, b: float) -> np.ndarray:
+        v = np.zeros(dimension)
+        v[first] = a
+        v[second] = b
+        return v
+
+    origin = point(0.0, 0.0)
     if kind == "CW":
-        return [origin, x, xy, y, origin]
+        return [origin, point(epsilon, 0.0), point(epsilon, epsilon),
+                point(0.0, epsilon), origin]
     if kind == "CCW":
-        return [origin, y, xy, x, origin]
+        return [origin, point(0.0, epsilon), point(epsilon, epsilon),
+                point(epsilon, 0.0), origin]
+    if kind == "TRI":
+        # Reshaped loop, same plane. Used only as a negative control: the
+        # small-loop holonomy is the curvature contracted with the enclosed
+        # area, so its DIRECTION does not depend on the shape.
+        return [origin, point(epsilon, 0.0), point(0.5 * epsilon, epsilon), origin]
     raise ValueError(f"unknown loop kind: {kind}")
 
 
-def transport_loop(cfg: Cfg, model: Model, rank: int, kind: str, step: float):
+def transport_loop(
+    cfg: Cfg,
+    model: Model,
+    rank: int,
+    kind: str,
+    step: float,
+    epsilon: float,
+    plane: tuple,
+):
     invalid_before = model.invalid_control_evaluations
     z = model.z0.copy()
-    task = np.zeros(2)
+    task = np.zeros(model.task_dimension)
     worst = {"reachability": 0.0, "lift_error": 0.0, "residual": 0.0, "infidelity": 0.0}
     rank_rows: list[dict[str, Any]] = []
     steps = 0
 
-    vertices = task_vertices(kind, cfg.loop_epsilon)
+    vertices = task_vertices(kind, epsilon, plane, model.task_dimension)
     for start, end in zip(vertices[:-1], vertices[1:]):
         edge = end - start
         count = max(1, math.ceil(np.linalg.norm(edge) / step))
@@ -713,7 +838,8 @@ def transport_loop(cfg: Cfg, model: Model, rank: int, kind: str, step: float):
             rank_rows.append(diagnostics["rank"])
             steps += 1
 
-    final_q = jacobian_control(model, z, np.zeros(2), cfg.control_fd)
+    zero_task = np.zeros(model.task_dimension)
+    final_q = jacobian_control(model, z, zero_task, cfg.control_fd)
     rank_rows.append(rank_diagnostic(final_q, rank, cfg.path_rank_relative_cut))
 
     rank_summary = {
@@ -739,8 +865,8 @@ def transport_loop(cfg: Cfg, model: Model, rank: int, kind: str, step: float):
         and rank_summary["minimum_retained_to_discarded_gap"] >= cfg.path_spectral_gap_min
     )
 
-    residual = float(np.linalg.norm(model.endpoint_residual_vector(z, np.zeros(2))))
-    infidelity = model.endpoint_infidelity(z, np.zeros(2))
+    residual = float(np.linalg.norm(model.endpoint_residual_vector(z, zero_task)))
+    infidelity = model.endpoint_infidelity(z, zero_task)
     control_separation = float(np.linalg.norm(z - model.z0))
     invalid = int(model.invalid_control_evaluations - invalid_before)
     numerical_pass = bool(
@@ -755,6 +881,8 @@ def transport_loop(cfg: Cfg, model: Model, rank: int, kind: str, step: float):
     )
     return {
         "kind": kind,
+        "loop_epsilon": float(epsilon),
+        "loop_plane": [int(plane[0]), int(plane[1])],
         "z": z,
         "steps": steps,
         "endpoint_residual": residual,
@@ -944,73 +1072,120 @@ def analyze_direction(cfg: Cfg, model: Model, run: dict[str, Any], base_response
     return summary, rows
 
 
-def direction_independence(
-    model: Model, runs: dict[str, Any], base_response
-) -> dict[str, Any]:
-    """Report how far CW and CCW are from being the same test twice.
+def normalized_overlap(a: np.ndarray, b: np.ndarray) -> float:
+    """cos angle between two landing points or two responses.
 
-    Reported, not gated: there is no threshold at which two landing points
-    become "independent enough". The point is that the certificate must not be
-    read as two confirmations when the antipodality ratios are small, so the
-    finding for THIS run is stated in words rather than left as a conditional
-    legend for the reader to evaluate.
+    Scale free, so it compares landing points of different norms -- which the
+    sum/difference ratios used for the CW/CCW pair cannot do, because a loop of
+    a different size produces a holonomy of a different magnitude and the ratio
+    is then dominated by that mismatch rather than by direction.
     """
-    z_cw = runs["CW"]["z"]
-    z_ccw = runs["CCW"]["z"]
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na <= FLOOR or nb <= FLOOR:
+        return math.nan
+    return float(np.real(np.vdot(a, b)) / (na * nb))
+
+
+def landing_point_relations(
+    model: Model, runs: dict[str, Any], base_response, cfg: Cfg
+) -> dict[str, Any]:
+    """Pairwise relations among every transported landing point.
+
+    Reported, not gated as "independence": there is no threshold at which two
+    landing points become independent. What IS gated, elsewhere, is the
+    degenerate case -- a second loop whose landing point lies on the same ray as
+    the first re-tests nothing.
+    """
     k0 = base_response[2]
-    dk_cw = model.ideal_response(z_cw)[2] - k0
-    dk_ccw = model.ideal_response(z_ccw)[2] - k0
-    control_sum = float(
-        np.linalg.norm(z_cw + z_ccw) / max(np.linalg.norm(z_cw), FLOOR)
-    )
-    control_difference = float(
-        np.linalg.norm(z_cw - z_ccw) / max(np.linalg.norm(z_cw), FLOOR)
-    )
-    response_sum = float(
-        np.linalg.norm(dk_cw + dk_ccw) / max(np.linalg.norm(dk_cw), FLOOR)
-    )
+    names = list(runs)
+    z = {name: runs[name]["z"] for name in names}
+    dk = {name: model.ideal_response(runs[name]["z"])[2] - k0 for name in names}
+
+    pairs: dict[str, Any] = {}
+    for i, a in enumerate(names):
+        for b in names[i + 1 :]:
+            key = f"{a}_vs_{b}"
+            pairs[key] = {
+                "control_overlap": normalized_overlap(z[a], z[b]),
+                "response_overlap": normalized_overlap(dk[a], dk[b]),
+                "control_norm_ratio": float(
+                    np.linalg.norm(z[b]) / max(np.linalg.norm(z[a]), FLOOR)
+                ),
+                "control_sum_over_norm": float(
+                    np.linalg.norm(z[a] + z[b]) / max(np.linalg.norm(z[a]), FLOOR)
+                ),
+                "control_difference_over_norm": float(
+                    np.linalg.norm(z[a] - z[b]) / max(np.linalg.norm(z[a]), FLOOR)
+                ),
+                "response_sum_over_norm": float(
+                    np.linalg.norm(dk[a] + dk[b]) / max(np.linalg.norm(dk[a]), FLOOR)
+                ),
+            }
+
+    reversed_pair = pairs["CW_vs_CCW"]
+    reshaped_pair = pairs.get("CW_vs_SAME_PLANE_RESHAPED", {})
+    second_pair = pairs.get("CW_vs_ALT", {})
     finding = (
-        f"MEASURED IN THIS RUN: z_CCW = -z_CW to {control_sum:.1%} "
-        f"(||z_CW + z_CCW|| / ||z_CW|| = {control_sum:.3f}, and the complementary "
-        f"||z_CW - z_CCW|| / ||z_CW|| = {control_difference:.3f}, i.e. close to the "
-        f"antipodal value 2). The responses follow: dK_CCW = -dK_CW to "
-        f"{response_sum:.1%}. CW and CCW are therefore HIGHLY CORRELATED "
-        f"evaluations of the same first-order prediction, not independent "
-        f"confirmations of it."
+        "MEASURED IN THIS RUN. (1) Reversed loop, CW vs CCW: control overlap "
+        f"{reversed_pair['control_overlap']:+.4f}, response overlap "
+        f"{reversed_pair['response_overlap']:+.4f}. Reversing orientation gives "
+        "the antipodal landing point, and every gate here reads norms, which are "
+        "invariant under dK -> -dK; that is why the two agree to six digits in "
+        "the fitted exponents."
     )
+    if reshaped_pair:
+        finding += (
+            " (2) Reshaped loop in the SAME task plane, CW vs "
+            f"SAME_PLANE_RESHAPED: control overlap "
+            f"{reshaped_pair['control_overlap']:+.4f}, control norm ratio "
+            f"{reshaped_pair['control_norm_ratio']:.4f}. Reshaping does not help "
+            "either: for a small loop the holonomy is the curvature contracted "
+            "with the enclosed area, so the DIRECTION in control space is fixed "
+            "by the plane and only the magnitude tracks the area."
+        )
+    if second_pair:
+        finding += (
+            " (3) Second loop in a DIFFERENT task plane, CW vs ALT: control "
+            f"overlap {second_pair['control_overlap']:+.4f}, response overlap "
+            f"{second_pair['response_overlap']:+.4f}. This is the one comparison "
+            "that reaches a genuinely different point of the fiber, so the "
+            "first-order prediction is exercised at two unrelated landing points."
+        )
     return {
         "status": "REPORTED",
-        "control_sum_over_norm": control_sum,
-        "control_difference_over_norm": control_difference,
-        "response_sum_over_norm": response_sum,
+        "pairs": pairs,
         "finding": finding,
         "how_to_read_the_numbers": (
-            "CCW is the same task-space loop with reversed orientation, so its "
-            "holonomy is approximately the inverse of the CW holonomy and the "
-            "landing point sits at approximately -z_CW. The scale is set by the "
-            "ratios themselves: two landing points of comparable norm that were "
-            "unrelated would give control_sum_over_norm of order one, and two "
-            "exactly antipodal ones would give zero with "
-            "control_difference_over_norm exactly 2."
+            "control_overlap and response_overlap are cosines: +1 means the two "
+            "landing points lie on the same ray, -1 means antipodal, and a value "
+            "away from both means a genuinely different point of the fiber was "
+            "reached. The sum and difference ratios are meaningful only when the "
+            "two norms match, i.e. for the CW/CCW pair; for loops of different "
+            "plane or scale, read the cosines."
+        ),
+        "why_the_response_overlap_stays_high": (
+            "Near the reference, K is approximately linear in z and its "
+            "derivative is dominated by one direction, so dK inherits a large "
+            "overlap even when the landing points themselves are clearly "
+            "distinct. The collinearity gate is therefore applied to the control "
+            "overlap, which is what 'a different point of the fiber' means, and "
+            "the response overlap is reported."
         ),
         "why_it_matters": (
             "Every gate in this script reads norms, and ||dK|| and ||dE|| are "
-            "invariant under dK -> -dK. To the extent the antipodality is exact, "
-            "a sign-flipped landing point reproduces every gate value, which is "
-            "why the two directions agree to six digits in the fitted exponents. "
-            "The agreement is a consequence of the construction, not evidence "
-            "that the prediction was tested twice."
-        ),
-        "what_would_be_independent": (
-            "A loop of a different shape or scale in the task plane, or a "
-            "different base control, would land somewhere unrelated on the same "
-            "fiber and would constitute a second test. Reversing the orientation "
-            "of one loop does not."
+            "invariant under dK -> -dK. A sign-flipped landing point reproduces "
+            "every gate value. Neither reversing nor reshaping a loop in one "
+            "plane escapes this; changing the task plane does. The ALT loop "
+            "exists so that at least one comparison is not a consequence of the "
+            "construction."
         ),
         "caveat": (
-            "The two evaluations are correlated, not identical: the antipodality "
-            "is only exact to the percent level and K is not linear in z, so CCW "
-            "is still a distinct point of the fiber."
+            "Two non-collinear landing points are not statistically independent "
+            "samples of anything: they are two deterministic points of one "
+            "fiber, chosen by the analyst. The claim supported is that the "
+            "first-order prediction holds at more than one place on the fiber, "
+            "not that it was sampled at random."
         ),
     }
 
@@ -1105,7 +1280,7 @@ def save_latex_macros(path: Path, result: dict[str, Any]) -> None:
     agreement out of a rounding rule. Budgets are now per quantity, and a
     floor-limited quantity is emitted as an inequality rather than a value.
     """
-    convergence = result["justified_significant_figures_per_quantity"]
+    convergence = result["justified_significant_figures_per_quantity"]["CW"]
     quoted = result["quoted_values"]
     status_tex = result["status"].replace("_", r"\_")
     lines = [
@@ -1117,7 +1292,7 @@ def save_latex_macros(path: Path, result: dict[str, Any]) -> None:
         rf"\newcommand{{\MtwoEndpointRank}}{{{result['endpoint_geometry']['rank_half']}}}",
         rf"\newcommand{{\MtwoFiberDimension}}{{{result['endpoint_geometry']['fiber_dimension']}}}",
     ]
-    for direction in ("CW", "CCW"):
+    for direction in quoted:
         for dotted, macro, _kind in QUOTED_QUANTITIES:
             record = quoted[direction][dotted]
             text = record["quoted"]
@@ -1135,16 +1310,18 @@ def save_latex_macros(path: Path, result: dict[str, Any]) -> None:
                 lines.append(
                     rf"\newcommand{{\Mtwo{direction}{macro}Digits}}{{{digits}}}"
                 )
-    response_sum = result["diagnostics"]["D2_direction_independence"][
-        "response_sum_over_norm"
-    ]
-    delta_k_digits = convergence["path_response.normalized_delta_K_frobenius"][
-        "digits"
-    ]
-    lines.append(
-        rf"\newcommand{{\MtwoDirectionResponseSum}}"
-        rf"{{{format_quoted(response_sum, delta_k_digits or 2)}}}"
-    )
+    pairs = result["diagnostics"]["D2_landing_point_relations"]["pairs"]
+    for key, macro in (("CW_vs_CCW", "ReversedLoop"), ("CW_vs_ALT", "SecondLoop")):
+        if key not in pairs:
+            continue
+        lines.append(
+            rf"\newcommand{{\Mtwo{macro}ControlOverlap}}"
+            rf"{{{format_quoted(pairs[key]['control_overlap'], 4)}}}"
+        )
+        lines.append(
+            rf"\newcommand{{\Mtwo{macro}ResponseOverlap}}"
+            rf"{{{format_quoted(pairs[key]['response_overlap'], 4)}}}"
+        )
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -1163,7 +1340,7 @@ def pip_freeze() -> str:
 
 def audit(cfg: Cfg):
     model = Model(cfg)
-    zero_task = np.zeros(2)
+    zero_task = np.zeros(model.task_dimension)
     jacobians = {
         "h": jacobian_control(model, model.z0, zero_task, cfg.control_fd),
         "h_half": jacobian_control(model, model.z0, zero_task, cfg.control_fd / 2.0),
@@ -1174,64 +1351,144 @@ def audit(cfg: Cfg):
     rank = int(geometry["rank_half"])
     truncation = fd_truncation_audit(cfg, rank, jacobians)
 
-    runs = {
-        kind: transport_loop(cfg, model, rank, kind, cfg.transport_step)
-        for kind in ("CW", "CCW")
+    # Three landing points: the square loop in both orientations, plus a second
+    # loop of different shape and scale. v1.3 reported that CW and CCW are the
+    # same loop reversed and said what an independent test would look like;
+    # this is that test.
+    loops = {
+        "CW": ("CW", cfg.loop_epsilon, tuple(cfg.loop_plane), cfg.transport_step),
+        "CCW": ("CCW", cfg.loop_epsilon, tuple(cfg.loop_plane), cfg.transport_step),
+        "ALT": (
+            "CW",
+            cfg.alt_loop_epsilon,
+            tuple(cfg.alt_loop_plane),
+            cfg.alt_transport_step,
+        ),
     }
-    # A single step-halving audit checks that the transported physical control
-    # and the resulting path response are not transport-discretization artifacts.
-    fine_cw = transport_loop(cfg, model, rank, "CW", cfg.transport_step / 2.0)
+    runs = {
+        name: transport_loop(cfg, model, rank, kind, step, epsilon, plane)
+        for name, (kind, epsilon, plane, step) in loops.items()
+    }
+    # Negative control, not part of the four-step claim: a reshaped loop in the
+    # SAME plane as CW. Its landing point is expected to be collinear with CW's,
+    # which is the measured reason ALT had to change plane rather than shape.
+    same_plane_control = transport_loop(
+        cfg,
+        model,
+        rank,
+        "TRI",
+        cfg.transport_step,
+        cfg.same_plane_control_epsilon,
+        tuple(cfg.loop_plane),
+    )
+    # Each landing point gets its OWN step-halving audit. Inheriting CW's budget
+    # for ALT would be unjustified: ALT is a different loop with its own
+    # discretization error, and the near-antipodality that licenses sharing a
+    # budget between CW and CCW does not relate ALT to either.
+    fine_runs = {
+        name: transport_loop(cfg, model, rank, kind, step / 2.0, epsilon, plane)
+        for name, (kind, epsilon, plane, step) in loops.items()
+        if name != "CCW"
+    }
 
     base_response = model.ideal_response(model.z0)
     direction_results = []
     all_rows: list[dict[str, Any]] = []
-    for kind in ("CW", "CCW"):
-        direction, rows = analyze_direction(cfg, model, runs[kind], base_response)
-        direction_results.append(direction)
+    summaries = {}
+    for name in loops:
+        summary, rows = analyze_direction(cfg, model, runs[name], base_response)
+        summary["direction"] = name
+        for row in rows:
+            row["direction"] = name
+        summaries[name] = summary
+        direction_results.append(summary)
         all_rows.extend(rows)
 
-    coarse_response = model.ideal_response(runs["CW"]["z"])[2]
-    fine_response = model.ideal_response(fine_cw["z"])[2]
-    transport_control_convergence = relative_difference(runs["CW"]["z"], fine_cw["z"])
-    transport_response_convergence = relative_difference(
-        coarse_response - base_response[2], fine_response - base_response[2]
+    step_halving = {}
+    for name, fine in fine_runs.items():
+        coarse_response = model.ideal_response(runs[name]["z"])[2]
+        fine_response = model.ideal_response(fine["z"])[2]
+        control_drift = relative_difference(runs[name]["z"], fine["z"])
+        response_drift = relative_difference(
+            coarse_response - base_response[2], fine_response - base_response[2]
+        )
+        coarse_step = loops[name][3]
+        step_halving[name] = {
+            "coarse_step": coarse_step,
+            "fine_step": coarse_step / 2.0,
+            "loop_epsilon": runs[name]["loop_epsilon"],
+            "control_relative_difference": control_drift,
+            "path_response_relative_difference": response_drift,
+            "fine_transport_numerical_pass": fine["numerical_pass"],
+            "gate": bool(
+                fine["numerical_pass"]
+                and control_drift <= cfg.transport_convergence_tol
+                and response_drift <= cfg.transport_convergence_tol
+            ),
+        }
+    convergence_gate = bool(all(v["gate"] for v in step_halving.values()))
+    worst_drift = max(
+        max(v["control_relative_difference"], v["path_response_relative_difference"])
+        for v in step_halving.values()
     )
-    convergence_gate = bool(
-        fine_cw["numerical_pass"]
-        and transport_control_convergence <= cfg.transport_convergence_tol
-        and transport_response_convergence <= cfg.transport_convergence_tol
-    )
-    worst_drift = max(transport_control_convergence, transport_response_convergence)
 
-    # Per-quantity digit budgets. The fine-step landing point is analysed in
-    # full, so every quoted scalar is compared against its own fine-step value
-    # instead of inheriting one global number from the control vector.
-    fine_summary, _ = analyze_direction(cfg, model, fine_cw, base_response)
-    coarse_summary = next(
-        item for item in direction_results if item["direction"] == "CW"
-    )
-    convergence = quantity_convergence(coarse_summary, fine_summary)
+    # Per-quantity digit budgets, measured separately for each audited landing
+    # point. CCW inherits CW's budget, and that inheritance is stated: D2 shows
+    # the two are near-antipodal points of the same loop.
+    convergence = {}
+    for name, fine in fine_runs.items():
+        fine_summary, _ = analyze_direction(cfg, model, fine, base_response)
+        convergence[name] = quantity_convergence(
+            summaries[name],
+            fine_summary,
+            cfg.maximum_quoted_digits,
+            cfg.decade_margin_warning,
+        )
+    convergence["CCW"] = convergence["CW"]
+
     quoted = {}
-    for item in direction_results:
-        quoted[item["direction"]] = {
+    for name in loops:
+        budget = convergence[name]
+        quoted[name] = {
             dotted: {
-                "value": nested_get(item, dotted),
+                "value": nested_get(summaries[name], dotted),
                 "quoted": (
-                    convergence[dotted]["quoted"]
-                    if item["direction"] == "CW"
-                    else (
-                        convergence[dotted]["quoted"]
-                        if convergence[dotted]["regime"] == "FLOOR_LIMITED"
-                        else format_quoted(
-                            nested_get(item, dotted), convergence[dotted]["digits"]
-                        )
+                    budget[dotted]["quoted"]
+                    if budget[dotted]["regime"] == "FLOOR_LIMITED"
+                    else format_quoted(
+                        nested_get(summaries[name], dotted), budget[dotted]["digits"]
                     )
                 ),
-                "digits": convergence[dotted]["digits"],
-                "regime": convergence[dotted]["regime"],
+                "digits": budget[dotted]["digits"],
+                "regime": budget[dotted]["regime"],
+                "budget_measured_on": "CW" if name == "CCW" else name,
             }
             for dotted, _macro, _kind in QUOTED_QUANTITIES
         }
+
+    relations = landing_point_relations(
+        model, {**runs, "SAME_PLANE_RESHAPED": same_plane_control}, base_response, cfg
+    )
+    second_loop = relations["pairs"]["CW_vs_ALT"]
+    # Gated on the CONTROL overlap: the question is whether the second loop
+    # reached a different POINT of the fiber. The response overlap is reported
+    # rather than gated, because dK is approximately linear in z near z0 and is
+    # dominated by one direction, so it stays high even for clearly distinct
+    # landing points.
+    collinearity = abs(second_loop["control_overlap"])
+    second_loop_gate = {
+        "control_overlap": second_loop["control_overlap"],
+        "response_overlap": second_loop["response_overlap"],
+        "absolute_control_overlap": collinearity,
+        "threshold": cfg.landing_point_collinearity_max,
+        "pass": bool(
+            math.isfinite(collinearity)
+            and collinearity <= cfg.landing_point_collinearity_max
+        ),
+        "note": "Rules out the degenerate case in which the second loop lands on "
+        "the same ray as the first and re-tests nothing. Passing does NOT "
+        "establish statistical independence; see the caveat in D2.",
+    }
 
     geometry_public = {k: v for k, v in geometry.items() if k != "projector"}
     all_direction_gates = bool(all(r["supported"] for r in direction_results))
@@ -1240,6 +1497,7 @@ def audit(cfg: Cfg):
         and truncation["pass"]
         and all(run["numerical_pass"] for run in runs.values())
         and convergence_gate
+        and second_loop_gate["pass"]
     )
     supported = bool(numerical_pass and all_direction_gates)
     status = (
@@ -1280,22 +1538,30 @@ def audit(cfg: Cfg):
             "justified_significant_figures_per_quantity and quoted_values), and "
             "quantities at the double-precision floor are quoted as upper bounds "
             "rather than values. CW and CCW are near-antipodal landing points of "
-            "the same loop and are not independent confirmations; see "
-            "D2_direction_independence. It is not hardware evidence, does not "
+            "the same loop and are not independent confirmations of each other; "
+            "the ALT loop is a second, non-collinear landing point, so the "
+            "first-order prediction is exercised at two unrelated points of the "
+            "fiber, though all of them are deterministic points chosen by the "
+            "analyst rather than random samples; see D2_landing_point_relations. "
+            "It is not hardware evidence, does not "
             "select a unique natural metric, and does not prove that all quantum "
             "computation is geometric flow."
         ),
         "configuration": asdict(cfg),
         "endpoint_geometry": geometry_public,
         "fd_truncation_audit": truncation,
-        "transport_step_halving": {
-            "coarse_step": cfg.transport_step,
-            "fine_step": cfg.transport_step / 2.0,
-            "control_relative_difference": transport_control_convergence,
-            "path_response_relative_difference": transport_response_convergence,
-            "fine_transport_numerical_pass": fine_cw["numerical_pass"],
-            "gate": convergence_gate,
+        "loops": {
+            name: {
+                "kind": kind,
+                "epsilon": epsilon,
+                "plane": [int(plane[0]), int(plane[1])],
+                "transport_step": step,
+            }
+            for name, (kind, epsilon, plane, step) in loops.items()
         },
+        "task_generators": ["X", "Y", "N"],
+        "transport_step_halving": step_halving,
+        "second_loop_not_collinear": second_loop_gate,
         "justified_significant_figures_per_quantity": convergence,
         "quoted_values": quoted,
         "worst_landing_point_relative_drift": worst_drift,
@@ -1308,19 +1574,18 @@ def audit(cfg: Cfg):
             "of the same construction."
         ),
         "diagnostics": {
-            "D2_direction_independence": direction_independence(
-                model, runs, base_response
-            ),
+            "D2_landing_point_relations": relations,
         },
         "directions": direction_results,
         "global_gates": {
             "endpoint_geometry_stable": geometry["stable"],
             "fd_discarded_values_are_truncation": truncation["pass"],
-            "both_transports_numerically_valid": all(
+            "all_transports_numerically_valid": all(
                 run["numerical_pass"] for run in runs.values()
             ),
-            "transport_step_halving_converged": convergence_gate,
-            "both_directions_close_all_four_steps": all_direction_gates,
+            "all_step_halving_audits_converged": convergence_gate,
+            "second_loop_not_collinear_with_first": second_loop_gate["pass"],
+            "all_landing_points_close_all_four_steps": all_direction_gates,
         },
     }
     return result, all_rows, runs
@@ -1427,7 +1692,9 @@ def main() -> None:
                     "pass",
                 )
             },
+            "loops": result["loops"],
             "transport_step_halving": result["transport_step_halving"],
+            "second_loop_not_collinear": result["second_loop_not_collinear"],
             "diagnostics": result["diagnostics"],
             "quoted_values": {
                 direction: {
