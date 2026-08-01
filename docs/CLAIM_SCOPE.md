@@ -11,8 +11,9 @@ evaluation supports:
 1. affine schedule response optimization at every tested seed and distance;
 2. positive decoded-logical-failure reduction in 15 of 15 fixed-distance
    cases;
-3. a reduction of the minimum tested Wilson-resolved distance from 11 to 9 at
-   \(p_L^{\mathrm{target}}=0.025\) on 3 of 3 new prospective seeds;
+3. a reduction of the minimum tested distance satisfying the frozen Wilson
+   criterion from 11 to 9 at \(p_L^{\mathrm{target}}=0.025\) on 3 of 3 new
+   prospective seeds;
 4. a corresponding 45.34% reduction in the active-coordinate qubit-round
    proxy.
 
@@ -50,17 +51,26 @@ The schedule changes only the synthetic single-data and adjacent-pair fault
 probabilities attached to that layer. It does not generate distinct physical
 unitary evolutions.
 
+The repository therefore supports geometric optimization and a decoded resource
+crossover in a synthetic schedule-to-fault model. It does not support the
+stronger statement that multiple physical control schedules implement the same
+complete unitary gate.
+
 This experiment is not an independent prediction validation: the optimization
 objective is built from the same synthetic schedule-to-fault probability model
 that is later injected into Stim. The Monte Carlo stage independently validates
 whether those probabilities, after syndrome extraction and decoding, cross the
 declared distance boundary.
 
+Decoded Monte Carlo outcomes are held out, but the analytic fault map optimized
+by the flow is also the map injected into Stim; this is not an out-of-model
+validation.
+
 ## Correct concise wording
 
 > In a frozen synthetic rotated-surface-code audit, response-fibre schedule
-> optimization prospectively reduced the minimum tested Wilson-resolved
-> distance from 11 to 9 at a target logical failure probability of 0.025 on all
-> three new seeds, corresponding to a 45.34% active-coordinate qubit-round
-> proxy reduction. No threshold, exponent, compiler, hardware, or physical
-> resource claim is made.
+> optimization prospectively reduced the minimum tested distance satisfying the
+> frozen Wilson criterion from 11 to 9 at a target logical failure probability
+> of 0.025 on all three new seeds, corresponding to a 45.34% active-coordinate
+> qubit-round proxy saving. No threshold, exponent, compiler, hardware, or
+> physical resource claim is made.

@@ -1,10 +1,11 @@
 {
   "all_gates_pass": true,
   "cases_declared": 15,
-  "certificate_sha256_before_self_field": "e4658480b6a4cb71caadfb6532453c4a31ba11f732dfaf36ffd66cc10921138c",
+  "certificate_sha256_before_self_field": "2db9620419ac5a7ff64510c65e0d391c4603b6c361fdd8aadd2d9f96165cbc79",
   "claim_boundary": "affine schedule response changes synthetic fault probabilities attached to a Stim-inserted ideal identity layer; it does not generate different physical unitary evolutions or establish real hardware resource reduction",
   "crossover_seeds_passing": 3,
   "crossover_successful_seed_fraction": 1.0,
+  "design_evaluation_boundary": "Decoded Monte Carlo outcomes are held out, but the analytic fault map optimized by the flow is also the map injected into Stim; this is not an out-of-model validation.",
   "distance_scaling_exponent_change_claimed": false,
   "distances": [
     3,
@@ -23,19 +24,20 @@
   "hardware_advantage_claimed": false,
   "minimum_optimised_distance": 9,
   "minimum_reference_distance": 11,
-  "minimum_relative_decoded_failure_reduction": 0.17952900751436057,
+  "minimum_relative_decoded_failure_reduction": 0.1786430350741669,
   "minimum_resolved_active_coordinate_qubit_round_proxy_reduction": 0.45341380611090154,
-  "minimum_z_score": 23.651326422117876,
+  "minimum_z_score": 24.858621249936743,
   "new_prospective_cohort_used": true,
   "protocol_sha256": "fec91e30001712f3d9ac84c0e45a6b70f2d5ae7189d3c9ac6d1096d47505cbf6",
+  "report_json_gz_sha256": "f9edf8692aaa0f116cc6584507e7f326d184831f251669aa6e2dd2dd143bb95a",
   "round_policy": "equal_distance",
   "scaling_beta_flow_minus_reference": {
-    "20290107": -9e-05,
-    "20290119": -0.004051,
-    "20290203": 0.004717
+    "20290107": 0.002734405674804541,
+    "20290119": -0.0019197693395532345,
+    "20290203": 0.006300831962920639
   },
   "scientific_status": "PROSPECTIVE_SYNTHETIC_FAULT_MODEL_DISTANCE_CROSSOVER_SUPPORTED",
-  "scope": "Compact transcription of the displayed v0.6.0 final result with v0.6.1 claim-boundary repair. The full protocol is archived as protocol.json; the full Monte Carlo report must be regenerated for raw counts and Wilson tables. Not a threshold theorem, interval certificate, compiler result, hardware validation, or physical resource claim.",
+  "scope": "Compact transcription of the archived v0.6.0 full report with v0.6.1 claim-boundary repair. The full protocol is archived as protocol.json and the full Monte Carlo report as report.json.gz. Not a threshold theorem, interval certificate, compiler result, hardware validation, or physical resource claim.",
   "secondary_fixed_distance_cases_passing": 15,
   "seeds": [
     20290107,

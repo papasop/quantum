@@ -17,4 +17,6 @@ jobs:
       - name: Verify hashes and Python syntax
         run: python tools/verify_release.py
       - name: Quick Stim/PyMatching smoke test
+        env:
+          MPLCONFIGDIR: /tmp/matplotlib
         run: python src/ft_unit_change_time_rotated_surface_code_v0_6_0.py --quick --output /tmp/quantum-smoke

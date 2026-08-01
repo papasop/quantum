@@ -1,10 +1,10 @@
 # Response-Fibre Fault Tolerance
 
-Numerical audits of an affine schedule response mechanism for synthetic
-fault-tolerance experiments. The current result tests whether a constrained
-schedule optimization changes a frozen synthetic schedule-to-fault map enough
-to cross a discrete rotated-surface-code distance boundary under Stim sampling
-and PyMatching decoding.
+Numerical audits of whether a constrained flow can preserve a declared affine
+schedule response in a synthetic fault-tolerance experiment. The current result
+tests whether schedule optimization changes a frozen synthetic
+schedule-to-fault map enough to cross a discrete rotated-surface-code distance
+boundary under Stim sampling and PyMatching decoding.
 
 The ideal logical identity layer is inserted constructively by Stim. The
 schedule does not generate a different physical unitary evolution; in this
@@ -14,8 +14,8 @@ inserted layer.
 ## Prospective v0.6.0 result, documented by v0.6.1
 
 On a frozen rotated-surface-code experiment using Stim and PyMatching, the
-affine schedule response lowered the minimum tested Wilson-resolved distance
-at the declared logical-failure target:
+affine schedule response lowered the minimum tested distance satisfying the
+frozen Wilson criterion at the declared logical-failure target:
 
 \[
 d_{\mathrm{reference}}=11 \longrightarrow d_{\mathrm{flow}}=9,
@@ -46,10 +46,16 @@ Protocol SHA-256:
 fec91e30001712f3d9ac84c0e45a6b70f2d5ae7189d3c9ac6d1096d47505cbf6
 ```
 
-Reference report certificate SHA-256 (before its self field):
+Archived report certificate SHA-256 (before its self field):
 
 ```text
-e4658480b6a4cb71caadfb6532453c4a31ba11f732dfaf36ffd66cc10921138c
+2db9620419ac5a7ff64510c65e0d391c4603b6c361fdd8aadd2d9f96165cbc79
+```
+
+Archived `report.json.gz` SHA-256:
+
+```text
+f9edf8692aaa0f116cc6584507e7f326d184831f251669aa6e2dd2dd143bb95a
 ```
 
 ## Claim boundary
@@ -86,11 +92,10 @@ roughly 20 minutes, depending on CPU and memory performance. It writes
 `protocol.json` and `report.json` under
 `ft_unit_change_time_v0_6_0_results/`.
 
-The repository includes the frozen `results/v0.6.0/protocol.json`, whose hash
-matches the displayed protocol SHA-256. The full Monte Carlo `report.json.gz`
-is not reconstructed from the compact release summary; `claim_certificate.json`
-records the auditable v0.6.1 boundary and explicitly marks raw per-case counts
-as requiring regeneration from the frozen script.
+The repository includes the frozen `results/v0.6.0/protocol.json` and the full
+compressed Monte Carlo `results/v0.6.0/report.json.gz`. The report contains the
+raw per-case failure counts, Wilson upper bounds, and crossover decisions used
+by `claim_certificate.json`.
 
 A lightweight pipeline check is available:
 
@@ -150,6 +155,15 @@ This repository tests that idea as a fault-tolerance application. The theory
 and certified local-flow work remain in
 [papasop/Geometric-Flow](https://github.com/papasop/Geometric-Flow).
 
+In this repository, the tested fibre is not a family of physical control
+schedules verified to implement the same complete unitary gate. It is a fixed
+Stim identity layer with schedule-dependent `X_ERROR` and `E(XX)` probabilities
+in a synthetic schedule-to-fault model.
+
+Decoded Monte Carlo outcomes are held out, but the analytic fault map optimized
+by the flow is also the map injected into Stim; this is not an out-of-model
+validation.
+
 ## Citation
 
 Citation metadata is provided in [`CITATION.cff`](CITATION.cff). Until the
@@ -158,5 +172,4 @@ version and commit or release tag.
 
 ## License
 
-No open-source license is asserted in this release. Copyright remains with the
-author unless a license file is added explicitly.
+This repository is released under the MIT License. See [LICENSE](LICENSE).

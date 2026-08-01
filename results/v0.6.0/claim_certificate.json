@@ -7,11 +7,12 @@
     "optimization_evaluation_coupling": "optimization objective is derived from the same synthetic schedule-to-fault probability model later injected into Stim",
     "schedule_semantics": "schedule changes only synthetic fault probabilities; it does not generate distinct physical unitary evolutions"
   },
-  "claim_certificate_sha256_before_self_field": "9c5cead41fee0f9f6271437ac1d37bbf95eb6b14b91de9170d5346a7ac10498f",
-  "created_from": "results/v0.6.0/reference_summary.json and reconstructed frozen protocol.json",
+  "claim_certificate_sha256_before_self_field": "6754415ceb7bb662982c052d2045c7fafced8a7568bf86db7f94a86338a0f00f",
+  "created_from": "results/v0.6.0/protocol.json and results/v0.6.0/report.json.gz",
   "decision_rule": {
     "minimum_successful_seed_fraction": 0.6666666666666666,
     "minimum_tested_distance_reduction": 2,
+    "minimum_tested_distance_statement": "minimum tested distance satisfying the frozen Wilson criterion",
     "target_logical_failure_probability": 0.025,
     "wilson_bound": "one-sided 95% Wilson upper bound must not exceed target"
   },
@@ -38,7 +39,8 @@
   },
   "protocol_sha256": "fec91e30001712f3d9ac84c0e45a6b70f2d5ae7189d3c9ac6d1096d47505cbf6",
   "raw_monte_carlo_counts": {
-    "required_report_fields": [
+    "cases": 15,
+    "fields": [
       "cases[].initial.failure_count",
       "cases[].initial.shots",
       "cases[].optimised.failure_count",
@@ -46,16 +48,18 @@
       "seed_crossovers[].distance_table[].initial_wilson_upper_95_one_sided",
       "seed_crossovers[].distance_table[].optimised_wilson_upper_95_one_sided"
     ],
-    "status": "not archived in the v0.6.0 GitHub zip; regenerate results/v0.6.0/report.json.gz by running the frozen script with pinned dependencies"
+    "seed_crossovers": 3,
+    "status": "archived in results/v0.6.0/report.json.gz"
   },
-  "reference_report_certificate_sha256_before_self_field": "e4658480b6a4cb71caadfb6532453c4a31ba11f732dfaf36ffd66cc10921138c",
+  "reference_report_certificate_sha256_before_self_field": "2db9620419ac5a7ff64510c65e0d391c4603b6c361fdd8aadd2d9f96165cbc79",
+  "report_json_gz_sha256": "f9edf8692aaa0f116cc6584507e7f326d184831f251669aa6e2dd2dd143bb95a",
   "reported_outcome": {
     "active_coordinate_qubit_round_proxy": {
       "optimised_active_coordinates": 161,
       "optimised_rounds": 9,
       "reference_active_coordinates": 241,
       "reference_rounds": 11,
-      "relative_reduction": 0.45341380611090154
+      "relative_saving": 0.45341380611090154
     },
     "all_gates_pass": true,
     "crossover_seeds_declared": 3,
@@ -64,8 +68,8 @@
     "fixed_distance_cases_passing": 15,
     "minimum_optimised_distance": 9,
     "minimum_reference_distance": 11,
-    "minimum_relative_decoded_failure_reduction": 0.17952900751436057,
-    "minimum_z_score": 23.651326422117876
+    "minimum_relative_decoded_failure_reduction": 0.1786430350741669,
+    "minimum_z_score": 24.858621249936743
   },
   "repository_code": "https://github.com/papasop/quantum",
   "source_result_version": "0.6.0",
