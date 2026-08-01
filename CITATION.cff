@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the repository release and the companion manuscript when available."
+title: "Response-Fibre Fault Tolerance"
+type: software
+authors:
+  - family-names: "Li"
+    given-names: "Y.Y.N."
+repository-code: "https://github.com/papasop/response-fibre-fault-tolerance"
+version: "0.6.0"
+date-released: "2026-08-01"
+keywords:
+  - quantum error correction
+  - response fibre
+  - geometric flow
+  - rotated surface code
+  - Stim
+  - PyMatching
