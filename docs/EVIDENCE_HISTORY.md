@@ -15,6 +15,12 @@ The version sequence is cumulative but not uniformly claim-bearing.
   0.025 for the next cohort.
 - **v0.6.0:** new prospective seeds; distance 11 to 9 crossover supported on
   all three seeds.
+- **v0.6.1:** complete compressed report and a hash-bound claim certificate
+  repaired the public evidence and claim boundary without changing the frozen
+  protocol.
+- **v0.6.2:** the complete eight-page manuscript, plotted data, independent
+  Wilson checker, README, and file manifest were synchronized to the archived
+  v0.6.1 evidence.
 
 This history is retained to distinguish algorithm repair, development
 calibration, and prospective evaluation.

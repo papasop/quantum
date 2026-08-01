@@ -34,6 +34,8 @@ def main() -> None:
             failures.append(f"hash mismatch: {relative}")
 
     sources = sorted((ROOT / "src").glob("*.py"))
+    sources += sorted((ROOT / "tools").glob("*.py"))
+    sources += sorted((ROOT / "paper" / "v0.6.2").glob("*.py"))
     for source in sources:
         try:
             py_compile.compile(str(source), doraise=True)
@@ -42,7 +44,7 @@ def main() -> None:
 
     if failures:
         raise SystemExit("VERIFY FAILED\n" + "\n".join(failures))
-    print(f"VERIFY PASS: {len(sources)} Python audits compiled and all manifest hashes match.")
+    print(f"VERIFY PASS: {len(sources)} Python files compiled and all manifest hashes match.")
 
 
 if __name__ == "__main__":

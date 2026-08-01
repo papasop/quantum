@@ -1,6 +1,6 @@
 # Claim scope
 
-## Supported v0.6.0 statement, repaired in v0.6.1
+## Supported v0.6.0 statement, documented in v0.6.1 and v0.6.2
 
 For the declared rotated-surface-code logical Z-memory task, frozen synthetic
 schedule-to-fault map, Stim circuit construction, independently sampled

@@ -1,14 +1,22 @@
-# Companion Manuscript
+# Companion manuscript
 
-Working title:
+The current complete manuscript package is in [`v0.6.2/`](v0.6.2/):
 
-> Affine Schedule Response in a Synthetic Rotated-Surface-Code Fault Model
+- `response_fibre_fault_tolerance_v0_6_2.tex` - LaTeX source;
+- `response_fibre_fault_tolerance_v0_6_2.pdf` - compiled eight-page paper;
+- `figure_data_seed_*.csv` - Figure 1 data derived from archived failure counts;
+- `verify_wilson.py` - independent Wilson-bound and crossover checker;
+- `README.md` - paper-package evidence summary.
 
-The manuscript source is `response_fibre_fault_tolerance_v0_6_2.tex`, with
-`response_fibre_fault_tolerance_v0_6_2.pdf` compiled directly from that source.
-All numerical claims are derived from `results/v0.6.0/report.json.gz`.
+The manuscript treats v0.6.0 as the primary prospective experiment,
+v0.5.0 as a fail-closed negative result, v0.5.1/v0.5.2 as repair and
+development stages, and v0.6.1/v0.6.2 as evidence-boundary and publication
+synchronization releases.
 
-The PDF artifact is generated from the same v0.6.2 claim boundary: a synthetic
-schedule-to-fault model mechanism result, not a same-complete-unitary physical
-control result. It should not be cited as a threshold, exponent, compiler,
-hardware, or physical resource claim.
+The historical v0.6.1 source and PDF remain for provenance. They are not the
+current submission artifacts.
+
+The supported interpretation is a synthetic schedule-to-fault model mechanism
+result. It is not a same-complete-unitary physical-control result and must not
+be cited as a threshold, exponent, compiler, hardware, or physical-resource
+claim.

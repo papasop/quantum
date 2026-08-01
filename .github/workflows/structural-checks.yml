@@ -23,7 +23,7 @@ jobs:
           tar -xzf /tmp/tectonic.tar.gz -C /tmp/tectonic
       - name: Verify hashes and Python syntax
         run: python tools/verify_release.py
-      - name: Verify scientific consistency
+      - name: Verify scientific cross-file consistency
         env:
           TECTONIC_BIN: /tmp/tectonic/tectonic
         run: python tools/verify_scientific_consistency.py
