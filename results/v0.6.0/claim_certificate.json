@@ -1,14 +1,15 @@
 {
-  "certificate_version": "0.6.1",
+  "certificate_version": "0.6.2",
   "claim_boundary": {
     "accurate_positioning": "prospective fail-closed synthetic fault-model mechanism experiment",
     "ideal_layer": "Stim constructively inserts an ideal logical identity layer",
+    "manuscript_sync": "README, LaTeX source, compiled PDF, Wilson CSV, and claim certificate are synchronized to the archived full report in v0.6.2",
     "monte_carlo_role": "independently validates whether those probabilities produce the declared distance crossover after syndrome extraction and decoding",
     "optimization_evaluation_coupling": "optimization objective is derived from the same synthetic schedule-to-fault probability model later injected into Stim",
     "schedule_semantics": "schedule changes only synthetic fault probabilities; it does not generate distinct physical unitary evolutions"
   },
-  "claim_certificate_sha256_before_self_field": "6754415ceb7bb662982c052d2045c7fafced8a7568bf86db7f94a86338a0f00f",
-  "created_from": "results/v0.6.0/protocol.json and results/v0.6.0/report.json.gz",
+  "claim_certificate_sha256_before_self_field": "e01064c5772eff865653ad66f9a9cf466c4222cb08df95ee30f2926c3cf42ae9",
+  "created_from": "results/v0.6.0/protocol.json, results/v0.6.0/report.json.gz, and v0.6.2 synchronized manuscript artifacts",
   "decision_rule": {
     "minimum_successful_seed_fraction": 0.6666666666666666,
     "minimum_tested_distance_reduction": 2,
@@ -73,7 +74,7 @@
   },
   "repository_code": "https://github.com/papasop/quantum",
   "source_result_version": "0.6.0",
-  "title": "Response-fibre fault-tolerance v0.6.1 claim certificate",
+  "title": "Response-fibre fault-tolerance v0.6.2 claim certificate",
   "unsupported_claims": [
     "fault-tolerance threshold improvement",
     "asymptotic logical-error exponent improvement",

@@ -11,11 +11,12 @@ schedule does not generate a different physical unitary evolution; in this
 repository it changes only the synthetic fault probabilities attached to that
 inserted layer.
 
-## Prospective v0.6.0 result, documented by v0.6.1
+## Prospective v0.6.0 result, documented by v0.6.2
 
 On a frozen rotated-surface-code experiment using Stim and PyMatching, the
-affine schedule response lowered the minimum tested distance satisfying the
-frozen Wilson criterion at the declared logical-failure target:
+affine-response-constrained schedule optimization lowered the minimum tested
+distance satisfying the frozen Wilson criterion at the declared
+logical-failure target:
 
 \[
 d_{\mathrm{reference}}=11 \longrightarrow d_{\mathrm{flow}}=9,
@@ -35,8 +36,8 @@ was
 |---|---:|
 | Prospective seeds passing | 3 / 3 |
 | Fixed-distance cases passing | 15 / 15 |
-| Minimum decoded-failure reduction | 17.95% |
-| Minimum two-sample z score | 23.65 |
+| Minimum decoded-failure reduction | 17.86% |
+| Minimum two-sample z score | 24.86 |
 | Distance crossover | 11 to 9 |
 | Active-coordinate qubit-round proxy reduction | 45.34% |
 
@@ -125,6 +126,7 @@ python tools/verify_release.py
 | v0.5.2 | Lower-noise, rounds-equal-distance development calibration | Development-only target interval identified |
 | v0.6.0 | Frozen prospective rotated-surface-code audit | Distance 11 to 9 and 45.34% proxy reduction supported |
 | v0.6.1 | Documentation and evidence-boundary repair | Repository URL, exact dependencies, protocol artifact, and claim scope corrected |
+| v0.6.2 | Report-synchronized manuscript and consistency checks | Full report, README, paper source, PDF, and hashes synchronized |
 
 The v0.5.0 negative result is retained intentionally. The v0.5.1 projection
 repair is part of the methodological record and was completed before the
@@ -134,7 +136,7 @@ v0.6.0 prospective seeds were evaluated.
 
 ```text
 src/                 versioned standalone audits
-results/v0.6.0/      frozen protocol, compact summary, and claim certificate
+results/v0.6.0/      frozen protocol, full report, summary, and certificates
 docs/                claim boundary and evidence history
 tools/               integrity and syntax verification
 paper/               manuscript source and PDF build notes

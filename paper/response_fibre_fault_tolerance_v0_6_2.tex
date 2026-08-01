@@ -1,0 +1,305 @@
+\documentclass[11pt]{article}
+\usepackage[margin=0.9in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\hypersetup{colorlinks=true,linkcolor=black,urlcolor=blue}
+\setlength{\parskip}{0.45em}
+\setlength{\parindent}{0pt}
+\sloppy
+
+\title{Affine Schedule Response in a Synthetic Rotated-Surface-Code Fault Model}
+\author{Y.Y.N. Li}
+\date{v0.6.2, 2026-08-02}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We report a prospective, fail-closed mechanism experiment for affine-response-constrained schedule optimization in a synthetic rotated-surface-code fault model. A fixed Stim-generated logical identity memory layer is augmented with schedule-dependent \texttt{X\_ERROR} and \texttt{E(XX)} probabilities, and PyMatching decodes independently sampled detector outcomes. The archived v0.6.0 full report supports a crossover from reference distance 11 to optimized distance 9 at target logical failure probability $p_L=0.025$ on all three prospective seeds, corresponding to a 45.34138061\% active-coordinate qubit-round proxy saving. The minimum decoded-failure reduction across the 15 fixed-distance cases is 17.86\%, and the minimum two-sample z score is 24.86. This is not a threshold claim, exponent claim, calibrated hardware result, compiler result, same-complete-unitary control claim, or physical resource claim.
+\end{abstract}
+
+\section{Scope and Claim}
+The repository supports geometric optimization and decoded resource crossover in a synthetic schedule-to-fault model. It does not support the stronger statement that multiple physical control schedules implement the same complete unitary gate. The ideal logical identity layer is inserted constructively by Stim; the schedule changes only synthetic single-data and adjacent-pair fault probabilities attached to that layer.
+
+The v0.6.0 cohort was specified and frozen before prospective evaluation. The decision endpoint is the minimum tested distance satisfying the frozen one-sided 95\% Wilson criterion at $p_L=0.025$. The supported result is:
+\[
+  d_{\rm reference}=11 \quad\longrightarrow\quad d_{\rm optimized}=9,
+\]
+with all three prospective seeds passing the crossover gate and with active-coordinate qubit-round proxy saving
+\[
+  1 - \frac{161\times 9}{241\times 11} = 45.34138061\%.
+\]
+
+\section{Model}
+The base circuit is Stim \texttt{surface\_code:rotated\_memory\_z} with rounds equal to distance. For each distance and seed, the code extracts active data coordinates and nearest-neighbor data-coordinate edges. A schedule $u$ is constrained by an affine mean-one condition on every data coordinate and by a fixed amplitude box. The analytic design score is the sum of schedule-induced single-coordinate and adjacent-pair synthetic fault probabilities, with the pair term weighted by 2.5.
+
+For every undirected adjacent data edge $(i,j)$, the pair exposure contributes symmetrically to both endpoints of the projected gradient. In implementation terms, the gradient update adds the coefficient times $u_j$ to endpoint $i$ and the same coefficient times $u_i$ to endpoint $j$; no directed-edge duplicate is interpreted as a separate physical interaction.
+
+\section{Design-Evaluation Boundary}
+Decoded Monte Carlo outcomes are held out: the random detector samples used to evaluate the initial and optimized arms are independently seeded. However, the analytic fault map optimized by the flow is also the map injected into Stim. This is therefore not an out-of-model validation. The experiment tests whether optimizing that frozen synthetic map crosses a decoded distance boundary after syndrome extraction and matched decoding.
+
+\section{Frozen Protocol and Reproducibility}
+The code repository is \url{https://github.com/papasop/quantum}. The frozen protocol is archived as \path{results/v0.6.0/protocol.json} and the full compressed Monte Carlo report as \path{results/v0.6.0/report.json.gz}. The Wilson/crossover plotting table derived from the report is \path{results/v0.6.0/wilson_distance_table.csv}.
+
+\textbf{Protocol canonical hash}
+\begin{verbatim}
+fec91e30001712f3d9ac84c0e45a6b70f2d5ae7189d3c9ac6d1096d47505cbf6
+\end{verbatim}
+\textbf{Report certificate before self field}
+\begin{verbatim}
+2db9620419ac5a7ff64510c65e0d391c4603b6c361fdd8aadd2d9f96165cbc79
+\end{verbatim}
+\textbf{Compressed report SHA-256}
+\begin{verbatim}
+f9edf8692aaa0f116cc6584507e7f326d184831f251669aa6e2dd2dd143bb95a
+\end{verbatim}
+
+The pinned software versions used for the archived report were Python 3.12.13, NumPy 2.0.2, Stim 1.16.0, and PyMatching 2.4.0.
+
+\section{Fixed-Distance Results}
+\begin{center}
+\scriptsize
+\begin{tabular}{rrrrrrrr}
+\toprule
+Seed & $d$ & Ref fails & Opt fails & Ref $p_L$ & Opt $p_L$ & Reduction (\%) & z \\
+\midrule
+20290107 & 3 & 126079 & 100295 & 0.126079 & 0.100295 & 20.45 & 57.59 \\
+20290107 & 5 & 47639 & 37114 & 0.047639 & 0.037114 & 22.09 & 36.96 \\
+20290107 & 7 & 36602 & 28917 & 0.036602 & 0.028917 & 21.00 & 30.53 \\
+20290107 & 9 & 29031 & 22491 & 0.029031 & 0.022491 & 22.53 & 29.20 \\
+20290107 & 11 & 23001 & 17547 & 0.023001 & 0.017547 & 23.71 & 27.37 \\
+20290119 & 3 & 122832 & 95069 & 0.122832 & 0.095069 & 22.60 & 63.07 \\
+20290119 & 5 & 44958 & 35577 & 0.044958 & 0.035577 & 20.87 & 33.75 \\
+20290119 & 7 & 36321 & 28268 & 0.036321 & 0.028268 & 22.17 & 32.22 \\
+20290119 & 9 & 28079 & 22174 & 0.028079 & 0.022174 & 21.03 & 26.68 \\
+20290119 & 11 & 21925 & 16990 & 0.021925 & 0.016990 & 22.51 & 25.27 \\
+20290203 & 3 & 115213 & 94631 & 0.115213 & 0.094631 & 17.86 & 47.52 \\
+20290203 & 5 & 44062 & 35746 & 0.044062 & 0.035746 & 18.87 & 30.05 \\
+20290203 & 7 & 38218 & 29872 & 0.038218 & 0.029872 & 21.84 & 32.55 \\
+20290203 & 9 & 29317 & 22717 & 0.029317 & 0.022717 & 22.51 & 29.32 \\
+20290203 & 11 & 22145 & 17260 & 0.022145 & 0.017260 & 22.06 & 24.86 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The minimum fixed-distance decoded-failure reduction is 17.86\%, attained at seed 20290203 and distance 3. The minimum z score is 24.86, attained at seed 20290203 and distance 11. All 15 fixed-distance cases pass the secondary diagnostic gates in the archived report.
+
+\section{Wilson Crossover Results}
+\begin{center}
+\scriptsize
+\begin{tabular}{rrrrrr}
+\toprule
+Seed & $d$ & Ref Wilson upper & Ref closes & Opt Wilson upper & Opt closes \\
+\midrule
+20290107 & 3 & 0.126626 & false & 0.100790 & false \\
+20290107 & 5 & 0.047991 & false & 0.037426 & false \\
+20290107 & 7 & 0.036912 & false & 0.029194 & false \\
+20290107 & 9 & 0.029308 & false & 0.022736 & true \\
+20290107 & 11 & 0.023249 & true & 0.017764 & true \\
+20290119 & 3 & 0.123373 & false & 0.095553 & false \\
+20290119 & 5 & 0.045300 & false & 0.035883 & false \\
+20290119 & 7 & 0.036630 & false & 0.028542 & false \\
+20290119 & 9 & 0.028352 & false & 0.022417 & true \\
+20290119 & 11 & 0.022167 & true & 0.017204 & true \\
+20290203 & 3 & 0.115739 & false & 0.095114 & false \\
+20290203 & 5 & 0.044401 & false & 0.036053 & false \\
+20290203 & 7 & 0.038535 & false & 0.030153 & false \\
+20290203 & 9 & 0.029596 & false & 0.022963 & true \\
+20290203 & 11 & 0.022388 & true & 0.017476 & true \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For each prospective seed, the reference arm first satisfies the frozen Wilson criterion at distance 11, while the optimized arm first satisfies it at distance 9. Thus the crossover gate passes for 3 of 3 seeds.
+
+\section{Scaling Diagnostic}
+The distance-scaling diagnostic is retained as a boundary check, not as a claim. The fitted exponent differences vary by seed, so v0.6.2 does not claim a changed asymptotic suppression exponent.
+
+\begin{center}
+\begin{tabular}{rrrr}
+\toprule
+Seed & Reference beta & Optimized beta & Delta beta \\
+\midrule
+20290107 & 0.362121 & 0.364856 & 0.002734 \\
+20290119 & 0.362834 & 0.360915 & -0.001920 \\
+20290203 & 0.351525 & 0.357826 & 0.006301 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+
+\section{Audit Gates}
+The archived report separates architecture gates, fixed-distance diagnostics,
+and crossover gates. Architecture gates check that the affine schedule starts
+inside the amplitude box, remains inside the amplitude box during accepted
+steps, preserves the mean-one affine constraint, changes the design score, and
+keeps the two Stim circuits structurally matched. The noiseless endpoint check
+verifies that the inserted identity-layer construction leaves all noiseless
+detectors and observables unflipped. These checks do not prove equality of
+physical control unitaries; they only verify the declared synthetic circuit
+construction.
+
+The fixed-distance diagnostics require positive decoded-failure reduction and a
+z score above the frozen threshold at every tested seed and distance. The
+primary crossover gate then uses the Wilson table to find the first tested
+distance closing the target in each arm. The result passes only because the
+reference arm closes first at distance 11 and the optimized arm closes first at
+distance 9 for each of the three prospective seeds.
+
+\section{Evidence Provenance}
+The full report contains the raw failure counts, shot counts, Wilson upper
+bounds, case-level schedules, schedule-induced single-coordinate fault
+probabilities, schedule-induced adjacent-pair fault probabilities, decoder
+metadata, and all pass/fail gates. The README summary, claim certificate,
+Wilson CSV, and this manuscript are derived from that compressed report rather
+than from manually transcribed values. This v0.6.2 revision exists to remove
+stale summary numbers and to make the report, paper, and PDF mutually
+checkable.
+
+The previously displayed compact certificate value from an earlier release
+package is not used as the authoritative report certificate here. The archived
+full report certificate is the value printed above, and the compressed report
+hash identifies the exact file committed to the repository.
+
+\section{Unsupported Interpretations}
+This artifact should not be cited as evidence for a fault-tolerance threshold improvement, an asymptotic scaling-exponent improvement, a compiler-derived pulse-to-fault relation, calibrated hardware noise agreement, a QPU or hardware resource advantage, or physical control flow lowering real surface-code hardware resources. It is a prospective, fail-closed synthetic fault-model mechanism experiment.
+
+\clearpage
+\appendix
+\section{Recomputation Checklist}
+A reader can recompute the summary by installing the pinned requirements,
+checking the protocol canonical hash, decompressing the archived report, and
+recomputing the report certificate after removing its self field. The scientific
+consistency script in \path{tools/verify_scientific_consistency.py} performs
+these checks and also validates that the README and manuscript contain the
+current report-derived summary numbers.
+
+\section{Plot Data Schema}
+The file \path{results/v0.6.0/wilson_distance_table.csv} has one row per seed,
+distance, and arm. The fields are seed, distance, arm, failure count, shots,
+point estimate, one-sided Wilson upper bound, target-closed boolean, active
+coordinates, rounds, and active-coordinate qubit-rounds. This is sufficient to
+plot the Wilson upper-bound curves and the target crossing at distance 11 for
+the reference arm and distance 9 for the optimized arm.
+
+\section{Why the Claim Is Finite-Target Only}
+The scaling diagnostic is intentionally not promoted to the main claim. The
+reported beta differences are small and vary by seed. The robust statement is
+therefore a finite-target crossover under a frozen synthetic model, not a claim
+about asymptotic error suppression.
+
+
+\clearpage
+\section{Case-Level Resource Diagnostics}
+The proxy resource reported in the main text is the active data-coordinate count
+multiplied by the distance-equal syndrome round count at the first distance
+satisfying the Wilson criterion. The following table records additional
+case-level diagnostics from the archived report. The reliable-unit-change cost
+is retained only as a secondary diagnostic; it is not the primary claim.
+
+\begin{center}
+\scriptsize
+\begin{tabular}{rrrrrrrr}
+\toprule
+Seed & $d$ & Active coords & Rounds & Ref score & Opt score & Cost red. (\%) & Steps \\
+\midrule
+20290107 & 3 & 17 & 3 & 0.5207 & 0.4061 & 2.866 & 240 \\
+20290107 & 5 & 49 & 5 & 1.4983 & 1.2953 & 1.093 & 240 \\
+20290107 & 7 & 97 & 7 & 2.9717 & 2.6798 & 0.791 & 240 \\
+20290107 & 9 & 161 & 9 & 5.0060 & 4.5968 & 0.669 & 240 \\
+20290107 & 11 & 241 & 11 & 7.5924 & 7.0551 & 0.555 & 240 \\
+20290119 & 3 & 17 & 3 & 0.5299 & 0.4160 & 3.068 & 240 \\
+20290119 & 5 & 49 & 5 & 1.4458 & 1.2721 & 0.973 & 240 \\
+20290119 & 7 & 97 & 7 & 2.9611 & 2.6616 & 0.829 & 240 \\
+20290119 & 9 & 161 & 9 & 4.9773 & 4.5683 & 0.604 & 240 \\
+20290119 & 11 & 241 & 11 & 7.5172 & 6.9987 & 0.502 & 240 \\
+20290203 & 3 & 17 & 3 & 0.4785 & 0.3998 & 2.273 & 240 \\
+20290203 & 5 & 49 & 5 & 1.4605 & 1.2869 & 0.862 & 240 \\
+20290203 & 7 & 97 & 7 & 3.0263 & 2.7105 & 0.860 & 240 \\
+20290203 & 9 & 161 & 9 & 5.0424 & 4.6198 & 0.675 & 240 \\
+20290203 & 11 & 241 & 11 & 7.5292 & 7.0029 & 0.497 & 240 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Architecture Gate Summary}
+The architecture gates are fail-closed checks on the synthetic circuit
+construction. They verify schedule feasibility, matched circuit structure, and
+matched-decoder construction, but they do not establish a hardware compiler or
+physical-control theorem.
+
+\begin{center}
+\scriptsize
+\begin{tabular}{rrrrrrr}
+\toprule
+Seed & $d$ & Noiseless & Fibre & Structure & Decoder & Case pass \\
+\midrule
+20290107 & 3 & true & true & true & true & true \\
+20290107 & 5 & true & true & true & true & true \\
+20290107 & 7 & true & true & true & true & true \\
+20290107 & 9 & true & true & true & true & true \\
+20290107 & 11 & true & true & true & true & true \\
+20290119 & 3 & true & true & true & true & true \\
+20290119 & 5 & true & true & true & true & true \\
+20290119 & 7 & true & true & true & true & true \\
+20290119 & 9 & true & true & true & true & true \\
+20290119 & 11 & true & true & true & true & true \\
+20290203 & 3 & true & true & true & true & true \\
+20290203 & 5 & true & true & true & true & true \\
+20290203 & 7 & true & true & true & true & true \\
+20290203 & 9 & true & true & true & true & true \\
+20290203 & 11 & true & true & true & true & true \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\clearpage
+\section{Detailed Boundary Notes}
+The phrase affine schedule response refers to the preserved mean-one schedule
+constraint inside the synthetic model. It should not be read as a verified
+hardware response manifold. The schedule variables affect the analytic exposure
+score and the generated Stim fault probabilities, while the logical identity
+endpoint is inserted explicitly by the circuit construction.
+
+The held-out component is the Monte Carlo detector-sample evaluation and the
+matched decoding of those samples. The optimization objective and the Stim
+injection probabilities are intentionally the same frozen synthetic map. This
+choice makes the experiment a mechanism audit: it tests whether the designed
+map remains effective after full detector sampling and decoding, not whether a
+model trained in one physical setting predicts another setting.
+
+The use of Wilson upper bounds makes the endpoint conservative at the declared
+finite target. The target is closed only when the one-sided upper confidence
+bound is below 0.025. This is why the claim is stated as a minimum tested
+distance satisfying the frozen Wilson criterion rather than as an exact
+threshold or asymptotic scaling statement.
+
+\section{Release Synchronization}
+Version v0.6.2 synchronizes four surfaces that must stay mutually consistent:
+README summary values, the claim certificate, the full report archive, and the
+compiled manuscript. The scientific consistency checker rejects stale summary
+numbers, stale certificate hashes, missing case rows, missing crossover rows,
+and PDF/source mismatches for the title and core report-derived values.
+
+
+\clearpage
+\section{Archived Report Field Map}
+The full report archive contains the following fields used by this manuscript:
+\begin{itemize}
+\item \texttt{cases}: the 15 seed-distance evaluations, including raw failure counts, shots, decoded logical failure probabilities, design scores, schedules, and case gates.
+\item \texttt{seed\_crossovers}: the three seed-level Wilson tables and crossover decisions.
+\item \texttt{scaling\_fits}: retained diagnostic fits for finite-distance trend inspection, not used as an asymptotic claim.
+\item \texttt{protocol\_sha256}: the canonical hash of the frozen prospective protocol.
+\item \texttt{certificate\_sha256\_before\_self\_field}: the archived report certificate after removing the self field.
+\end{itemize}
+
+A downstream reader should treat \texttt{report.json.gz} as the authoritative
+source for numerical summaries. The compact summary exists for quick inspection,
+and the manuscript exists for interpretation. If those surfaces disagree, the
+consistency checker should fail and the report archive should be used to
+regenerate the derived surfaces.
+
+\end{document}

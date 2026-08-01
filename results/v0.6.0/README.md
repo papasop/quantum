@@ -1,14 +1,17 @@
-# v0.6.0 reference result, v0.6.1 evidence repair
+# v0.6.0 reference result, v0.6.2 evidence repair
 
 `reference_summary.json` is a compact transcription of the completed frozen
 run. `protocol.json` is the reconstructed frozen protocol artifact; its
 canonical SHA-256 matches the displayed v0.6.0 protocol hash.
 
 `report.json.gz` is the full compressed Monte Carlo report regenerated with the
-frozen v0.6.0 protocol and pinned v0.6.1 dependencies. It includes raw per-case
+frozen v0.6.0 protocol and pinned v0.6.2 dependencies. It includes raw per-case
 failure counts, Wilson upper bounds, and crossover decisions.
 
-`claim_certificate.json` records the v0.6.1 claim boundary and points to the
+`wilson_distance_table.csv` is derived from `report.json.gz` for plotting and
+independent inspection of the Wilson crossover decision.
+
+`claim_certificate.json` records the v0.6.2 claim boundary and points to the
 archived full report.
 
 To regenerate those complete artifacts:

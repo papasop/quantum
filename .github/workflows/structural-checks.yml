@@ -14,8 +14,19 @@ jobs:
           python-version: "3.12"
       - name: Install pinned dependencies
         run: python -m pip install -r requirements.txt
+      - name: Install consistency-check dependency
+        run: python -m pip install pypdf
+      - name: Install Tectonic for manuscript compilation
+        run: |
+          curl -L -o /tmp/tectonic.tar.gz https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.17.0/tectonic-0.17.0-x86_64-unknown-linux-gnu.tar.gz
+          mkdir -p /tmp/tectonic
+          tar -xzf /tmp/tectonic.tar.gz -C /tmp/tectonic
       - name: Verify hashes and Python syntax
         run: python tools/verify_release.py
+      - name: Verify scientific consistency
+        env:
+          TECTONIC_BIN: /tmp/tectonic/tectonic
+        run: python tools/verify_scientific_consistency.py
       - name: Quick Stim/PyMatching smoke test
         env:
           MPLCONFIGDIR: /tmp/matplotlib
