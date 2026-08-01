@@ -1,14 +1,21 @@
 # Response-Fibre Fault Tolerance
 
-Numerical audits of whether a control flow can preserve a declared ideal
-logical task while reducing decoded logical failure and the physical resources
-needed to reach a fixed reliability target.
+Numerical audits of an affine schedule response mechanism for synthetic
+fault-tolerance experiments. The current result tests whether a constrained
+schedule optimization changes a frozen synthetic schedule-to-fault map enough
+to cross a discrete rotated-surface-code distance boundary under Stim sampling
+and PyMatching decoding.
 
-## Prospective v0.6.0 result
+The ideal logical identity layer is inserted constructively by Stim. The
+schedule does not generate a different physical unitary evolution; in this
+repository it changes only the synthetic fault probabilities attached to that
+inserted layer.
+
+## Prospective v0.6.0 result, documented by v0.6.1
 
 On a frozen rotated-surface-code experiment using Stim and PyMatching, the
-response-fibre schedule lowered the minimum resolved distance at the declared
-logical-failure target:
+affine schedule response lowered the minimum tested Wilson-resolved distance
+at the declared logical-failure target:
 
 \[
 d_{\mathrm{reference}}=11 \longrightarrow d_{\mathrm{flow}}=9,
@@ -17,7 +24,8 @@ d_{\mathrm{reference}}=11 \longrightarrow d_{\mathrm{flow}}=9,
 
 This occurred on all three new prospective seeds. With 241 active qubits at
 distance 11 and 161 at distance 9, and with the number of syndrome rounds set
-equal to the code distance, the resolved physical-qubit-round saving was
+equal to the code distance, the active-coordinate qubit-round proxy reduction
+was
 
 \[
 1-\frac{161\times 9}{241\times 11}=45.34\%.
@@ -30,7 +38,7 @@ equal to the code distance, the resolved physical-qubit-round saving was
 | Minimum decoded-failure reduction | 17.95% |
 | Minimum two-sample z score | 23.65 |
 | Distance crossover | 11 to 9 |
-| Physical-qubit-round saving | 45.34% |
+| Active-coordinate qubit-round proxy reduction | 45.34% |
 
 Protocol SHA-256:
 
@@ -46,18 +54,21 @@ e4658480b6a4cb71caadfb6532453c4a31ba11f732dfaf36ffd66cc10921138c
 
 ## Claim boundary
 
-The result is a prospective numerical mechanism result under a frozen,
-synthetic schedule-to-fault map. It is **not**:
+The result is a prospective, fail-closed synthetic fault-model mechanism
+experiment. It shows that constrained schedule optimization crosses a discrete
+code-distance boundary in this model. It is **not**:
 
 - a fault-tolerance threshold theorem;
 - evidence that the asymptotic distance-suppression exponent changed;
 - a compiler-derived or calibrated physical-noise result;
 - a hardware or QPU advantage claim;
+- evidence that a physical control flow has lowered real surface-code hardware
+  resources;
 - a formal interval-arithmetic certificate.
 
 The fitted exponent differences changed sign across the three seeds, so the
-supported interpretation is a finite-reliability resource/intercept advantage,
-not an asymptotic scaling improvement.
+supported interpretation is a finite-reliability mechanism crossover, not an
+asymptotic scaling improvement.
 
 See [docs/CLAIM_SCOPE.md](docs/CLAIM_SCOPE.md) for the exact statement.
 
@@ -74,6 +85,12 @@ The full frozen run evaluates 30 million decoded samples in total and may take
 roughly 20 minutes, depending on CPU and memory performance. It writes
 `protocol.json` and `report.json` under
 `ft_unit_change_time_v0_6_0_results/`.
+
+The repository includes the frozen `results/v0.6.0/protocol.json`, whose hash
+matches the displayed protocol SHA-256. The full Monte Carlo `report.json.gz`
+is not reconstructed from the compact release summary; `claim_certificate.json`
+records the auditable v0.6.1 boundary and explicitly marks raw per-case counts
+as requiring regeneration from the frozen script.
 
 A lightweight pipeline check is available:
 
@@ -101,7 +118,8 @@ python tools/verify_release.py
 | v0.5.0 | First rotated-surface-code resource audit | Fail-closed; initialization stalls exposed |
 | v0.5.1 | Feasible-initialization repair on reused seeds | Regression repair supported; no new prospective claim |
 | v0.5.2 | Lower-noise, rounds-equal-distance development calibration | Development-only target interval identified |
-| v0.6.0 | Frozen prospective rotated-surface-code audit | Distance 11 to 9 and 45.34% resource saving supported |
+| v0.6.0 | Frozen prospective rotated-surface-code audit | Distance 11 to 9 and 45.34% proxy reduction supported |
+| v0.6.1 | Documentation and evidence-boundary repair | Repository URL, exact dependencies, protocol artifact, and claim scope corrected |
 
 The v0.5.0 negative result is retained intentionally. The v0.5.1 projection
 repair is part of the methodological record and was completed before the
@@ -111,10 +129,10 @@ v0.6.0 prospective seeds were evaluated.
 
 ```text
 src/                 versioned standalone audits
-results/v0.6.0/      compact frozen reference summary
+results/v0.6.0/      frozen protocol, compact summary, and claim certificate
 docs/                claim boundary and evidence history
 tools/               integrity and syntax verification
-paper/               manuscript handoff notes
+paper/               manuscript source and PDF build notes
 .github/workflows/   lightweight structural checks
 ```
 

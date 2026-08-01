@@ -1,14 +1,24 @@
-# v0.6.0 reference result
+# v0.6.0 reference result, v0.6.1 evidence repair
 
 `reference_summary.json` is a compact transcription of the completed frozen
-run. It is not a substitute for the full generated `protocol.json` and
-`report.json`.
+run. `protocol.json` is the reconstructed frozen protocol artifact; its
+canonical SHA-256 matches the displayed v0.6.0 protocol hash.
+
+`claim_certificate.json` records the v0.6.1 claim boundary and makes the
+evidence gap explicit. The v0.6.0 GitHub zip did not include the full
+Monte Carlo `report.json`, so raw per-case failure counts and per-distance
+Wilson tables must be regenerated from the frozen script before claiming a
+fully independently recomputable report certificate.
 
 To regenerate those complete artifacts:
 
 ```bash
 python src/ft_unit_change_time_rotated_surface_code_v0_6_0.py
 ```
+
+That command writes `protocol.json` and `report.json` under
+`ft_unit_change_time_v0_6_0_results/`. Compress the report as
+`results/v0.6.0/report.json.gz` when preserving a full release artifact.
 
 Expected identifying hashes:
 

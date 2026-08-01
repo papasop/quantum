@@ -1,0 +1,93 @@
+{
+  "circuit_engine": "Stim generated surface_code:rotated_memory_z with an inserted ideal-identity layer and schedule-dependent faults",
+  "correlated_decoding": true,
+  "correlated_schedule_faults": "Stim E instructions on adjacent data pairs",
+  "decoder": "PyMatching constructed separately from each Stim detector error model",
+  "design_evaluation_separation": "projected flow uses only the analytic exposure score; claims use independently seeded Stim detector samples and matched decoding",
+  "development_seeds_excluded_from_new_claims": [
+    20280107,
+    20280119,
+    20280203,
+    20280307,
+    20280319,
+    20280403,
+    20280507,
+    20280519,
+    20280603,
+    20280707,
+    20280719,
+    20280803,
+    20280907,
+    20280919,
+    20281003,
+    20281107,
+    20281119,
+    20281203
+  ],
+  "development_target_interval_from_v052": [
+    0.022859700317492494,
+    0.028340340056867457
+  ],
+  "distances": [
+    3,
+    5,
+    7,
+    9,
+    11
+  ],
+  "fixed_rounds_if_selected": 5,
+  "formal_interval_arithmetic": false,
+  "frozen_default_prospective_used": true,
+  "frozen_target_selection_rule": "choose the simple central value 0.025 inside the common development crossover interval before evaluating any prospective seed",
+  "gates": {
+    "maximum_area_residual": 1e-12,
+    "minimum_flow_displacement": 0.1,
+    "secondary_fixed_distance_diagnostic_minimum_reduction": 0.05,
+    "secondary_fixed_distance_diagnostic_minimum_z": 1.645
+  },
+  "hook_error_model": "two-qubit Clifford depolarization in syndrome-extraction gates",
+  "implementation_fibre": "fixed normalized identity-layer schedule mean on every data qubit",
+  "independent_heldout_sampler_seeds": true,
+  "initialisation_repair": "rowwise Euclidean projection onto the intersection of the declared amplitude box and the exact mean-one affine fibre",
+  "logical_task": "one protected rotated-surface-code logical Z-memory interval (ideal identity logical channel)",
+  "new_prospective_cohort_used": true,
+  "noise": {
+    "after_clifford_depolarization": 0.0015,
+    "after_reset_flip_probability": 0.0025,
+    "before_measure_flip_probability": 0.005,
+    "before_round_data_depolarization": 0.001
+  },
+  "prospective_seeds_frozen_before_run": [
+    20290107,
+    20290119,
+    20290203
+  ],
+  "purpose": "prospectively test whether response-fibre flow lowers the minimum rotated-surface-code distance and physical-qubit-round volume required at a frozen logical-failure target",
+  "quick_mode": false,
+  "resource_measure": "active coordinated Stim qubits times the distance-dependent syndrome rounds; sparse Stim register width is reported but not charged as hardware",
+  "round_policy": "equal_distance",
+  "sampling_batch_shots": 50000,
+  "schedule_to_fault_map": "frozen synthetic heterogeneous exposure map; not a pulse compiler or calibrated hardware model",
+  "scope": "frozen prospective fixed-reliability rotated-surface-code numerical resource audit; not a threshold theorem, asymptotic scaling-exponent claim, interval certificate, compiler result, or hardware validation",
+  "seeds": [
+    20290107,
+    20290119,
+    20290203
+  ],
+  "segments": 24,
+  "shots_per_schedule": 1000000,
+  "software": {
+    "pymatching": "2.4.0",
+    "stim": "1.16.0"
+  },
+  "source_v052_certificate_sha256": "f4296cce58797d301be800992830dc288537150fad00bfee0308e256e2f960f1",
+  "source_v052_protocol_sha256": "4e3c3d3963ef4c8b29bca1aaf7568244214aa5142428f8252fb8bf811d83acd5",
+  "target_decision": {
+    "confidence_rule": "one-sided 95% Wilson upper bound must not exceed target",
+    "minimum_distance_reduction": 2,
+    "minimum_successful_seed_fraction": 0.6666666666666666,
+    "target_logical_failure_probability": 0.025
+  },
+  "title": "FAULT-TOLERANT RESPONSE-FIBRE ROTATED-SURFACE-CODE PROSPECTIVE RESOURCE AUDIT",
+  "version": "0.6.0"
+}

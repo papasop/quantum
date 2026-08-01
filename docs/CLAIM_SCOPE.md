@@ -1,18 +1,20 @@
 # Claim scope
 
-## Supported v0.6.0 statement
+## Supported v0.6.0 statement, repaired in v0.6.1
 
 For the declared rotated-surface-code logical Z-memory task, frozen synthetic
 schedule-to-fault map, Stim circuit construction, independently sampled
 reference and optimized arms, and PyMatching decoder constructed from each
-arm's detector error model, the preregistered v0.6.0 cohort supports:
+arm's detector error model, the v0.6.0 cohort specified and frozen before
+evaluation supports:
 
-1. response-fibre schedule optimization at every tested seed and distance;
+1. affine schedule response optimization at every tested seed and distance;
 2. positive decoded-logical-failure reduction in 15 of 15 fixed-distance
    cases;
-3. a reduction of the minimum Wilson-resolved distance from 11 to 9 at
+3. a reduction of the minimum tested Wilson-resolved distance from 11 to 9 at
    \(p_L^{\mathrm{target}}=0.025\) on 3 of 3 new prospective seeds;
-4. a corresponding 45.34% reduction in active-physical-qubit-round volume.
+4. a corresponding 45.34% reduction in the active-coordinate qubit-round
+   proxy.
 
 The target 0.025 was frozen before v0.6.0 from the common development interval
 identified by v0.5.2:
@@ -43,10 +45,22 @@ The response fibre in this experiment fixes the normalized mean of each
 identity-layer schedule. It should not be described as preservation of an
 arbitrary compiled physical gate under every hardware constraint.
 
+The ideal logical identity layer is inserted constructively in the Stim circuit.
+The schedule changes only the synthetic single-data and adjacent-pair fault
+probabilities attached to that layer. It does not generate distinct physical
+unitary evolutions.
+
+This experiment is not an independent prediction validation: the optimization
+objective is built from the same synthetic schedule-to-fault probability model
+that is later injected into Stim. The Monte Carlo stage independently validates
+whether those probabilities, after syndrome extraction and decoding, cross the
+declared distance boundary.
+
 ## Correct concise wording
 
 > In a frozen synthetic rotated-surface-code audit, response-fibre schedule
-> optimization prospectively reduced the minimum Wilson-resolved distance from
-> 11 to 9 at a target logical failure probability of 0.025 on all three new
-> seeds, corresponding to a 45.34% active-physical-qubit-round saving. No
-> threshold, exponent, compiler, or hardware claim is made.
+> optimization prospectively reduced the minimum tested Wilson-resolved
+> distance from 11 to 9 at a target logical failure probability of 0.025 on all
+> three new seeds, corresponding to a 45.34% active-coordinate qubit-round
+> proxy reduction. No threshold, exponent, compiler, hardware, or physical
+> resource claim is made.

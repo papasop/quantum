@@ -1,0 +1,82 @@
+{
+  "certificate_version": "0.6.1",
+  "claim_boundary": {
+    "accurate_positioning": "prospective fail-closed synthetic fault-model mechanism experiment",
+    "ideal_layer": "Stim constructively inserts an ideal logical identity layer",
+    "monte_carlo_role": "independently validates whether those probabilities produce the declared distance crossover after syndrome extraction and decoding",
+    "optimization_evaluation_coupling": "optimization objective is derived from the same synthetic schedule-to-fault probability model later injected into Stim",
+    "schedule_semantics": "schedule changes only synthetic fault probabilities; it does not generate distinct physical unitary evolutions"
+  },
+  "claim_certificate_sha256_before_self_field": "9c5cead41fee0f9f6271437ac1d37bbf95eb6b14b91de9170d5346a7ac10498f",
+  "created_from": "results/v0.6.0/reference_summary.json and reconstructed frozen protocol.json",
+  "decision_rule": {
+    "minimum_successful_seed_fraction": 0.6666666666666666,
+    "minimum_tested_distance_reduction": 2,
+    "target_logical_failure_probability": 0.025,
+    "wilson_bound": "one-sided 95% Wilson upper bound must not exceed target"
+  },
+  "frozen_inputs": {
+    "distances": [
+      3,
+      5,
+      7,
+      9,
+      11
+    ],
+    "pinned_dependencies": {
+      "numpy": "2.0.2",
+      "pymatching": "2.4.0",
+      "stim": "1.16.0"
+    },
+    "round_policy": "equal_distance",
+    "seeds": [
+      20290107,
+      20290119,
+      20290203
+    ],
+    "shots_per_schedule": 1000000
+  },
+  "protocol_sha256": "fec91e30001712f3d9ac84c0e45a6b70f2d5ae7189d3c9ac6d1096d47505cbf6",
+  "raw_monte_carlo_counts": {
+    "required_report_fields": [
+      "cases[].initial.failure_count",
+      "cases[].initial.shots",
+      "cases[].optimised.failure_count",
+      "cases[].optimised.shots",
+      "seed_crossovers[].distance_table[].initial_wilson_upper_95_one_sided",
+      "seed_crossovers[].distance_table[].optimised_wilson_upper_95_one_sided"
+    ],
+    "status": "not archived in the v0.6.0 GitHub zip; regenerate results/v0.6.0/report.json.gz by running the frozen script with pinned dependencies"
+  },
+  "reference_report_certificate_sha256_before_self_field": "e4658480b6a4cb71caadfb6532453c4a31ba11f732dfaf36ffd66cc10921138c",
+  "reported_outcome": {
+    "active_coordinate_qubit_round_proxy": {
+      "optimised_active_coordinates": 161,
+      "optimised_rounds": 9,
+      "reference_active_coordinates": 241,
+      "reference_rounds": 11,
+      "relative_reduction": 0.45341380611090154
+    },
+    "all_gates_pass": true,
+    "crossover_seeds_declared": 3,
+    "crossover_seeds_passing": 3,
+    "fixed_distance_cases_declared": 15,
+    "fixed_distance_cases_passing": 15,
+    "minimum_optimised_distance": 9,
+    "minimum_reference_distance": 11,
+    "minimum_relative_decoded_failure_reduction": 0.17952900751436057,
+    "minimum_z_score": 23.651326422117876
+  },
+  "repository_code": "https://github.com/papasop/quantum",
+  "source_result_version": "0.6.0",
+  "title": "Response-fibre fault-tolerance v0.6.1 claim certificate",
+  "unsupported_claims": [
+    "fault-tolerance threshold improvement",
+    "asymptotic logical-error exponent improvement",
+    "compiler-derived pulse-to-fault relation",
+    "calibrated hardware noise agreement",
+    "QPU or hardware resource advantage",
+    "physical control flow lowering real surface-code hardware resources",
+    "formal interval-arithmetic certificate"
+  ]
+}
